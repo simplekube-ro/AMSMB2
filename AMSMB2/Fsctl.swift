@@ -236,7 +236,7 @@ extension IOCtl {
             let printLen = UInt16(printData.count)
             return [
                 .init(value: reparseTag),
-                .init(value: UInt16(substituteData.count + printData.count)),
+                .init(value: UInt16(12 + substituteData.count + printData.count)),
                 .init(value: 0 as UInt16), // reserved
                 .init(value: 0 as UInt16), // substitute offset
                 .init(value: substituteLen),

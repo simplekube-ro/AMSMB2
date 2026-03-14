@@ -11,14 +11,20 @@ AMSMB2 is a Swift library that wraps [libsmb2](https://github.com/sahlberg/libsm
 ## Build and Test Commands
 
 ```bash
+# Prerequisites (required after fresh clone)
+git submodule update --init
+
 # Build
 swift build
 
-# Run all tests
+# Run all tests (unit tests run, integration tests skip without server)
 swift test
 
 # Run a specific test
 swift test --filter SMB2ManagerTests/testName
+
+# Integration tests (requires Docker)
+make integrationtest
 
 # Linux testing via Docker
 make linuxtest              # Uses local volume mount
