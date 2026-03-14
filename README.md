@@ -1,107 +1,136 @@
 # AMSMB2
 
+Swift library for SMB2/3 file operations on Apple platforms (iOS 13+, macOS 10.15+, tvOS 14+, watchOS 6+, visionOS 1+) and Linux. Wraps [libsmb2](https://github.com/sahlberg/libsmb2) with a modern async/await API.
 
-This is small Swift library for iOS, macOS and tvOS which wraps [libsmb2](https://github.com/sahlberg/libsmb2) and allows to connect a SMB2/3 share and do file operation.
+## Heritage
 
-[![Swift Version Compatibility][swift-version-image]][swift-version-url]
-[![Platform Compatibility ][platform-image]][platform-url]
-[![License][license-image]][license-url]
-[![Release version][release-image]][release-url]
+This is a fork of [amosavian/AMSMB2](https://github.com/amosavian/AMSMB2), the original Swift SMB2 library created by [Amir Abbas Mousavian](https://github.com/amosavian). The original library provides a solid foundation for SMB2/3 file operations with async/await support, NSSecureCoding/Codable serialization, and Objective-C compatibility.
 
+This fork extends the original with the following improvements:
 
-## Getting Started
+| Area | Original | This Fork |
+|------|----------|-----------|
+| **Public API surface** | Only `SMB2Manager` is public; internal types are inaccessible | `SMB2Client` and `SMB2FileHandle` exposed as public API for direct file handle operations |
+| **Thread safety** | Context access unprotected in some paths; file handle close/deinit has race conditions | Lock-protected context access via `withThreadSafeContext()`; nil-swap close pattern prevents double-close races; `smbClient` getter validates connection under lock |
+| **Server-side copy** | Sends copy chunks using negotiated write size (~8 MB), exceeding the MS-SMB2 spec limit | Chunks capped at 1 MiB per MS-SMB2 section 3.3.5.15.6.2 — works with all spec-compliant servers |
+| **Symlink creation** | `ReparseDataLength` omits 12-byte symlink header, causing `STATUS_IO_REPARSE_DATA_INVALID` on Samba 4.21+ | Correct reparse data format per MS-FSCC 2.1.2.4 |
+| **Change Notify** | Crashes (signal 5/11) due to re-entrant `smb2_close()` inside callback + dangling `withUnsafeMutablePointer` | Direct PDU construction bypasses re-entrant wrapper; `Unmanaged<CBData>` for safe C callback pointers |
+| **Testing** | Single test file; `swift test` crashes without server env vars; no Docker infrastructure | 53 tests across 4 files; `swift test` works without a server (skips integration tests); Docker-based `make integrationtest` |
+| **Documentation** | Minimal README with outdated examples | Architecture guide with Mermaid diagrams, comprehensive API reference, modern async/await examples |
 
-To use AMSMB2, add the following dependency to your Package.swift:
+## Features
+
+- Connect to SMB2/3 shares with NTLM authentication
+- List, create, remove directories (recursive)
+- Read, write, append, truncate files with progress reporting
+- Upload/download between local filesystem and SMB share
+- Server-side copy and move operations
+- Symbolic link creation and resolution
+- File system and item attribute queries
+- Change Notify (file monitoring)
+- Streaming writes via `AsyncSequence`
+- `NSSecureCoding` and `Codable` support for connection serialization
+- Objective-C compatibility layer
+- Direct access to `SMB2Client` and `SMB2FileHandle` for advanced use cases
+
+## Installation
+
+### Swift Package Manager
+
+Add to your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/amosavian/AMSMB2", .upToNextMinor(from: "3.0.0"))
+    .package(url: "https://github.com/simplekube-ro/AMSMB2", branch: "master")
 ]
 ```
 
-You can then add the specific product dependency to your target:
+Then add the product dependency to your target:
 
 ```swift
-dependencies: [
-    .product(name: "AMSMB2", package: "AMSMB2"),
-]
+.target(
+    name: "MyApp",
+    dependencies: [
+        .product(name: "AMSMB2", package: "AMSMB2"),
+    ]
+)
 ```
 
-## Usage
-
-Just read inline help to find what each function does. It's straightforward. It's thread safe.
-
-To do listing files in directory and file operations you must use this template:
+## Quick Start
 
 ```swift
 import AMSMB2
 
-class SMBClient: @unchecked Sendable {
-    /// connect to: `smb://guest@XXX.XXX.XX.XX/share`
-    
-    let serverURL = URL(string: "smb://XXX.XXX.XX.XX")!
-    let credential = URLCredential(user: "guest", password: "", persistence: URLCredential.Persistence.forSession)
-    let share = "share"
-    
-    lazy private var client = SMB2Manager(url: self.serverURL, credential: self.credential)!
-    
-    private func connect() async throws -> SMB2Manager {
-        // AMSMB2 can handle queueing connection requests
-        try await client.connectShare(name: self.share)
-        return self.client
-    }
-    
-    func listDirectory(path: String) {
-        Task {
-            do {
-                let client = try await connect()
-                let files = try await client.contentsOfDirectory(atPath: path)
-                for entry in files {
-                    print(
-                        "name:", entry[.nameKey] as! String,
-                        ", path:", entry[.pathKey] as! String,
-                        ", type:", entry[.fileResourceTypeKey] as! URLFileResourceType,
-                        ", size:", entry[.fileSizeKey] as! Int64,
-                        ", modified:", entry[.contentModificationDateKey] as! Date,
-                        ", created:", entry[.creationDateKey] as! Date)
-                }
-            } catch {
-                print(error)
-            }
-        }
-    }
-    
-    func moveItem(path: String, to toPath: String) {
-        Task {
-            do {
-                let client = try await self.connect()
-                try await client.moveItem(atPath: path, toPath: toPath)
-                print("\(path) moved successfully.")
-                
-                // Disconnecting is optional, it will be called eventually
-                // when `AMSMB2` object is freed.
-                // You may call it explicitly to detect errors.
-                try await client.disconnectShare()
-            } catch {
-                print(error)
-            }
-        }
-    }
+// Create a manager
+let url = URL(string: "smb://192.168.1.100")!
+let credential = URLCredential(user: "username", password: "password", persistence: .forSession)
+let smb = SMB2Manager(url: url, credential: credential)!
+
+// Connect to a share
+try await smb.connectShare(name: "Documents")
+
+// List directory contents
+let files = try await smb.contentsOfDirectory(atPath: "/")
+for file in files {
+    print(file.name ?? "?", file.fileSize ?? 0)
 }
 
+// Read a file
+let data = try await smb.contents(atPath: "/report.pdf", progress: nil)
+
+// Write a file
+try await smb.write(data: data, toPath: "/backup/report.pdf", progress: nil)
+
+// Upload a local file
+let localURL = URL(fileURLWithPath: "/tmp/photo.jpg")
+try await smb.uploadItem(at: localURL, toPath: "/photos/photo.jpg", progress: nil)
+
+// Download a file
+let downloadURL = URL(fileURLWithPath: "/tmp/downloaded.pdf")
+try await smb.downloadItem(atPath: "/report.pdf", to: downloadURL, progress: nil)
+
+// Disconnect
+try await smb.disconnectShare()
 ```
+
+## Testing
+
+### Prerequisites
+
+```bash
+git submodule update --init    # Required — fetches the libsmb2 C library
+```
+
+### Unit Tests (no server required)
+
+```bash
+swift test
+```
+
+Runs 15 unit tests. Integration tests are automatically skipped when no SMB server is configured.
+
+### Integration Tests (requires Docker)
+
+```bash
+make integrationtest
+```
+
+Starts a Samba container, runs the full test suite (53 tests), and tears down. Requires Docker Desktop.
+
+### Linux Tests
+
+```bash
+make linuxtest        # Uses local volume mount
+make cleanlinuxtest   # Clean Docker build
+```
+
+## Documentation
+
+- **[Architecture](docs/ARCHITECTURE.md)** — Layer stack, connection lifecycle, async operation flow, thread safety model
+- **[API Reference](docs/API.md)** — Complete reference for all public types and methods
 
 ## License
 
-While source code shipped with project is MIT licensed, but it has static link to `libsmb2` which is `LGPL v2.1`, consequently the whole project becomes `LGPL v2.1`.
+The source code in this repository is MIT licensed. However, it links to [libsmb2](https://github.com/sahlberg/libsmb2) which is LGPL v2.1. The library is configured as a **dynamic** framework (`.dynamic` in Package.swift) to comply with LGPL requirements for App Store distribution.
 
-You **must** link this library dynamically to your app if you intend to distribute your app on App Store.
-
-[swift-version-image]: https://img.shields.io/endpoint?url=https%3A%2F%2Fswiftpackageindex.com%2Fapi%2Fpackages%2Famosavian%2FAMSMB2%2Fbadge%3Ftype%3Dswift-versions
-[swift-version-url]: https://swiftpackageindex.com/amosavian/AMSMB2
-[platform-image]: https://img.shields.io/endpoint?url=https%3A%2F%2Fswiftpackageindex.com%2Fapi%2Fpackages%2Famosavian%2FAMSMB2%2Fbadge%3Ftype%3Dplatforms
-[platform-url]: https://swiftpackageindex.com/amosavian/AMSMB2
-[license-image]: https://img.shields.io/github/license/amosavian/AMSMB2.svg
-[license-url]: LICENSE
-[release-image]: https://img.shields.io/github/release/amosavian/AMSMB2.svg
-[release-url]: https://github.com/amosavian/AMSMB2/releases
+You **must** link this library dynamically if you distribute your app on the App Store.
