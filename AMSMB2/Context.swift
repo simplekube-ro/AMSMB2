@@ -10,19 +10,20 @@
 import Foundation
 import SMB2
 
-/// Reusable buffer pool that eliminates per-read `Data(repeating: 0, count:)` allocation
-/// and the extra `Data(buffer.prefix(...))` copy. Buffers are pre-allocated and recycled.
+/// Reusable fixed-capacity buffer pool. Avoids per-operation `Data` allocation by
+/// recycling buffers between calls. Thread-safe via an internal lock.
 final class BufferPool: @unchecked Sendable {
     private var pool: [Data] = []
     private let maxPoolSize: Int
-    // Finding 3: add a lock to serialize all pool mutations
     private let poolLock = NSLock()
 
     init(maxPoolSize: Int = 8) {
         self.maxPoolSize = maxPoolSize
     }
 
-    /// Returns a buffer of at least `minimumSize` bytes. No zero-fill is performed.
+    /// Returns a buffer of at least `minimumSize` bytes.
+    /// Prefers a pooled buffer that is already large enough; otherwise resizes the
+    /// largest available pooled buffer, or allocates a fresh one.
     func checkout(minimumSize: Int) -> Data {
         poolLock.lock()
         defer { poolLock.unlock() }
@@ -37,7 +38,7 @@ final class BufferPool: @unchecked Sendable {
         return Data(count: minimumSize)
     }
 
-    /// Returns a buffer to the pool for reuse. Buffers beyond maxPoolSize are released.
+    /// Returns a buffer to the pool. Buffers beyond `maxPoolSize` are discarded.
     func checkin(_ buffer: Data) {
         poolLock.lock()
         defer { poolLock.unlock() }
@@ -61,7 +62,7 @@ public final class SMB2Client: CustomDebugStringConvertible, CustomReflectable, 
     /// All libsmb2 calls must execute on this queue.
     private let eventLoopQueue: DispatchQueue
 
-    // Finding 1: DispatchSpecificKey used to detect "already on eventLoopQueue"
+    /// Used to detect re-entrant calls to the event loop queue and avoid deadlocks.
     private static let queueKey = DispatchSpecificKey<Bool>()
 
     /// DispatchSource-based socket monitor, created after connect.
@@ -70,7 +71,7 @@ public final class SMB2Client: CustomDebugStringConvertible, CustomReflectable, 
     /// Tracks all pending operations for error broadcast on connection drop.
     private var pendingOperations: [ObjectIdentifier: CBData] = [:]
 
-    /// Reusable buffer pool for read operations. Eliminates per-read allocation overhead.
+    /// Reusable buffer pool shared across all read operations on this client.
     let bufferPool = BufferPool()
 
     var timeout: TimeInterval
@@ -82,23 +83,18 @@ public final class SMB2Client: CustomDebugStringConvertible, CustomReflectable, 
         self.eventLoopQueue = DispatchQueue(
             label: "smb2_eventloop_\(UInt(bitPattern: ctx))"
         )
-        // Finding 1: tag the queue so we can detect re-entrant calls from deinit
         self.eventLoopQueue.setSpecific(key: Self.queueKey, value: true)
     }
 
-    // Finding 1: Two-phase shutdown — all teardown runs on the event loop queue.
-    // Finding 12: SocketMonitor.cancel() is called from within the event loop queue.
+    /// All teardown runs on the event loop queue so that SocketMonitor.cancel() and
+    /// smb2_destroy_context() are serialized with any in-flight I/O callbacks.
     private func shutdown() {
-        // Cancel socket monitoring first (must run on event loop queue)
         socketMonitor?.cancel()
         socketMonitor = nil
-        // Finding 4: failAllPendingOperations now runs on event loop queue
         failAllPendingOperations(with: POSIXError(.ECANCELED))
-        // Disconnect and destroy
         if let ctx = context {
             if smb2_get_fd(ctx) >= 0 {
-                // Fire-and-forget disconnect; flush with POLLOUT to push the PDU
-                // Finding 15: use POLLOUT to actually flush the disconnect PDU
+                // Best-effort graceful disconnect: queue the FIN PDU and flush it once.
                 smb2_disconnect_share_async(ctx, SMB2Client.generic_handler_noop, nil)
                 smb2_service(ctx, Int32(POLLOUT))
             }
@@ -109,9 +105,7 @@ public final class SMB2Client: CustomDebugStringConvertible, CustomReflectable, 
 
     deinit {
         guard context != nil else { return }
-        // Finding 1: dispatch ALL teardown onto the event loop queue
         if DispatchQueue.getSpecific(key: Self.queueKey) == true {
-            // Already on the event loop queue — call directly to avoid deadlock
             shutdown()
         } else {
             eventLoopQueue.sync { self.shutdown() }
@@ -119,11 +113,11 @@ public final class SMB2Client: CustomDebugStringConvertible, CustomReflectable, 
     }
 
     /// Raw context pointer for internal module use.
-    /// Only safe to access from the event loop queue or from callbacks during smb2_service.
+    /// Only safe to access from the event loop queue or from callbacks fired by smb2_service.
     var rawContext: UnsafeMutablePointer<smb2_context>? { context }
 
-    /// Executes a closure on the event loop queue with the context.
-    /// Used for simple synchronous property access — not for async I/O operations.
+    /// Executes a closure synchronously on the event loop queue.
+    /// Used for simple property access; do not use for async I/O operations.
     func withContext<R>(_ handler: (UnsafeMutablePointer<smb2_context>) throws -> R) throws -> R {
         var result: Result<R, any Error>!
         eventLoopQueue.sync {
@@ -136,14 +130,11 @@ public final class SMB2Client: CustomDebugStringConvertible, CustomReflectable, 
         return try result.get()
     }
 
-    /// Fire-and-forget: dispatches a closure to the event loop queue without waiting.
-    /// Used for cleanup operations (close, closedir) in deinit where we can't wait.
-    ///
-    /// Finding 5: capture `self` strongly so we can check context liveness on the queue.
+    /// Dispatches a closure to the event loop queue without waiting.
+    /// Used for cleanup in deinit paths where the caller cannot block.
+    /// Captures `self` strongly so the context liveness check is coherent.
     func fireAndForget(_ handler: @Sendable @escaping (UnsafeMutablePointer<smb2_context>) -> Void) {
         eventLoopQueue.async { [self] in
-            // The deinit fix (Finding 1) guarantees context is only destroyed on the event
-            // loop queue, so this check is always coherent.
             guard let ctx = self.context else { return }
             handler(ctx)
         }
@@ -171,11 +162,11 @@ public final class SMB2Client: CustomDebugStringConvertible, CustomReflectable, 
     }
 }
 
-// MARK: - Socket Monitor (DispatchSource-based)
+// MARK: - Socket Monitor
 
 extension SMB2Client {
-    /// Monitors a socket file descriptor using DispatchSource for efficient,
-    /// non-blocking I/O. Replaces the old poll() loop.
+    /// Monitors a socket file descriptor using `DispatchSource`.
+    /// All methods must be called on the event loop queue.
     private final class SocketMonitor {
         private let readSource: any DispatchSourceRead
         private var writeSource: (any DispatchSourceWrite)?
@@ -190,23 +181,18 @@ extension SMB2Client {
             self.onEvent = onEvent
 
             self.readSource = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
-            readSource.setEventHandler { [weak self] in
-                self?.onEvent()
-            }
+            readSource.setEventHandler { [weak self] in self?.onEvent() }
             readSource.resume()
         }
 
-        /// Activates the write source when libsmb2 has data to send.
+        /// Enables or disables the write source based on whether libsmb2 has pending outgoing data.
         func activateWriteSourceIfNeeded(context: UnsafeMutablePointer<smb2_context>) {
-            let events = smb2_which_events(context)
-            let needsWrite = (events & Int32(POLLOUT)) != 0
+            let needsWrite = (smb2_which_events(context) & Int32(POLLOUT)) != 0
 
             if needsWrite && !writeSourceResumed {
                 if writeSource == nil {
                     writeSource = DispatchSource.makeWriteSource(fileDescriptor: fd, queue: queue)
-                    writeSource?.setEventHandler { [weak self] in
-                        self?.onEvent()
-                    }
+                    writeSource?.setEventHandler { [weak self] in self?.onEvent() }
                 }
                 writeSource?.resume()
                 writeSourceResumed = true
@@ -220,35 +206,31 @@ extension SMB2Client {
             readSource.cancel()
             if let writeSource {
                 if !writeSourceResumed {
-                    writeSource.resume() // Must resume before cancel
+                    // DispatchSource must be resumed before it can be cancelled.
+                    writeSource.resume()
                 }
                 writeSource.cancel()
             }
             writeSource = nil
         }
-
-        // Finding 12: remove deinit — cancel() is called explicitly from the event loop queue
     }
 
-    /// Called by SocketMonitor when the socket has events.
-    /// Runs on the event loop queue. Services all ready I/O.
+    /// Invoked by SocketMonitor when the socket has I/O events.
+    /// Runs on the event loop queue.
     private func handleSocketEvent() {
         guard let context else { return }
 
-        // Determine what events to service
         let events = smb2_which_events(context)
-        var revents: Int32 = 0
-
-        // Check read readiness
         var pfd = pollfd()
         pfd.fd = smb2_get_fd(context)
         pfd.events = Int16(truncatingIfNeeded: events)
 
-        // Non-blocking poll to check actual readiness
+        // Non-blocking poll to confirm readiness; fall back to POLLIN if the source
+        // fired before the kernel updated poll state.
+        let revents: Int32
         if poll(&pfd, 1, 0) > 0 {
             revents = Int32(pfd.revents)
         } else {
-            // DispatchSource fired but poll says nothing ready yet — try POLLIN
             revents = Int32(POLLIN)
         }
 
@@ -261,17 +243,13 @@ extension SMB2Client {
             self.context = nil
             socketMonitor?.cancel()
             socketMonitor = nil
-            failAllPendingOperations(
-                with: POSIXError(.ECONNRESET, description: errorMsg)
-            )
+            failAllPendingOperations(with: POSIXError(.ECONNRESET, description: errorMsg))
             return
         }
 
-        // Update write source based on whether libsmb2 has outgoing data
         socketMonitor?.activateWriteSourceIfNeeded(context: context)
     }
 
-    /// Starts socket monitoring after a successful connect.
     private func startSocketMonitoring() {
         guard let context else { return }
         let fd = smb2_get_fd(context)
@@ -283,14 +261,13 @@ extension SMB2Client {
         socketMonitor?.activateWriteSourceIfNeeded(context: context)
     }
 
-    /// Stops socket monitoring (e.g., on disconnect).
     private func stopSocketMonitoring() {
         socketMonitor?.cancel()
         socketMonitor = nil
     }
 
-    /// Resumes all pending operations with an error (e.g., connection lost).
-    /// Finding 2+13: set isAbandoned before signaling so in-flight callbacks skip the semaphore.
+    /// Fails all in-flight operations. `isAbandoned` is set before signaling so that
+    /// any concurrent libsmb2 callback skips the already-signaled semaphore.
     private func failAllPendingOperations(with error: any Error) {
         for (_, cb) in pendingOperations {
             cb.isAbandoned = true
@@ -304,9 +281,6 @@ extension SMB2Client {
 // MARK: Setting manipulation
 
 extension SMB2Client {
-    // Finding 9: wrap all property getters that read context?.pointee in eventLoopQueue.sync.
-    // Use the queueKey to avoid deadlock when already on the queue.
-
     private func syncOnEventLoop<T>(_ work: () -> T) -> T {
         if DispatchQueue.getSpecific(key: Self.queueKey) == true {
             return work()
@@ -455,8 +429,6 @@ extension SMB2Client {
     }
 
     var error: String? {
-        // smb2_get_error reads only from the context's error buffer; safe to call
-        // from the event loop queue directly — no need for an extra sync wrapper.
         smb2_get_error(context).map(String.init(cString:))
     }
 
@@ -479,15 +451,14 @@ extension SMB2Client {
 
 extension SMB2Client {
     func connect(server: String, share: String, user: String) throws {
-        // Connect uses a temporary poll loop on the event loop queue since
-        // DispatchSource can't be set up until we have a valid fd.
+        // Connect uses a temporary poll loop on the event loop queue because
+        // DispatchSource can't be created until the socket fd exists.
         var connectError: (any Error)?
         eventLoopQueue.sync {
             do {
                 guard let context = self.context else {
                     throw POSIXError(.ENOTCONN)
                 }
-                // Finding 7: use `let` — CBData is a class (reference type), no inout needed
                 let cb = CBData()
                 let cbPtr = Unmanaged.passRetained(cb).toOpaque()
                 let result = smb2_connect_share_async(
@@ -496,8 +467,6 @@ extension SMB2Client {
                 try POSIXError.throwIfError(result, description: self.error)
                 try self.pollUntilComplete(cb)
                 try POSIXError.throwIfError(cb.result, description: self.error)
-
-                // Connection established — start DispatchSource monitoring
                 self.startSocketMonitoring()
             } catch {
                 connectError = error
@@ -507,8 +476,12 @@ extension SMB2Client {
     }
 
     func disconnect() throws {
-        stopSocketMonitoring()
-        failAllPendingOperations(with: POSIXError(.ENOTCONN))
+        // Run teardown on the event loop queue so it is serialized with any
+        // in-flight handleSocketEvent callbacks.
+        eventLoopQueue.sync {
+            self.stopSocketMonitoring()
+            self.failAllPendingOperations(with: POSIXError(.ENOTCONN))
+        }
         _=try? async_await { context, cbPtr -> Int32 in
             smb2_disconnect_share_async(context, SMB2Client.generic_handler, cbPtr)
         }
@@ -631,29 +604,28 @@ extension SMB2Client {
 // MARK: Async operation handler
 
 extension SMB2Client {
-    /// Per-operation callback state. Each in-flight operation gets its own CBData.
-    /// The calling thread waits on the semaphore; the callback (fired by smb2_service
-    /// on the event loop queue) signals it when the reply arrives.
+    /// Per-operation callback state. Each in-flight operation gets its own `CBData`.
+    /// The calling thread waits on `semaphore`; `generic_handler` signals it when
+    /// libsmb2 delivers the reply via `smb2_service`.
     ///
-    /// Finding 2+13: `isAbandoned` prevents the semaphore from being double-signaled
-    /// when a timeout races with the libsmb2 callback. The CBData is kept alive via
-    /// passRetained/takeRetainedValue so it outlives any timeout.
+    /// `isAbandoned` prevents the semaphore from being double-signaled when a timeout
+    /// races with the libsmb2 callback. `passRetained`/`takeRetainedValue` keeps the
+    /// object alive until the callback fires, even after the caller has timed out.
     final class CBData {
         var result: Int32 = .init(NTStatus.success.rawValue)
         let semaphore = DispatchSemaphore(value: 0)
         var dataHandler: ((UnsafeMutableRawPointer?) -> Void)?
         var error: (any Error)?
-        /// Set to true when the caller has already timed out or the connection failed.
-        /// The libsmb2 callback must check this flag and skip signaling.
+        /// Set to `true` when the caller has timed out or the connection was dropped.
+        /// The libsmb2 callback checks this flag and skips signaling the semaphore.
         var isAbandoned = false
         var status: NTStatus {
             NTStatus(rawValue: result)
         }
     }
 
-    /// Temporary poll loop used only during connect (before DispatchSource is set up).
-    /// Runs on the event loop queue.
-    /// Finding 7: take CBData by value (it's a class — passed by reference automatically).
+    /// Poll loop used only during `connect()`, before DispatchSource monitoring is running.
+    /// Runs synchronously on the event loop queue.
     private func pollUntilComplete(_ cb: CBData) throws {
         let startDate = Date()
         while cb.error == nil && cb.semaphore.wait(timeout: .now()) == .timedOut {
@@ -685,12 +657,8 @@ extension SMB2Client {
         if let error = cb.error { throw error }
     }
 
-    /// Callback invoked by libsmb2 when an async operation completes.
-    /// Runs on the event loop queue (called from smb2_service).
-    /// Signals the semaphore to wake the waiting caller.
-    ///
-    /// Finding 2+13: uses takeRetainedValue() to balance the passRetained() at setup,
-    /// and checks isAbandoned before signaling.
+    /// Callback invoked by libsmb2 when an async operation completes (on the event loop queue).
+    /// `takeRetainedValue()` balances the `passRetained()` performed at setup.
     static let generic_handler: smb2_command_cb = { smb2, status, command_data, cbdata in
         do {
             guard try smb2.unwrap().pointee.fd >= 0 else { return }
@@ -718,18 +686,12 @@ extension SMB2Client {
         try async_await(dataHandler: { _, _ in }, execute: handler).result
     }
 
-    /// Submits an async libsmb2 operation to the event loop and waits for the reply.
+    /// Submits an async libsmb2 operation and blocks the calling thread until the reply arrives.
     ///
-    /// 1. Creates a CBData with a semaphore
-    /// 2. Dispatches the libsmb2 async call to the event loop queue (sync, brief)
-    /// 3. The event loop queue returns immediately after queuing the PDU
-    /// 4. The calling thread waits on the semaphore
-    /// 5. DispatchSource fires when the socket has a reply
-    /// 6. smb2_service() calls generic_handler which signals the semaphore
-    /// 7. The calling thread wakes up with the result
-    ///
-    /// Multiple operations can be in-flight simultaneously — each waits on its
-    /// own semaphore while the event loop services all of them.
+    /// The libsmb2 call is dispatched synchronously onto the event loop queue (brief — just
+    /// queues the PDU). The calling thread then waits on a per-operation semaphore. When
+    /// DispatchSource fires, `smb2_service` calls `generic_handler` which signals the semaphore.
+    /// Multiple operations can be in-flight simultaneously, each with its own semaphore.
     @discardableResult
     func async_await<DataType>(
         dataHandler: @escaping ContextHandler<DataType>,
@@ -747,16 +709,14 @@ extension SMB2Client {
                 dataHandlerError = error
             }
         }
-        // Finding 2+13: passRetained keeps CBData alive until the callback fires
+        // passRetained keeps CBData alive until generic_handler calls takeRetainedValue().
         let cbPtr = Unmanaged.passRetained(cb).toOpaque()
         let cbId = ObjectIdentifier(cb)
 
-        // Dispatch setup to event loop queue (synchronous — just queues the PDU)
         var setupError: (any Error)?
         eventLoopQueue.sync {
             guard let context = self.context else {
                 setupError = POSIXError(.ENOTCONN)
-                // Balance the passRetained since the callback will never fire
                 Unmanaged<CBData>.fromOpaque(cbPtr).release()
                 return
             }
@@ -767,17 +727,15 @@ extension SMB2Client {
                 self.socketMonitor?.activateWriteSourceIfNeeded(context: context)
             } catch {
                 setupError = error
-                // Balance the passRetained since the callback will never fire
                 Unmanaged<CBData>.fromOpaque(cbPtr).release()
             }
         }
         if let setupError { throw setupError }
 
-        // Wait for the callback to signal completion
         if timeout > 0 {
             if cb.semaphore.wait(timeout: .now() + timeout) == .timedOut {
-                // Finding 2+13: on timeout, mark abandoned and remove from pending.
-                // Do NOT release cbPtr here — the callback will call takeRetainedValue().
+                // On timeout, mark abandoned so that the eventual callback (which will
+                // call takeRetainedValue()) skips signaling the semaphore.
                 eventLoopQueue.sync {
                     cb.isAbandoned = true
                     _ = self.pendingOperations.removeValue(forKey: cbId)
@@ -788,10 +746,9 @@ extension SMB2Client {
             cb.semaphore.wait()
         }
 
-        // Remove from pending (may already be removed by error broadcast)
+        // Remove from pending; may already be absent if failAllPendingOperations ran.
         eventLoopQueue.sync { _ = self.pendingOperations.removeValue(forKey: cbId) }
 
-        // Check for errors
         if let error = cb.error { throw error }
         let cbResult = cb.result
         try POSIXError.throwIfError(cbResult, description: error)
@@ -823,7 +780,6 @@ extension SMB2Client {
                 dataHandlerError = error
             }
         }
-        // Finding 2+13: passRetained keeps CBData alive until the callback fires
         let cbPtr = Unmanaged.passRetained(cb).toOpaque()
         let cbId = ObjectIdentifier(cb)
 
@@ -831,7 +787,6 @@ extension SMB2Client {
         eventLoopQueue.sync {
             guard let context = self.context else {
                 setupError = POSIXError(.ENOTCONN)
-                // Balance the passRetained since the callback will never fire
                 Unmanaged<CBData>.fromOpaque(cbPtr).release()
                 return
             }
@@ -842,7 +797,6 @@ extension SMB2Client {
                 self.socketMonitor?.activateWriteSourceIfNeeded(context: context)
             } catch {
                 setupError = error
-                // Balance the passRetained since the callback will never fire
                 Unmanaged<CBData>.fromOpaque(cbPtr).release()
             }
         }
@@ -850,7 +804,6 @@ extension SMB2Client {
 
         if timeout > 0 {
             if cb.semaphore.wait(timeout: .now() + timeout) == .timedOut {
-                // Finding 2+13: mark abandoned; callback will call takeRetainedValue()
                 eventLoopQueue.sync {
                     cb.isAbandoned = true
                     _ = self.pendingOperations.removeValue(forKey: cbId)

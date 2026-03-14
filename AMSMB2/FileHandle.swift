@@ -17,24 +17,23 @@ typealias smb2fh = OpaquePointer
 let O_SYMLINK: Int32 = O_NOFOLLOW
 #endif
 
-/// Thread-safe collector for pipelined operation results.
-/// Allows concurrent writes from multiple dispatch queue blocks, read after join.
-private final class PipelineCollector: @unchecked Sendable {
-    private var results: [Result<Data, any Error>?]
+/// Thread-safe indexed result collector for pipelined operations.
+/// Slots are written concurrently from multiple dispatch queue blocks and read
+/// sequentially after `DispatchGroup.wait()` completes.
+private final class PipelineCollector<T>: @unchecked Sendable {
+    private var results: [Result<T, any Error>?]
     private let lock = NSLock()
 
     init(count: Int) {
         self.results = Array(repeating: nil, count: count)
     }
 
-    func set(index: Int, result: Result<Data, any Error>) {
-        lock.lock()
-        results[index] = result
-        lock.unlock()
+    func set(index: Int, result: Result<T, any Error>) {
+        lock.withLock { results[index] = result }
     }
 
-    func get(index: Int) throws -> Data {
-        // No lock needed — only called after DispatchGroup.wait()
+    /// Returns the result at `index`. Must only be called after `DispatchGroup.wait()`.
+    func get(index: Int) throws -> T {
         guard let result = results[index] else {
             throw POSIXError(.EIO, description: "Pipeline result missing for chunk \(index).")
         }
@@ -153,8 +152,8 @@ public final class SMB2FileHandle: @unchecked Sendable {
         handle = nil
         _handleLock.unlock()
         guard let captured else { return }
-        // Fire-and-forget close to avoid re-entering the event loop from a callback.
-        // Convert to raw pointer bits to cross Sendable boundary.
+        // Use fire-and-forget to avoid blocking deinit on the event loop.
+        // The pointer is passed as a raw integer to cross the Sendable boundary safely.
         let rawHandle = UInt(bitPattern: captured)
         client.fireAndForget { context in
             let fh = OpaquePointer(bitPattern: rawHandle)
@@ -262,7 +261,6 @@ public final class SMB2FileHandle: @unchecked Sendable {
         let handle = try handle.unwrap()
         let count = length > 0 ? length : optimizedReadSize
         var buffer = client.bufferPool.checkout(minimumSize: count)
-        // Finding 11: return buffer to pool on all exit paths
         defer { client.bufferPool.checkin(buffer) }
         buffer.count = count
         let result = try buffer.withUnsafeMutableBytes { buffer in
@@ -272,9 +270,7 @@ public final class SMB2FileHandle: @unchecked Sendable {
                 )
             }
         }
-        // Truncate in-place — no second allocation or copy
-        let bytesRead = Int(result)
-        return Data(buffer.prefix(bytesRead))
+        return Data(buffer.prefix(Int(result)))
     }
 
     /// Reads data at the specified offset without changing the file position.
@@ -287,7 +283,6 @@ public final class SMB2FileHandle: @unchecked Sendable {
         let handle = try handle.unwrap()
         let count = length > 0 ? length : optimizedReadSize
         var buffer = client.bufferPool.checkout(minimumSize: count)
-        // Finding 11: return buffer to pool on all exit paths
         defer { client.bufferPool.checkin(buffer) }
         buffer.count = count
         let result = try buffer.withUnsafeMutableBytes { buffer in
@@ -298,8 +293,7 @@ public final class SMB2FileHandle: @unchecked Sendable {
                 )
             }
         }
-        let bytesRead = Int(result)
-        return Data(buffer.prefix(bytesRead))
+        return Data(buffer.prefix(Int(result)))
     }
 
     var maxWriteSize: Int {
@@ -316,26 +310,13 @@ public final class SMB2FileHandle: @unchecked Sendable {
         )
 
         let handle = try handle.unwrap()
-        let result: Int32
-        if let data = data as? Data {
-            // Fast path: Data is already contiguous — no copy needed
-            result = try data.withUnsafeBytes { buffer in
-                try client.async_await { context, cbPtr -> Int32 in
-                    smb2_write_async(
-                        context, handle, buffer.baseAddress, .init(buffer.count), SMB2Client.generic_handler, cbPtr
-                    )
-                }
-            }
-        } else {
-            result = try Data(data).withUnsafeBytes { buffer in
-                try client.async_await { context, cbPtr -> Int32 in
-                    smb2_write_async(
-                        context, handle, buffer.baseAddress, .init(buffer.count), SMB2Client.generic_handler, cbPtr
-                    )
-                }
+        let result = try Data(data).withUnsafeBytes { buffer in
+            try client.async_await { context, cbPtr -> Int32 in
+                smb2_write_async(
+                    context, handle, buffer.baseAddress, .init(buffer.count), SMB2Client.generic_handler, cbPtr
+                )
             }
         }
-
         return Int(result)
     }
 
@@ -345,27 +326,14 @@ public final class SMB2FileHandle: @unchecked Sendable {
         )
 
         let handle = try handle.unwrap()
-        let result: Int32
-        if let data = data as? Data {
-            result = try data.withUnsafeBytes { buffer in
-                try client.async_await { context, cbPtr -> Int32 in
-                    smb2_pwrite_async(
-                        context, handle, buffer.baseAddress, .init(buffer.count), offset, SMB2Client.generic_handler,
-                        cbPtr
-                    )
-                }
-            }
-        } else {
-            result = try Data(data).withUnsafeBytes { buffer in
-                try client.async_await { context, cbPtr -> Int32 in
-                    smb2_pwrite_async(
-                        context, handle, buffer.baseAddress, .init(buffer.count), offset, SMB2Client.generic_handler,
-                        cbPtr
-                    )
-                }
+        let result = try Data(data).withUnsafeBytes { buffer in
+            try client.async_await { context, cbPtr -> Int32 in
+                smb2_pwrite_async(
+                    context, handle, buffer.baseAddress, .init(buffer.count), offset, SMB2Client.generic_handler,
+                    cbPtr
+                )
             }
         }
-
         return Int(result)
     }
 
@@ -376,14 +344,11 @@ public final class SMB2FileHandle: @unchecked Sendable {
         }
     }
     
-    /// Reads a range of a file using pipelined requests for maximum throughput.
-    /// Multiple pread operations are dispatched concurrently to the event loop,
-    /// bounded by `maxInFlight`. Results are returned in offset order.
-    ///
-    /// Finding 6: instead of `nonisolated(unsafe) let handle`, capture the opaque pointer
-    /// as an integer and reconstruct it inside each dispatch block. The handle's lifetime is
-    /// guaranteed because the calling function joins via `group.wait()` before returning,
-    /// and the handle can only be closed after this function returns.
+    /// Reads `totalLength` bytes starting at `offset` using pipelined pread requests.
+    /// Up to `maxInFlight` requests are dispatched concurrently; results are returned
+    /// in offset order. The handle pointer is captured as an integer token that is safe
+    /// to pass across Sendable boundaries — the handle itself cannot be closed while
+    /// this function is running because `group.wait()` completes before returning.
     func pipelinedRead(
         offset: UInt64, totalLength: Int64, chunkSize: Int = 0, maxInFlight: Int = 4
     ) throws -> Data {
@@ -398,7 +363,7 @@ public final class SMB2FileHandle: @unchecked Sendable {
             let remaining = totalBytes - Int(currentOffset - offset)
             let windowChunks = min(maxInFlight, (remaining + readSize - 1) / readSize)
 
-            let collector = PipelineCollector(count: windowChunks)
+            let collector = PipelineCollector<Data>(count: windowChunks)
             let group = DispatchGroup()
 
             for i in 0..<windowChunks {
@@ -413,7 +378,6 @@ public final class SMB2FileHandle: @unchecked Sendable {
                     do {
                         let fh = OpaquePointer(bitPattern: handleRaw)!
                         var buffer = client.bufferPool.checkout(minimumSize: chunkLen)
-                        // Finding 11: return buffer to pool on all exit paths
                         defer { client.bufferPool.checkin(buffer) }
                         buffer.count = chunkLen
                         let bytesRead = try buffer.withUnsafeMutableBytes { buf -> Int32 in
@@ -424,8 +388,7 @@ public final class SMB2FileHandle: @unchecked Sendable {
                                 )
                             }
                         }
-                        let readData = Data(buffer.prefix(Int(bytesRead)))
-                        collector.set(index: i, result: .success(readData))
+                        collector.set(index: i, result: .success(Data(buffer.prefix(Int(bytesRead)))))
                     } catch {
                         collector.set(index: i, result: .failure(error))
                     }
@@ -434,10 +397,8 @@ public final class SMB2FileHandle: @unchecked Sendable {
 
             group.wait()
 
-            // Collect results in order
             for i in 0..<windowChunks {
-                let data = try collector.get(index: i)
-                result.append(data)
+                result.append(try collector.get(index: i))
             }
 
             currentOffset += UInt64(windowChunks * readSize)
@@ -446,12 +407,9 @@ public final class SMB2FileHandle: @unchecked Sendable {
         return result
     }
 
-    /// Writes data using pipelined requests for maximum throughput.
-    /// Multiple pwrite operations are dispatched concurrently, bounded by `maxInFlight`.
-    ///
-    /// Finding 6: capture the opaque pointer as an integer and reconstruct it in each
-    /// dispatch block. The handle is guaranteed alive because `group.wait()` is called
-    /// before this function returns.
+    /// Writes `data` starting at `offset` using pipelined pwrite requests.
+    /// Up to `maxInFlight` requests are dispatched concurrently. The handle pointer
+    /// is captured as an integer token — see `pipelinedRead` for the safety argument.
     func pipelinedWrite(data: Data, offset: UInt64, chunkSize: Int = 0, maxInFlight: Int = 4) throws -> Int {
         let handle = try handle.unwrap()
         let handleRaw = UInt(bitPattern: handle)
@@ -464,7 +422,7 @@ public final class SMB2FileHandle: @unchecked Sendable {
             let remaining = data.count - dataOffset
             let windowChunks = min(maxInFlight, (remaining + writeSize - 1) / writeSize)
 
-            let collector = PipelineCollector(count: windowChunks)
+            let collector = PipelineCollector<Int>(count: windowChunks)
             let group = DispatchGroup()
 
             for i in 0..<windowChunks {
@@ -489,7 +447,7 @@ public final class SMB2FileHandle: @unchecked Sendable {
                                 )
                             }
                         }
-                        collector.set(index: i, result: .success(Data(count: Int(written))))
+                        collector.set(index: i, result: .success(Int(written)))
                     } catch {
                         collector.set(index: i, result: .failure(error))
                     }
@@ -498,10 +456,8 @@ public final class SMB2FileHandle: @unchecked Sendable {
 
             group.wait()
 
-            // Check results in order
             for i in 0..<windowChunks {
-                let resultData = try collector.get(index: i)
-                totalWritten += resultData.count
+                totalWritten += try collector.get(index: i)
             }
 
             dataOffset += windowChunks * writeSize
