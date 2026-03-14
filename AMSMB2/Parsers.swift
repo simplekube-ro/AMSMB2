@@ -24,7 +24,7 @@ extension String {
 
 extension Array where Element == SMB2Share {
     init(_ client: SMB2Client, _ dataPtr: UnsafeMutableRawPointer?) throws {
-        defer { smb2_free_data(client.context, dataPtr) }
+        defer { smb2_free_data(client.rawContext, dataPtr) }
         let result = try dataPtr.unwrap().assumingMemoryBound(to: srvsvc_NetrShareEnum_rep.self).pointee
         self = Array(result.ses.ShareInfo.Level1.Buffer.pointee)
     }
@@ -97,7 +97,7 @@ extension DecodableResponse {
             return
         }
 #endif
-        defer { smb2_free_data(client.context, output) }
+        defer { smb2_free_data(client.rawContext, output) }
         let data = Data(bytes: output, count: Int(reply.output_count))
         self = try Self(data: data)
     }

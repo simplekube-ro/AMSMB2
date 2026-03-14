@@ -35,7 +35,7 @@ final class SMB2Directory: Collection {
     }
     
     func makeIterator() -> AnyIterator<smb2dirent> {
-        let context = client.context
+        let context = client.rawContext
         smb2_rewinddir(context, handle)
         return AnyIterator { [handle] in
             smb2_readdir(context, handle)?.pointee
@@ -51,7 +51,7 @@ final class SMB2Directory: Collection {
     }
 
     var count: Int {
-        let context = client.context
+        let context = client.rawContext
         let currentPos = smb2_telldir(context, handle)
         defer {
             smb2_seekdir(context, handle, currentPos)
@@ -66,7 +66,7 @@ final class SMB2Directory: Collection {
     }
 
     subscript(_: Int) -> smb2dirent {
-        let context = client.context
+        let context = client.rawContext
         let currentPos = smb2_telldir(context, handle)
         smb2_seekdir(context, handle, 0)
         defer {
