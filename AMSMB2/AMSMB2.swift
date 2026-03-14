@@ -26,6 +26,16 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
 
     fileprivate var client: SMB2Client?
 
+    /// The underlying SMB2 client instance for direct file handle operations.
+    public var smbClient: SMB2Client {
+        get throws {
+            guard let client else {
+                throw POSIXError(.ENOTCONN)
+            }
+            return client
+        }
+    }
+
     /// SMB2 Share URL.
     public let url: URL
 
