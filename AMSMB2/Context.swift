@@ -392,7 +392,7 @@ extension SMB2Client {
     static let generic_handler: smb2_command_cb = { smb2, status, command_data, cbdata in
         do {
             guard try smb2.unwrap().pointee.fd >= 0 else { return }
-            let cbdata = try cbdata.unwrap().bindMemory(to: CBData.self, capacity: 1).pointee
+            let cbdata = Unmanaged<CBData>.fromOpaque(try cbdata.unwrap()).takeUnretainedValue()
             if NTStatus(rawValue: status) != .success {
                 cbdata.result = status
             }
@@ -430,9 +430,8 @@ extension SMB2Client {
                     dataHandlerError = error
                 }
             }
-            let result = try withUnsafeMutablePointer(to: &cb) { cb in
-                try handler(context, cb)
-            }
+            let cbPtr = Unmanaged.passUnretained(cb).toOpaque()
+            let result = try handler(context, cbPtr)
             try POSIXError.throwIfError(result, description: error)
             try wait_for_reply(&cb)
             let cbResult = cb.result
@@ -468,9 +467,8 @@ extension SMB2Client {
                     dataHandlerError = error
                 }
             }
-            let pdu = try withUnsafeMutablePointer(to: &cb) { cb in
-                try handler(context, cb).unwrap()
-            }
+            let cbPtr = Unmanaged.passUnretained(cb).toOpaque()
+            let pdu = try handler(context, cbPtr).unwrap()
             smb2_queue_pdu(context, pdu)
             try wait_for_reply(&cb)
 

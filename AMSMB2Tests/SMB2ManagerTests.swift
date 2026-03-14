@@ -571,10 +571,6 @@ class SMB2ManagerTests: XCTestCase, @unchecked Sendable {
     }
     
     func testMonitor() async throws {
-        // Change Notify crashes due to a bug in the Swift async wrapper's
-        // callback lifetime management (signal 5/11). Separate connections
-        // fix the deadlock but the callback crash remains.
-        try XCTSkipIf(true, "Change Notify crashes in async callback handler")
         // Use separate connections: monitorItem holds the context lock for the
         // entire poll duration, so writing on the same connection deadlocks.
         let smbMonitor = SMB2Manager(url: server, credential: credential)!

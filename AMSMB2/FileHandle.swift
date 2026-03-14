@@ -336,15 +336,42 @@ public final class SMB2FileHandle: @unchecked Sendable {
     }
     
     func changeNotify(for type: SMB2FileChangeType) throws -> [SMB2FileChangeInfo] {
-        let (_, result) = try client.async_await(dataHandler: [SMB2FileChangeInfo].init) { context, dataPtr in
-            smb2_notify_change_filehandle_async(
-                context, handle,
-                UInt16(type.contains([.recursive]) ? SMB2_CHANGE_NOTIFY_WATCH_TREE : 0),
-                type.completionFilter,
-                0,
-                SMB2Client.generic_handler,
-                dataPtr
+        // Build the Change Notify PDU directly instead of using
+        // smb2_notify_change_filehandle_async, which wraps the callback in
+        // notify_change_cb. That wrapper calls smb2_close() (synchronous)
+        // inside the callback, re-entering the event loop and crashing.
+        let fid = fileId
+        let flags: UInt16 = type.contains(.recursive) ? UInt16(SMB2_CHANGE_NOTIFY_WATCH_TREE) : 0
+        let filter = type.completionFilter
+        let dataHandler: SMB2Client.ContextHandler<[SMB2FileChangeInfo]> = { client, dataPtr in
+            guard let dataPtr else { return [] }
+            let reply = dataPtr.assumingMemoryBound(to: smb2_change_notify_reply.self).pointee
+            guard reply.output_buffer_length > 0, let output = reply.output else { return [] }
+            let fnc = UnsafeMutablePointer<smb2_file_notify_change_information>.allocate(capacity: 1)
+            fnc.initialize(to: smb2_file_notify_change_information())
+            defer {
+                free_smb2_file_notify_change_information(client.rawContext, fnc)
+            }
+            var vec = smb2_iovec(buf: output, len: Int(reply.output_buffer_length), free: nil)
+            smb2_decode_filenotifychangeinformation(client.rawContext, fnc, &vec, 0)
+            var result = [SMB2FileChangeInfo]()
+            var current: UnsafeMutablePointer<smb2_file_notify_change_information>? = fnc
+            while let ptr = current {
+                if ptr.pointee.name != nil {
+                    result.append(SMB2FileChangeInfo(ptr.pointee))
+                }
+                current = ptr.pointee.next
+            }
+            return result
+        }
+        let (_, result) = try client.async_await_pdu(dataHandler: dataHandler) { context, cbPtr in
+            var req = smb2_change_notify_request(
+                flags: flags,
+                output_buffer_length: 0xffff,
+                file_id: fid.uuid,
+                completion_filter: filter
             )
+            return smb2_cmd_change_notify_async(context, &req, SMB2Client.generic_handler, cbPtr)
         }
         return result
     }
