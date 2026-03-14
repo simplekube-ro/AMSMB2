@@ -29,7 +29,11 @@ final class SMB2Directory: Collection {
     }
 
     deinit {
-        try? client.withThreadSafeContext { context in
+        // Convert to raw bits to cross Sendable boundary.
+        let rawHandle = handle.map { UInt(bitPattern: $0) }
+        client.fireAndForget { context in
+            guard let rawHandle else { return }
+            let handle = UnsafeMutablePointer<smb2dir>(bitPattern: rawHandle)
             smb2_closedir(context, handle)
         }
     }
@@ -50,6 +54,7 @@ final class SMB2Directory: Collection {
         count
     }
 
+    @available(*, deprecated, message: "Use makeIterator() and collect entries instead. This performs a full scan.")
     var count: Int {
         let context = client.rawContext
         let currentPos = smb2_telldir(context, handle)

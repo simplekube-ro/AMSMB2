@@ -1517,6 +1517,48 @@ extension SMB2Manager {
 }
 
 extension SMB2Manager {
+    /// Lazily enumerates directory entries, yielding one at a time.
+    /// For recursive listing, descends into subdirectories as they are encountered.
+    private func lazyListDirectory(
+        client: SMB2Client, path: String, recursive: Bool
+    ) -> AsyncThrowingStream<[URLResourceKey: any Sendable], any Error> {
+        AsyncThrowingStream { continuation in
+            do {
+                try self.yieldDirectoryEntries(
+                    client: client, path: path, recursive: recursive, continuation: continuation
+                )
+                continuation.finish()
+            } catch {
+                continuation.finish(throwing: error)
+            }
+        }
+    }
+
+    private func yieldDirectoryEntries(
+        client: SMB2Client, path: String, recursive: Bool,
+        continuation: AsyncThrowingStream<[URLResourceKey: any Sendable], any Error>.Continuation
+    ) throws {
+        let dir = try SMB2Directory(path.canonical, on: client)
+        for ent in dir {
+            let name = String(cString: ent.name)
+            if [".", ".."].contains(name) { continue }
+            var result = [URLResourceKey: any Sendable]()
+            result[.nameKey] = name
+            result[.pathKey] =
+                path.fileURL().appendingPathComponent(name, isDirectory: ent.st.isDirectory).path
+            ent.st.populateResourceValue(&result)
+            continuation.yield(result)
+
+            // Descend into subdirectory immediately (lazy recursive)
+            if recursive && ent.st.isDirectory {
+                let subPath = result[.pathKey] as! String
+                try yieldDirectoryEntries(
+                    client: client, path: subPath, recursive: true, continuation: continuation
+                )
+            }
+        }
+    }
+
     private func listDirectory(client: SMB2Client, path: String, recursive: Bool) throws
         -> [[URLResourceKey: any Sendable]]
     {

@@ -111,9 +111,18 @@ public class AsyncInputStream<Seq>: InputStream, @unchecked Sendable where Seq: 
     private var _streamStatus: Stream.Status = .notOpen
     private let bufferLock = NSLock()
 
-    init(stream: Seq) {
+    /// High-water mark: prefetch pauses when buffer exceeds this size.
+    private let highWaterMark: Int
+    /// Low-water mark: prefetch resumes when buffer drops below this size.
+    private let lowWaterMark: Int
+    /// Continuation used to suspend/resume the prefetch task for backpressure.
+    private var backpressureContinuation: CheckedContinuation<Void, Never>?
+
+    init(stream: Seq, highWaterMark: Int = 4_194_304, lowWaterMark: Int = 1_048_576) {
         self.stream = stream
         self.iterator = stream.makeAsyncIterator()
+        self.highWaterMark = highWaterMark
+        self.lowWaterMark = lowWaterMark
         super.init(data: Data())
         prefetchData()
     }
@@ -128,8 +137,14 @@ public class AsyncInputStream<Seq>: InputStream, @unchecked Sendable where Seq: 
 
     override public func close() {
         _streamStatus = .closed
+        // Resume backpressure if suspended to let prefetch task exit
+        bufferLock.lock()
+        let cont = backpressureContinuation
+        backpressureContinuation = nil
+        bufferLock.unlock()
+        cont?.resume()
     }
-    
+
     override public var streamError: (any Error)? {
         _streamError
     }
@@ -145,21 +160,36 @@ public class AsyncInputStream<Seq>: InputStream, @unchecked Sendable where Seq: 
         @unknown default:
             break
         }
-        
+
         bufferLock.lock()
-        defer { bufferLock.unlock() }
 
         if self.buffer == nil || bufferOffset >= self.buffer!.count {
+            bufferLock.unlock()
             return -1
         }
 
         let bytesToCopy = min(len, self.buffer!.count - bufferOffset)
         self.buffer!.copyBytes(to: buffer, from: bufferOffset..<(bufferOffset + bytesToCopy))
         bufferOffset += bytesToCopy
-        
+
         if bufferOffset == self.buffer!.count {
             _streamStatus = .atEnd
         }
+
+        // Check if we should resume the prefetch task (backpressure relief)
+        let remaining = self.buffer!.count - bufferOffset
+        let cont: CheckedContinuation<Void, Never>?
+        if remaining < lowWaterMark {
+            cont = backpressureContinuation
+            backpressureContinuation = nil
+        } else {
+            cont = nil
+        }
+
+        bufferLock.unlock()
+
+        // Resume prefetch outside the lock
+        cont?.resume()
 
         return bytesToCopy
     }
@@ -179,6 +209,24 @@ public class AsyncInputStream<Seq>: InputStream, @unchecked Sendable where Seq: 
                             self.buffer = Data(data)
                         } else {
                             self.buffer!.append(contentsOf: data)
+                        }
+                    }
+
+                    // Backpressure: pause if buffer exceeds high-water mark
+                    let bufferSize: Int = bufferLock.withLock {
+                        (self.buffer?.count ?? 0) - bufferOffset
+                    }
+                    if bufferSize > highWaterMark {
+                        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                            bufferLock.withLock {
+                                // Re-check under lock — consumer may have drained
+                                let current = (self.buffer?.count ?? 0) - self.bufferOffset
+                                if current > self.lowWaterMark && self._streamStatus != .closed {
+                                    self.backpressureContinuation = continuation
+                                } else {
+                                    continuation.resume()
+                                }
+                            }
                         }
                     }
                 }
