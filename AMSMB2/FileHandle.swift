@@ -11,7 +11,7 @@ import Foundation
 import SMB2
 import SMB2.Raw
 
-public typealias smb2fh = OpaquePointer
+typealias smb2fh = OpaquePointer
 
 #if os(Linux) || os(Android) || os(OpenBSD)
 let O_SYMLINK: Int32 = O_NOFOLLOW
@@ -20,7 +20,12 @@ let O_SYMLINK: Int32 = O_NOFOLLOW
 public final class SMB2FileHandle: @unchecked Sendable {
     private var client: SMB2Client
     private var handle: smb2fh?
+    private let _handleLock = NSLock()
 
+    /// Opens a file for reading at the given path.
+    ///
+    /// Operations on this handle are serialized through the client's internal lock.
+    /// The handle is invalidated if the connection is dropped; do not use after disconnect.
     public convenience init(forReadingAtPath path: String, on client: SMB2Client) throws {
         try self.init(path, flags: O_RDONLY, on: client)
     }
@@ -94,7 +99,9 @@ public final class SMB2FileHandle: @unchecked Sendable {
     init(fileDescriptor: smb2_file_id, on client: SMB2Client) throws {
         self.client = client
         var fileDescriptor = fileDescriptor
-        self.handle = smb2_fh_from_file_id(client.context, &fileDescriptor)
+        self.handle = try client.withThreadSafeContext { context in
+            smb2_fh_from_file_id(context, &fileDescriptor)
+        }
     }
 
     // This initializer does not support O_SYMLINK.
@@ -116,26 +123,34 @@ public final class SMB2FileHandle: @unchecked Sendable {
     }
 
     deinit {
-        do {
-            let handle = try self.handle.unwrap()
-            try client.async_await { context, cbPtr -> Int32 in
-                smb2_close_async(context, handle, SMB2Client.generic_handler, cbPtr)
-            }
-        } catch {}
+        _handleLock.lock()
+        let captured = handle
+        handle = nil
+        _handleLock.unlock()
+        guard let captured else { return }
+        _ = try? client.async_await { context, cbPtr -> Int32 in
+            smb2_close_async(context, captured, SMB2Client.generic_handler, cbPtr)
+        }
     }
 
     var fileId: UUID {
         .init(uuid: (try? smb2_get_file_id(handle.unwrap()).unwrap().pointee) ?? compound_file_id)
     }
 
+    /// Closes the file handle synchronously. Safe to call from any thread.
+    /// After calling, further operations on this handle will throw.
     public func close() {
-        guard let handle = handle else { return }
-        self.handle = nil
+        _handleLock.lock()
+        let captured = handle
+        handle = nil
+        _handleLock.unlock()
+        guard let captured else { return }
         _ = try? client.withThreadSafeContext { context in
-            smb2_close(context, handle)
+            smb2_close(context, captured)
         }
     }
 
+    /// Returns file status. Serialized through the client's internal lock.
     public func fstat() throws -> smb2_stat_64 {
         let handle = try handle.unwrap()
         var st = smb2_stat_64()
@@ -190,6 +205,7 @@ public final class SMB2FileHandle: @unchecked Sendable {
         }
     }
 
+    /// Maximum read size supported by the server. Serialized through the client's internal lock.
     public var maxReadSize: Int {
         (try? Int(client.withThreadSafeContext(smb2_get_max_read_size))) ?? -1
     }
@@ -202,7 +218,9 @@ public final class SMB2FileHandle: @unchecked Sendable {
     @discardableResult
     func lseek(offset: Int64, whence: SeekWhence) throws -> Int64 {
         let handle = try handle.unwrap()
-        let result = smb2_lseek(client.context, handle, offset, whence.rawValue, nil)
+        let result = try client.withThreadSafeContext { context in
+            smb2_lseek(context, handle, offset, whence.rawValue, nil)
+        }
         try POSIXError.throwIfError(result, description: client.error)
         return result
     }
@@ -225,6 +243,8 @@ public final class SMB2FileHandle: @unchecked Sendable {
         return Data(buffer.prefix(Int(result)))
     }
 
+    /// Reads data at the specified offset without changing the file position.
+    /// Serialized through the client's internal lock.
     public func pread(offset: UInt64, length: Int = 0) throws -> Data {
         precondition(
             length <= UInt32.max, "Length bigger than UInt32.max can't be handled by libsmb2."

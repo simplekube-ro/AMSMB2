@@ -10,13 +10,17 @@
 import Foundation
 import SMB2
 
-/// Provides synchronous operation on SMB2
+/// Provides synchronous operations on SMB2.
+///
+/// Thread safety: `SMB2Client` is `@unchecked Sendable`. All operations that touch
+/// the underlying `smb2_context` are serialized through an internal recursive lock
+/// via ``withThreadSafeContext(_:)``. Do not access the raw context outside this mechanism.
 public final class SMB2Client: CustomDebugStringConvertible, CustomReflectable, @unchecked Sendable {
-    var context: UnsafeMutablePointer<smb2_context>?
+    private var context: UnsafeMutablePointer<smb2_context>?
     private var _context_lock = NSRecursiveLock()
     var timeout: TimeInterval
 
-    init(timeout: TimeInterval) throws {
+    internal init(timeout: TimeInterval) throws {
         self.context = try smb2_init_context().unwrap()
         self.timeout = timeout
     }
@@ -31,6 +35,9 @@ public final class SMB2Client: CustomDebugStringConvertible, CustomReflectable, 
             smb2_destroy_context(context)
         }
     }
+
+    /// Raw context pointer for internal module use. Callers must ensure thread safety.
+    var rawContext: UnsafeMutablePointer<smb2_context>? { context }
 
     func withThreadSafeContext<R>(_ handler: (UnsafeMutablePointer<smb2_context>) throws -> R)
         throws -> R

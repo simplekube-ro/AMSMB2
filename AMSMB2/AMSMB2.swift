@@ -27,9 +27,17 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
     fileprivate var client: SMB2Client?
 
     /// The underlying SMB2 client instance for direct file handle operations.
+    ///
+    /// The returned client is only valid while the connection is active. Do not store
+    /// the reference beyond the immediate operation — a reconnect or disconnect will
+    /// invalidate it. All operations on the client are serialized through an internal lock.
+    ///
+    /// - Throws: `POSIXError(.ENOTCONN)` if no connection is active.
     public var smbClient: SMB2Client {
         get throws {
-            guard let client else {
+            connectLock.lock()
+            defer { connectLock.unlock() }
+            guard let client, client.fileDescriptor != -1 else {
                 throw POSIXError(.ENOTCONN)
             }
             return client
