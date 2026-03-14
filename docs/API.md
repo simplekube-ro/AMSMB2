@@ -361,7 +361,7 @@ func monitorItem(atPath path: String, for filter: SMB2FileChangeType) async thro
     -> [SMB2FileChangeInfo]
 ```
 
-Monitors a file or directory for changes. Blocks until a change matching the filter occurs or timeout expires. Use separate connections for monitoring and writing — `monitorItem` holds the context lock for the entire poll duration.
+Monitors a file or directory for changes. Blocks until a change matching the filter occurs or timeout expires. The operation uses the event loop like any other async operation, so it does not block other operations on the same connection. However, using a separate connection for monitoring is still recommended for clarity.
 
 - **Parameters:**
   - `path` — Path to monitor
@@ -377,7 +377,7 @@ public final class SMB2Client: CustomDebugStringConvertible, CustomReflectable,
                                 @unchecked Sendable
 ```
 
-Low-level wrapper around libsmb2's `smb2_context`. All access to the underlying C context is serialized through `withThreadSafeContext()`.
+Low-level wrapper around libsmb2's `smb2_context`. All access to the underlying C context is serialized through a dedicated serial `DispatchQueue` (the "event loop"). Socket I/O is driven by `DispatchSource` for efficient, non-blocking operation handling. Multiple operations can be in-flight simultaneously.
 
 | Property | Type | Description |
 |----------|------|-------------|
@@ -403,6 +403,8 @@ Represents an open file on the SMB share. Obtained by opening files through `SMB
 | `close()` | Method | Closes the handle. Safe to call from any thread. Uses lock-nil-swap pattern to prevent double-close. |
 | `fstat()` | Method | Returns `smb2_stat_64` with file metadata. Throws on error. |
 | `pread(offset:length:)` | Method | Reads data at offset without changing file position. |
+| `pipelinedRead(offset:totalLength:chunkSize:maxInFlight:)` | Method | Reads `totalLength` bytes using multiple concurrent pread requests. Up to `maxInFlight` (default: 4) chunks are dispatched simultaneously via `DispatchGroup`. Results are returned in offset order. |
+| `pipelinedWrite(data:offset:chunkSize:maxInFlight:)` | Method | Writes data using multiple concurrent pwrite requests. Up to `maxInFlight` (default: 4) chunks are dispatched simultaneously. Returns total bytes written. |
 
 ---
 
@@ -470,6 +472,17 @@ public class AsyncInputStream<Seq>: InputStream, @unchecked Sendable
 ```
 
 Adapts an `AsyncSequence` of `DataProtocol` chunks into an `InputStream` for use with `SMB2Manager.write(stream:toPath:)`.
+
+### Backpressure
+
+`AsyncInputStream` uses high-water/low-water mark flow control to bound memory usage during large file streaming:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `highWaterMark` | 4 MB (4,194,304 bytes) | When the internal buffer exceeds this size, the prefetch task suspends. |
+| `lowWaterMark` | 1 MB (1,048,576 bytes) | When consumption drains the buffer below this size, the suspended prefetch task resumes. |
+
+This prevents unbounded memory growth when the producer (async sequence) is faster than the consumer (SMB write operations). The prefetch task also resumes if the stream is closed, to avoid deadlocks.
 
 ---
 

@@ -11,7 +11,8 @@ This fork extends the original with the following improvements:
 | Area | Original | This Fork |
 |------|----------|-----------|
 | **Public API surface** | Only `SMB2Manager` is public; internal types are inaccessible | `SMB2Client` and `SMB2FileHandle` exposed as public API for direct file handle operations |
-| **Thread safety** | Context access unprotected in some paths; file handle close/deinit has race conditions | Lock-protected context access via `withThreadSafeContext()`; nil-swap close pattern prevents double-close races; `smbClient` getter validates connection under lock |
+| **Thread safety** | Context access unprotected in some paths; file handle close/deinit has race conditions | Serial event loop queue exclusively owns `smb2_context`; `DispatchSource`-based socket monitoring; nil-swap close pattern prevents double-close races; `smbClient` getter validates connection under lock |
+| **Performance** | Single-threaded poll loop blocks during each operation; only one operation at a time | Event loop + `DispatchSource` I/O allows multiple in-flight operations; `BufferPool` eliminates per-read allocation; pipelined read/write dispatch concurrent chunks via `DispatchGroup`; `AsyncInputStream` backpressure bounds memory during streaming |
 | **Server-side copy** | Sends copy chunks using negotiated write size (~8 MB), exceeding the MS-SMB2 spec limit | Chunks capped at 1 MiB per MS-SMB2 section 3.3.5.15.6.2 — works with all spec-compliant servers |
 | **Symlink creation** | `ReparseDataLength` omits 12-byte symlink header, causing `STATUS_IO_REPARSE_DATA_INVALID` on Samba 4.21+ | Correct reparse data format per MS-FSCC 2.1.2.4 |
 | **Change Notify** | Crashes (signal 5/11) due to re-entrant `smb2_close()` inside callback + dangling `withUnsafeMutablePointer` | Direct PDU construction bypasses re-entrant wrapper; `Unmanaged<CBData>` for safe C callback pointers |
@@ -28,7 +29,8 @@ This fork extends the original with the following improvements:
 - Symbolic link creation and resolution
 - File system and item attribute queries
 - Change Notify (file monitoring)
-- Streaming writes via `AsyncSequence`
+- Streaming writes via `AsyncSequence` with backpressure flow control
+- Pipelined read/write for high-throughput file transfers
 - `NSSecureCoding` and `Codable` support for connection serialization
 - Objective-C compatibility layer
 - Direct access to `SMB2Client` and `SMB2FileHandle` for advanced use cases
@@ -126,7 +128,7 @@ make cleanlinuxtest   # Clean Docker build
 
 ## Documentation
 
-- **[Architecture](docs/ARCHITECTURE.md)** — Layer stack, connection lifecycle, async operation flow, thread safety model
+- **[Architecture](docs/ARCHITECTURE.md)** — Layer stack, event loop model, socket monitoring, buffer pool, pipelined I/O, thread safety model
 - **[API Reference](docs/API.md)** — Complete reference for all public types and methods
 
 ## License
