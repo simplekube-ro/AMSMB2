@@ -1,0 +1,20 @@
+version: "3.8"
+services:
+  smb-test:
+    image: ghcr.io/simplekube-ro/samba:1.2
+    container_name: amsmb2-smb-test
+    ports:
+      - "445:445"
+    volumes:
+      - smb-data:/share
+      - ./samba/smb.conf:/etc/samba/smb.conf:ro
+    command: ["sh", "-c", "useradd -M testuser && printf 'testpass\\ntestpass\\n' | smbpasswd -a -s testuser && chmod 777 /share && echo 'seed' > /share/seed.txt && chown testuser: /share/seed.txt && smbd --foreground --no-process-group"]
+    restart: "no"
+    healthcheck:
+      test: ["CMD", "smbclient", "-L", "localhost", "-N"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  smb-data:

@@ -1607,8 +1607,8 @@ extension SMB2Manager {
         let fileSource = try SMB2FileHandle(forReadingAtPath: path, on: client)
         let size = try Int64(fileSource.fstat().smb2_size)
         let sourceKey: IOCtl.RequestResumeKey = try fileSource.fcntl(command: .srvRequestResumeKey)
-        // TODO: Get chunk size from server
-        let chunkSize = fileSource.optimizedWriteSize
+        // MS-SMB2 limits individual copy chunks to 1 MiB (spec section 3.3.5.15.6.2).
+        let chunkSize = min(fileSource.optimizedWriteSize, 1_048_576)
         let chunkArray = stride(from: 0, to: UInt64(size), by: chunkSize).map {
             IOCtl.SrvCopyChunk(
                 sourceOffset: $0, targetOffset: $0,

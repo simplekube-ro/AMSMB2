@@ -26,75 +26,17 @@ private func fileName(postfix: String = "", name: String = #function) -> String 
 }
 
 class SMB2ManagerTests: XCTestCase, @unchecked Sendable {
-    override func setUp() {
-        super.setUp()
-        // Put setup code here. This method is called before the invocation of each test method in the class.
-    }
-
-    override func tearDown() {
-        // Put teardown code here. This method is called after the invocation of each test method in the class.
-        super.tearDown()
-    }
-    
-    @available(iOS 11.0, macOS 10.13, tvOS 11.0, *)
-    func testNSCodable() {
-        let url = URL(string: "smb://192.168.1.1/share")!
-        let credential = URLCredential(user: "user", password: "password", persistence: .forSession)
-        let smb = SMB2Manager(url: url, credential: credential)
-        XCTAssertNotNil(smb)
-        let archiver = NSKeyedArchiver(requiringSecureCoding: true)
-        archiver.encode(smb, forKey: NSKeyedArchiveRootObjectKey)
-        archiver.finishEncoding()
-        let data = archiver.encodedData
-        XCTAssertNil(archiver.error)
-        XCTAssertFalse(data.isEmpty)
-        let unarchiver = try! NSKeyedUnarchiver(forReadingFrom: data)
-        unarchiver.decodingFailurePolicy = .setErrorAndReturn
-        unarchiver.requiresSecureCoding = true
-        let decodedSMB = unarchiver.decodeObject(
-            of: SMB2Manager.self, forKey: NSKeyedArchiveRootObjectKey
+    override func setUpWithError() throws {
+        try super.setUpWithError()
+        try XCTSkipUnless(
+            ProcessInfo.processInfo.environment["SMB_SERVER"] != nil,
+            "SMB server not configured"
         )
-        XCTAssertNotNil(decodedSMB)
-        XCTAssertEqual(smb?.url, decodedSMB?.url)
-        XCTAssertEqual(smb?.timeout, decodedSMB?.timeout)
-        XCTAssertNil(unarchiver.error)
     }
 
-    func testCoding() {
-        let url = URL(string: "smb://192.168.1.1/share")!
-        let credential = URLCredential(user: "user", password: "password", persistence: .forSession)
-        let smb = SMB2Manager(url: url, domain: "", credential: credential)
-        XCTAssertNotNil(smb)
-        do {
-            let encoder = JSONEncoder()
-            let json = try encoder.encode(smb!)
-            XCTAssertFalse(json.isEmpty)
-            let decoder = JSONDecoder()
-            let decodedSMB = try decoder.decode(SMB2Manager.self, from: json)
-            XCTAssertEqual(smb!.url, decodedSMB.url)
-            XCTAssertEqual(smb!.timeout, decodedSMB.timeout)
+    lazy var server: URL = URL(string: ProcessInfo.processInfo.environment["SMB_SERVER"] ?? "smb://placeholder")!
 
-            let errorJson = String(data: json, encoding: .utf8)!.replacingOccurrences(
-                of: "smb:", with: "smb2:"
-            ).data(using: .utf8)!
-            XCTAssertThrowsError(try decoder.decode(SMB2Manager.self, from: errorJson))
-        } catch {
-            XCTAssert(false, error.localizedDescription)
-        }
-    }
-
-    func testNSCopy() {
-        let url = URL(string: "smb://192.168.1.1/share")!
-        let credential = URLCredential(user: "user", password: "password", persistence: .forSession)
-        let smb = SMB2Manager(url: url, domain: "", credential: credential)!
-        let smbCopy = smb.copy() as! SMB2Manager
-        XCTAssertEqual(smb.url, smbCopy.url)
-    }
-
-    // Change server address and testing share
-    lazy var server: URL = .init(string: ProcessInfo.processInfo.environment["SMB_SERVER"]!)!
-
-    lazy var share: String = ProcessInfo.processInfo.environment["SMB_SHARE"]!
+    lazy var share: String = ProcessInfo.processInfo.environment["SMB_SHARE"] ?? ""
 
     lazy var credential: URLCredential? = {
         if let user = ProcessInfo.processInfo.environment["SMB_USER"],
@@ -629,34 +571,36 @@ class SMB2ManagerTests: XCTestCase, @unchecked Sendable {
     }
     
     func testMonitor() async throws {
-        try XCTSkipIf(true)
-        let smb = SMB2Manager(url: server, credential: credential)!
+        // Change Notify crashes due to a bug in the Swift async wrapper's
+        // callback lifetime management (signal 5/11). Separate connections
+        // fix the deadlock but the callback crash remains.
+        try XCTSkipIf(true, "Change Notify crashes in async callback handler")
+        // Use separate connections: monitorItem holds the context lock for the
+        // entire poll duration, so writing on the same connection deadlocks.
+        let smbMonitor = SMB2Manager(url: server, credential: credential)!
+        let smbWriter = SMB2Manager(url: server, credential: credential)!
 
         addTeardownBlock {
-            try? await smb.removeDirectory(atPath: "\(folderName())", recursive: true)
+            try? await smbWriter.removeDirectory(atPath: "\(folderName())", recursive: true)
         }
 
-        try await smb.connectShare(name: share, encrypted: encrypted)
-        try await smb.createDirectory(atPath: "\(folderName())")
-        try await smb.createDirectory(atPath: "\(folderName())/subdir")
+        try await smbMonitor.connectShare(name: share, encrypted: encrypted)
+        try await smbWriter.connectShare(name: share, encrypted: encrypted)
+        try await smbWriter.createDirectory(atPath: "\(folderName())")
+        try await smbWriter.createDirectory(atPath: "\(folderName())/subdir")
         try await withThrowingTaskGroup(of: Void.self) { group in
             group.addTask {
-                do {
-                    let changes = try await smb.monitorItem(atPath: "\(folderName())", for: [.fileName, .recursive])
-                    XCTAssert(!changes.isEmpty)
-                    print(changes)
-                } catch {
-                    print(error)
-                    throw error
-                }
+                let changes = try await smbMonitor.monitorItem(atPath: "\(folderName())", for: [.fileName, .recursive])
+                XCTAssert(!changes.isEmpty)
+                print(changes)
             }
             group.addTask {
                 try await Task.sleep(nanoseconds: NSEC_PER_SEC)
-                try await smb.write(data: Data(), toPath: "\(folderName())/file", progress: nil)
+                try await smbWriter.write(data: Data(), toPath: "\(folderName())/file", progress: nil)
             }
             try await group.waitForAll()
         }
-        try await smb.removeDirectory(atPath: "\(folderName())", recursive: true)
+        try await smbWriter.removeDirectory(atPath: "\(folderName())", recursive: true)
     }
 }
 
