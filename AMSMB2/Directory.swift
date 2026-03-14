@@ -15,6 +15,7 @@ typealias smb2dirPointer = UnsafeMutablePointer<smb2dir>?
 /// - Note: This class is NOT thread-safe.
 final class SMB2Directory: Collection {
     private let path: String
+    // Finding 8+16: keep `client` alive — never store raw context pointer
     private let client: SMB2Client
     private var handle: smb2dirPointer
 
@@ -23,7 +24,7 @@ final class SMB2Directory: Collection {
         let (_, handle) = try client.async_await(dataHandler: OpaquePointer.init) { context, cbPtr -> Int32 in
             smb2_opendir_async(context, path, SMB2Client.generic_handler, cbPtr)
         }
-        
+
         self.client = client
         self.handle = .init(handle)
     }
@@ -37,13 +38,19 @@ final class SMB2Directory: Collection {
             smb2_closedir(context, handle)
         }
     }
-    
-    func makeIterator() -> AnyIterator<smb2dirent> {
-        let context = client.rawContext
-        smb2_rewinddir(context, handle)
-        return AnyIterator { [handle] in
-            smb2_readdir(context, handle)?.pointee
-        }
+
+    // Finding 8+16: materialize all entries eagerly inside withContext so the raw context
+    // pointer never escapes the event loop queue.
+    func makeIterator() -> IndexingIterator<[smb2dirent]> {
+        let entries: [smb2dirent] = (try? client.withContext { context in
+            smb2_rewinddir(context, self.handle)
+            var result: [smb2dirent] = []
+            while let entry = smb2_readdir(context, self.handle) {
+                result.append(entry.pointee)
+            }
+            return result
+        }) ?? []
+        return entries.makeIterator()
     }
 
     var startIndex: Int {
@@ -56,28 +63,29 @@ final class SMB2Directory: Collection {
 
     @available(*, deprecated, message: "Use makeIterator() and collect entries instead. This performs a full scan.")
     var count: Int {
-        let context = client.rawContext
-        let currentPos = smb2_telldir(context, handle)
-        defer {
-            smb2_seekdir(context, handle, currentPos)
-        }
-
-        smb2_rewinddir(context, handle)
-        var result = 0
-        while smb2_readdir(context, handle) != nil {
-            result += 1
-        }
-        return result
+        (try? client.withContext { context in
+            let currentPos = smb2_telldir(context, self.handle)
+            defer {
+                smb2_seekdir(context, self.handle, currentPos)
+            }
+            smb2_rewinddir(context, self.handle)
+            var result = 0
+            while smb2_readdir(context, self.handle) != nil {
+                result += 1
+            }
+            return result
+        }) ?? 0
     }
 
     subscript(_: Int) -> smb2dirent {
-        let context = client.rawContext
-        let currentPos = smb2_telldir(context, handle)
-        smb2_seekdir(context, handle, 0)
-        defer {
-            smb2_seekdir(context, handle, currentPos)
-        }
-        return smb2_readdir(context, handle).pointee
+        (try? client.withContext { context in
+            let currentPos = smb2_telldir(context, self.handle)
+            smb2_seekdir(context, self.handle, 0)
+            defer {
+                smb2_seekdir(context, self.handle, currentPos)
+            }
+            return smb2_readdir(context, self.handle).pointee
+        }) ?? smb2dirent()
     }
 
     func index(after index: Int) -> Int {

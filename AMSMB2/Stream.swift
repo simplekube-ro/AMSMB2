@@ -202,6 +202,15 @@ public class AsyncInputStream<Seq>: InputStream, @unchecked Sendable where Seq: 
 
     private func prefetchData() {
         Task { @Sendable in
+            // Finding 10: on any exit path (normal or error), resume a suspended
+            // backpressureContinuation so the caller is never left waiting forever.
+            defer {
+                bufferLock.withLock {
+                    let cont = backpressureContinuation
+                    backpressureContinuation = nil
+                    cont?.resume()
+                }
+            }
             do {
                 while let data = try await iterator.next() {
                     bufferLock.withLock {
