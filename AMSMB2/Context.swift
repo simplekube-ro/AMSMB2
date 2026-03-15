@@ -476,14 +476,19 @@ extension SMB2Client {
     }
 
     func disconnect() throws {
-        // Run teardown on the event loop queue so it is serialized with any
-        // in-flight handleSocketEvent callbacks.
+        // Send a best-effort disconnect PDU and tear down in one atomic block
+        // on the event loop queue. Uses fire-and-forget (matching shutdown())
+        // because no caller inspects the disconnect result.
         eventLoopQueue.sync {
+            guard let context = self.context, smb2_get_fd(context) >= 0 else {
+                self.stopSocketMonitoring()
+                self.failAllPendingOperations(with: POSIXError(.ENOTCONN))
+                return
+            }
+            smb2_disconnect_share_async(context, SMB2Client.generic_handler_noop, nil)
+            smb2_service(context, Int32(POLLOUT))
             self.stopSocketMonitoring()
             self.failAllPendingOperations(with: POSIXError(.ENOTCONN))
-        }
-        _=try? async_await { context, cbPtr -> Int32 in
-            smb2_disconnect_share_async(context, SMB2Client.generic_handler, cbPtr)
         }
     }
 

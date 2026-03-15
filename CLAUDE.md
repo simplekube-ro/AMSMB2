@@ -54,6 +54,26 @@ make cleanlinuxtest         # Clean Docker build
 - **libsmb2** - C library in `Dependencies/libsmb2/`, compiled as a Swift package target
 - **swift-atomics** - Used in tests only
 
+## Development Process
+
+### Feature Planning (OpenSpec)
+
+All feature work, bug fixes with design decisions, and test additions MUST use the OpenSpec workflow:
+1. `/opsx:propose` — create proposal, design, specs, and tasks
+2. `/opsx:apply` — implement tasks from the change
+3. `/opsx:archive` — archive the completed change
+
+Do not skip straight to implementation. The spec-driven process ensures changes are well-designed before code is written.
+
+### Test-Driven Development (TDD)
+
+All development MUST follow TDD:
+1. Write a failing test first
+2. Write the minimum implementation to make it pass
+3. Refactor while keeping tests green
+
+Do not write implementation code without a corresponding test. Run tests after each change to verify the red-green-refactor cycle.
+
 ## Code Style
 
 The project uses SwiftFormat (`.swiftformat`) and swift-format (`.swift-format`):
