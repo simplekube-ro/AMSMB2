@@ -234,8 +234,10 @@ public final class SMB2FileHandle: @unchecked Sendable {
     }
 
     /// Maximum read size supported by the server. Serialized through the client's internal lock.
+    /// Returns `0` when the SMB context is unavailable (e.g., disconnected), signaling
+    /// that the handle is no longer usable.
     public var maxReadSize: Int {
-        (try? Int(client.withContext(smb2_get_max_read_size))) ?? -1
+        (try? Int(client.withContext(smb2_get_max_read_size))) ?? 0
     }
 
     /// This value allows softer streaming
