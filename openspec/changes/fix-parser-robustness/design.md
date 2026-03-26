@@ -39,9 +39,9 @@ The AMSMB2 library parses binary protocol data from SMB2 servers in several plac
 
 **Choice**: Before each `offset += 2` padding adjustment, check `offset + 2 <= data.count`. If not, throw `POSIXError(.EINVAL)`. This matches the existing error pattern used for the main offset checks on lines 62-63 and 83-84.
 
-### D5: MSRPC padding — use byte-count alignment
+### D5: MSRPC padding — SKIPPED (existing code is correct)
 
-**Choice**: Replace `serverNameLen % 2 == 1` with alignment based on the actual byte position. After writing `serverNameData`, if the total byte offset is not 4-byte aligned, add 2 bytes of padding. Specifically: `serverNameData.count % 4 != 0 ? .init(value: 0 as UInt16) : .init(value: 0 as UInt16)` — actually, the NDR alignment rule for conformant strings is to align the next field to 4 bytes. The correct check is whether `(fixed_header_size + serverNameData.count) % 4 != 0`.
+**Original analysis was wrong.** The existing `serverNameLen % 2 == 1` check IS correct 4-byte NDR alignment: `serverNameLen * 2 % 4 == 0` ⟺ `serverNameLen % 2 == 0`, so odd `serverNameLen` correctly triggers 2 extra bytes of padding. Verified by tracing through multiple server name lengths. No change needed.
 
 ## Risks / Trade-offs
 
