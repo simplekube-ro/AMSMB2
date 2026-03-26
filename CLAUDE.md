@@ -20,7 +20,7 @@ swift build --disable-sandbox
 # Run all tests (unit tests run, integration tests skip without server)
 swift test --disable-sandbox
 
-# Shorthand (no --disable-sandbox; use swift test directly in Claude Code)
+# Shorthand (WARNING: omits --disable-sandbox, will fail in Claude Code sandbox)
 make test
 
 # Run a specific test
@@ -167,3 +167,4 @@ The project uses SwiftFormat (`.swiftformat`) and swift-format (`.swift-format`)
 - 100/132 character line length
 - File headers with MIT license
 - LF line endings
+- Errors use `POSIXError(.CODE)` (e.g., `.EINVAL`, `.ENOTCONN`) — no custom Error types
