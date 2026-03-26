@@ -60,7 +60,7 @@ public final class SMB2Client: CustomDebugStringConvertible, CustomReflectable, 
 
     /// Serial queue that exclusively owns the smb2_context.
     /// All libsmb2 calls must execute on this queue.
-    private let eventLoopQueue: DispatchQueue
+    let eventLoopQueue: DispatchQueue
 
     /// Used to detect re-entrant calls to the event loop queue and avoid deadlocks.
     private static let queueKey = DispatchSpecificKey<Bool>()
@@ -81,7 +81,8 @@ public final class SMB2Client: CustomDebugStringConvertible, CustomReflectable, 
         self.context = ctx
         self.timeout = timeout
         self.eventLoopQueue = DispatchQueue(
-            label: "smb2_eventloop_\(UInt(bitPattern: ctx))"
+            label: "smb2_eventloop_\(UInt(bitPattern: ctx))",
+            qos: .userInitiated
         )
         self.eventLoopQueue.setSpecific(key: Self.queueKey, value: true)
     }
