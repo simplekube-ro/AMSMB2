@@ -20,6 +20,9 @@ swift build --disable-sandbox
 # Run all tests (unit tests run, integration tests skip without server)
 swift test --disable-sandbox
 
+# Shorthand (no --disable-sandbox; use swift test directly in Claude Code)
+make test
+
 # Run a specific test
 swift test --disable-sandbox --filter SMB2ManagerUnitTests/testName
 
@@ -51,6 +54,11 @@ make cleanlinuxtest         # Clean Docker build
 - [FileMonitoring.swift](AMSMB2/FileMonitoring.swift) - Change Notify types (SMB2FileChangeType, SMB2FileChangeAction, SMB2FileChangeInfo)
 - [Parsers.swift](AMSMB2/Parsers.swift) - Response parsing — decodes C structs into Swift types
 - [Extensions.swift](AMSMB2/Extensions.swift) - URLResourceKey convenience accessors, POSIXError helpers
+
+### Internal Types (not public API)
+
+- `ShareProperties`, `ShareType` (Context.swift) — used by `listShares()` internally; not exposed to consumers
+- `SMB2Directory` (Directory.swift) — collection wrapper for `smb2dir` C handle
 
 ### Dependencies
 
@@ -138,6 +146,18 @@ Minimise token usage — this directly affects cost and speed:
 - **Match verbosity to task complexity**: Routine ops (merge, simple file edits) need minimal commentary. Save detailed explanations for complex logic, architectural decisions, or when asked.
 - **One tool call, not three**: Prefer a single well-constructed command over multiple incremental checks.
 - **Don't narrate tool use**: Skip "Let me read the file" or "Let me check the status" — just do it.
+
+## Testing Gotchas
+
+- Test files are in `AMSMB2Tests/` (not `Tests/`) — glob `AMSMB2Tests/*.swift`
+- C library functions (`smb2_*`) require `import SMB2` in test files; not re-exported via `@testable import AMSMB2`
+- `SMB2Manager` has multiple `contents(atPath:)` overloads — in async test context, compiler picks `async throws -> Data` over `AsyncThrowingStream`. Use explicit type: `let stream: AsyncThrowingStream<Data, any Error> = smb.contents(atPath:)`
+- `make integrationtest` fails inside Claude Code (sandbox-exec permission denied). Use `swift test --disable-sandbox` for unit tests instead
+- `SMB2Client.disconnect()` does not nil the context — can't simulate fully disconnected state in unit tests
+
+## Commit Convention
+
+Conventional commits: `fix:`, `feat:`, `docs:`, `chore:`, `refactor:`, `test:`
 
 ## Code Style
 
