@@ -66,6 +66,18 @@ class SMB2ManagerUnitTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(smb.url, smbCopy.url)
     }
 
+    func testEventLoopQueueQoS() throws {
+        let client = try SMB2Client(timeout: 30)
+        XCTAssertEqual(
+            client.eventLoopQueue.qos, .userInitiated,
+            "eventLoopQueue must run at .userInitiated to avoid priority inversion"
+        )
+        XCTAssertTrue(
+            client.eventLoopQueue.label.hasPrefix("smb2_eventloop_"),
+            "eventLoopQueue label must follow the smb2_eventloop_<address> pattern"
+        )
+    }
+
     func testInitWithInvalidURL() {
         let httpURL = URL(string: "http://192.168.1.1/share")!
         let credential = URLCredential(user: "user", password: "password", persistence: .forSession)

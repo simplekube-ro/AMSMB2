@@ -113,7 +113,7 @@ graph TB
     end
 
     subgraph SMB2Client
-        ELQ["eventLoopQueue (serial DispatchQueue)<br/><i>Exclusively owns smb2_context</i>"]
+        ELQ["eventLoopQueue (serial DispatchQueue, .userInitiated)<br/><i>Exclusively owns smb2_context</i>"]
         SM["SocketMonitor (DispatchSource)<br/><i>Monitors socket readability/writability</i>"]
         SEM["Per-operation DispatchSemaphore<br/><i>Caller blocks until reply arrives</i>"]
     end
@@ -132,7 +132,7 @@ graph TB
 |-----------|------|----------|-------------|
 | `connectLock` | `NSLock` | `SMB2Manager.client` reference, connection state | `connectShare()`, `disconnectShare()`, `smbClient` getter |
 | `operationLock` | `NSCondition` | `operationCount` — tracks in-flight operations | Increment/decrement around each queued operation |
-| `eventLoopQueue` | Serial `DispatchQueue` | All access to the `smb2_context` C pointer | PDU setup (brief `sync`), socket event handling, shutdown |
+| `eventLoopQueue` | Serial `DispatchQueue` (`.userInitiated` QoS) | All access to the `smb2_context` C pointer | PDU setup (brief `sync`), socket event handling, shutdown |
 | `SocketMonitor` | `DispatchSource` (read + write) | Socket I/O event delivery | Fires on the event loop queue when the socket is readable/writable |
 | `CBData.semaphore` | `DispatchSemaphore` | Per-operation completion signaling | Caller waits after PDU setup; signaled by `generic_handler` |
 | `_handleLock` | `NSLock` | `SMB2FileHandle.handle` pointer | `close()` and `deinit` only (nil-swap pattern) |
