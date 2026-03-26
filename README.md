@@ -31,7 +31,7 @@ This fork extends the original with the following improvements:
 - Change Notify (file monitoring)
 - Streaming writes via `AsyncSequence` with backpressure flow control
 - Pipelined read/write for high-throughput file transfers
-- `NSSecureCoding` and `Codable` support for connection serialization
+- `NSSecureCoding` and `Codable` support for connection serialization (passwords intentionally excluded for security)
 - Objective-C compatibility layer
 - Direct access to `SMB2Client` and `SMB2FileHandle` for advanced use cases
 

@@ -84,10 +84,9 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
         c.append((label: "url", value: url))
         c.append((label: "isConnected", value: (client?.isConnected ?? false)))
         c.append((label: "timeout", value: _timeout))
-        if _domain.isEmpty { c.append((label: "domain", value: _domain)) }
-        if _workstation.isEmpty { c.append((label: "workstation", value: _workstation)) }
-        if _workstation.isEmpty { c.append((label: "workstation", value: _workstation)) }
-        c.append((label: "user", value: _user))
+        if !_domain.isEmpty { c.append((label: "domain", value: _domain)) }
+        if !_workstation.isEmpty { c.append((label: "workstation", value: _workstation)) }
+        c.append((label: "user", value: "<redacted>"))
         if let connectedShare = client?.share { c.append((label: "share", value: connectedShare)) }
 
         let m = Mirror(self, children: c, displayStyle: .class)
@@ -188,7 +187,6 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
         aCoder.encode(_domain, forKey: CodingKeys.domain.stringValue)
         aCoder.encode(_workstation, forKey: CodingKeys.workstation.stringValue)
         aCoder.encode(_user, forKey: CodingKeys.user.stringValue)
-        aCoder.encode(_password, forKey: CodingKeys.password.stringValue)
         aCoder.encode(timeout, forKey: CodingKeys.timeout.stringValue)
     }
 
@@ -229,7 +227,6 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
         try container.encode(_domain, forKey: .domain)
         try container.encode(_workstation, forKey: .workstation)
         try container.encode(_user, forKey: .user)
-        try container.encode(_password, forKey: .password)
         try container.encode(timeout, forKey: .timeout)
     }
 
