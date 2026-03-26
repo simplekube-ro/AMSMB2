@@ -521,7 +521,7 @@ extension SMB2Client {
         try MSRPC.validateBindData(recvBindData)
 
         // NetShareEnum request, Level 1 mean we need share name and remark.
-        _ = try srvsvc.pwrite(data: MSRPC.NetShareEnumAllRequest(serverName: server!), offset: 0)
+        _ = try srvsvc.pwrite(data: MSRPC.NetShareEnumAllRequest(serverName: try server.unwrap()), offset: 0)
         let recvData = try srvsvc.pread(offset: 0)
         return try MSRPC.NetShareEnumAllLevel1(data: recvData).shares
     }
@@ -912,12 +912,13 @@ struct ShareProperties: RawRepresentable {
         case printQueue
         case device
         case ipc
+        case unknown = 0xFFFF_FFFF
     }
 
     let rawValue: UInt32
 
     var type: ShareType {
-        ShareType(rawValue: rawValue & 0x0fff_ffff)!
+        ShareType(rawValue: rawValue & 0x0fff_ffff) ?? .unknown
     }
 
     var isTemporary: Bool {

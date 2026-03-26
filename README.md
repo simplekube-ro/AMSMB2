@@ -109,7 +109,7 @@ git submodule update --init    # Required — fetches the libsmb2 C library
 swift test
 ```
 
-Runs 15 unit tests. Integration tests are automatically skipped when no SMB server is configured.
+Runs 28 unit tests. Integration tests are automatically skipped when no SMB server is configured.
 
 ### Integration Tests (requires Docker)
 
@@ -117,7 +117,7 @@ Runs 15 unit tests. Integration tests are automatically skipped when no SMB serv
 make integrationtest
 ```
 
-Starts a Samba container, runs the full test suite (53 tests), and tears down. Requires Docker Desktop.
+Starts a Samba container, runs the full test suite (72 tests), and tears down. Requires Docker Desktop.
 
 ### Linux Tests
 

@@ -167,6 +167,22 @@ Reads file contents into memory.
   - `progress` — Progress callback. Return `false` to cancel.
 - **Returns:** File data.
 
+#### `contents(atPath:range:)` (streaming)
+
+```swift
+@available(swift 5.9)
+open func contents<R: RangeExpression>(
+    atPath path: String, range: R? = Range<UInt64>?.none
+) -> AsyncThrowingStream<Data, any Error> where R.Bound: FixedWidthInteger
+```
+
+Returns an `AsyncThrowingStream` that yields file data in chunks. Useful for processing large files without loading everything into memory.
+
+- **Parameters:**
+  - `path` — File path
+  - `range` — Optional byte range to read (default: entire file)
+- **Returns:** An `AsyncThrowingStream<Data, any Error>`. Yields `POSIXError(.ENOTCONN)` if not connected.
+
 #### `contents(atPath:range:progress:)` (chunked)
 
 ```swift

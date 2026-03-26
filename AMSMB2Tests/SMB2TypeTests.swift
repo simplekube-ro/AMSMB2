@@ -7,6 +7,7 @@
 //
 
 import XCTest
+import SMB2
 
 @testable import AMSMB2
 
@@ -17,6 +18,31 @@ class SMB2TypeTests: XCTestCase, @unchecked Sendable {
     func testSMB2ClientTimeout() throws {
         let client = try SMB2Client(timeout: 30)
         XCTAssertEqual(client.timeout, 30)
+    }
+
+    // MARK: - ShareProperties / ShareType
+
+    func testShareTypeUnknownValue() {
+        let props = ShareProperties(rawValue: 0xFFFF_FFFF)
+        // Will compile after .unknown case is added to ShareType
+        XCTAssertEqual(props.type, .unknown, "Unknown raw value must map to .unknown, not crash")
+    }
+
+    func testShareTypeKnownValues() {
+        XCTAssertEqual(ShareProperties(rawValue: 0).type, .diskTree)
+        XCTAssertEqual(ShareProperties(rawValue: 1).type, .printQueue)
+        XCTAssertEqual(ShareProperties(rawValue: 2).type, .device)
+        XCTAssertEqual(ShareProperties(rawValue: 3).type, .ipc)
+    }
+
+    func testMaxWriteSizeReturnsZeroWhenUnavailable() throws {
+        // SMB2FileHandle.maxWriteSize: (try? Int(client.withContext(smb2_get_max_write_size))) ?? 0
+        // On a fresh (unnegotiated) client, smb2_get_max_write_size returns 0 (no session).
+        // On a fully disconnected client (context nil), try? yields nil → ?? 0.
+        // Both paths must return 0, never -1.
+        let client = try SMB2Client(timeout: 30)
+        let maxWrite = try client.withContext { ctx in Int(smb2_get_max_write_size(ctx)) }
+        XCTAssertEqual(maxWrite, 0, "Fresh client must report maxWriteSize of 0 (not -1)")
     }
 
     // MARK: - SMB2FileChangeType

@@ -72,7 +72,7 @@ final class SMB2Directory: Collection {
             let savedPos = smb2_telldir(context, self.handle)
             smb2_seekdir(context, self.handle, index)
             defer { smb2_seekdir(context, self.handle, savedPos) }
-            return smb2_readdir(context, self.handle).pointee
+            return smb2_readdir(context, self.handle)?.pointee ?? smb2dirent()
         }) ?? smb2dirent()
     }
 
