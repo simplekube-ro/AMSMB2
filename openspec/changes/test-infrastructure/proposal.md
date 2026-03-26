@@ -8,6 +8,7 @@ Running `swift test` crashes because server-dependent integration tests force-un
 - **Add Docker-based integration testing**: Create a `docker-compose.yml` with a Samba container, a `test-integration.sh` script to orchestrate Docker lifecycle + `swift test`, and a Makefile target.
 - **Expand unit test coverage**: Add tests for public types that currently have no coverage — `SMB2Client`, `SMB2FileHandle`, `AsyncInputStream`, `SMB2FileChangeType`/`Action`/`Info`.
 - **Expand integration test coverage**: Add tests for untested API operations — `append()`, `removeItem()`, `copyContentsOfItem()`, `echo()`, progress cancellation, error handling paths, and the `smbClient` public accessor.
+- **Deduplicate test helpers**: Extract `randomData(size:)` (duplicated in 3 test files) and shared setup boilerplate (server/share/credential/encrypted vars, `setUpWithError()`) into a shared test utilities file or base `XCTestCase` subclass.
 - **Document build prerequisites**: Add `git submodule update --init` to CLAUDE.md.
 
 ## Capabilities
@@ -17,12 +18,14 @@ Running `swift test` crashes because server-dependent integration tests force-un
 - `docker-integration`: Docker-based SMB test server with orchestration script and Makefile integration
 - `unit-test-coverage`: Unit tests for public types that need no server (SMB2Client, SMB2FileHandle, AsyncInputStream, file monitoring types)
 - `integration-test-coverage`: Integration tests for untested API operations requiring a live SMB server
+- `test-utilities`: Shared test helpers (`randomData`, server config base class) extracted from duplicated code across test files
 
 ### Modified Capabilities
 
 ## Impact
 
 - **Test files**: `AMSMB2Tests/SMB2ManagerTests.swift` modified; 4-5 new test files created in `AMSMB2Tests/`
+- **Test utilities**: New `AMSMB2Tests/TestUtilities.swift` (or similar) with shared `randomData(size:)` and `SMBTestCase` base class
 - **Build infrastructure**: New `test-fixtures/` directory, `scripts/test-integration.sh`, Makefile updates
 - **Documentation**: CLAUDE.md updated with submodule init instructions
 - **No production code changes**: All changes are test infrastructure and documentation only
