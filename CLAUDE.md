@@ -101,6 +101,7 @@ Use the `/opsx:` slash commands to drive the workflow:
 - **MANDATORY**: All features, bug fixes, and non-trivial changes MUST go through the OpenSpec process (`/opsx:propose` → `/opsx:apply` → `/opsx:archive`). Do not skip proposal/design/specs for any change that touches more than a single file or introduces new behavior. Quick typo fixes and config tweaks are exempt.
 - **Review gate**: Every proposal MUST be reviewed by the `project-architect` agent before moving to `/opsx:apply`.
 - **Artifacts must reflect implementation**: If the approach changes during implementation, update the proposal, design, and specs to match what was actually shipped.
+- **Verify before implementing**: Design docs may contain incorrect analysis. Verify claims about existing code behavior (especially "this is wrong/inverted") before changing working code.
 - **Specs are testable**: Each requirement has scenarios in WHEN/THEN format.
 - **Tasks are checkboxes**: Use `- [ ]` / `- [x]` format for tracking.
 - **Keep specs honest**: Never archive a change whose specs describe a different approach than what was implemented.
@@ -152,7 +153,7 @@ Minimise token usage — this directly affects cost and speed:
 - Test files are in `AMSMB2Tests/` (not `Tests/`) — glob `AMSMB2Tests/*.swift`
 - C library functions (`smb2_*`) require `import SMB2` in test files; not re-exported via `@testable import AMSMB2`
 - `SMB2Manager` has multiple `contents(atPath:)` overloads — in async test context, compiler picks `async throws -> Data` over `AsyncThrowingStream`. Use explicit type: `let stream: AsyncThrowingStream<Data, any Error> = smb.contents(atPath:)`
-- `make integrationtest` fails inside Claude Code (sandbox-exec permission denied). Use `swift test --disable-sandbox` for unit tests instead
+- `make integrationtest` / `./scripts/test-integration.sh` runs integration tests with Docker — use `-v` for verbose output
 - `SMB2Client.disconnect()` does not nil the context — can't simulate fully disconnected state in unit tests
 
 ## Commit Convention
