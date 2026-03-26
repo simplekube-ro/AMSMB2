@@ -25,6 +25,8 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying,
 
 The primary interface for SMB2/3 operations. Thread-safe. Supports serialization via `NSSecureCoding` and `Codable`.
 
+> **Breaking Change:** Passwords are intentionally excluded from all serialization paths (`Codable` and `NSSecureCoding`) for security. When decoding a previously archived `SMB2Manager`, the password field will be empty. Legacy archives that contain a password field still decode without error — the password is simply ignored. Consumers that persist `SMB2Manager` must store credentials separately (e.g., Keychain) and re-supply them after decoding.
+
 ### Type Aliases
 
 ```swift
@@ -58,7 +60,7 @@ Creates an SMB2 manager for the given server URL. Returns `nil` if the URL schem
 - **Parameters:**
   - `url` — SMB server URL (e.g., `smb://192.168.1.1`)
   - `domain` — User's domain for NTLM authentication (default: `""`)
-  - `credential` — Username and password. Pass `nil` for guest access.
+  - `credential` — Username and password. Pass `nil` for guest access. The password is held in memory for the connection lifecycle but is excluded from serialization (`Codable`/`NSSecureCoding`) for security.
 
 #### `connectShare(name:encrypted:)`
 

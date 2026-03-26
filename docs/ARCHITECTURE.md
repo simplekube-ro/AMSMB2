@@ -32,7 +32,7 @@ graph TB
 
 | Layer | Class | Responsibility |
 |-------|-------|----------------|
-| **Public API** | `SMB2Manager` | Connection lifecycle, all file/directory operations, NSSecureCoding/Codable, Obj-C compatibility |
+| **Public API** | `SMB2Manager` | Connection lifecycle, all file/directory operations, NSSecureCoding/Codable (passwords excluded from serialization), Obj-C compatibility |
 | **File Abstraction** | `SMB2FileHandle` | Open/close files, read/write/seek, IOCTL (fsctl), Change Notify |
 | **Context Wrapper** | `SMB2Client` | Wraps `smb2_context`, provides thread-safe access via a serial event loop queue, manages `DispatchSource`-based async operations |
 | **C Library** | libsmb2 | SMB2/3 protocol encoding/decoding, network I/O, NTLM authentication |
