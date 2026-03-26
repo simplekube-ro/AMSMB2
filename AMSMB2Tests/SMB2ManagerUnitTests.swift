@@ -188,6 +188,50 @@ class SMB2ManagerUnitTests: XCTestCase, @unchecked Sendable {
         )
     }
 
+    // MARK: - API Correctness Tests
+
+    func testContentsAtPathThrowsWhenDisconnected() async {
+        let url = URL(string: "smb://192.168.1.1/share")!
+        let credential = URLCredential(user: "user", password: "password", persistence: .forSession)
+        let smb = SMB2Manager(url: url, credential: credential)!
+
+        // Explicitly select the AsyncThrowingStream overload (not the async throws -> Data one)
+        let stream: AsyncThrowingStream<Data, any Error> = smb.contents(atPath: "/test.txt")
+
+        do {
+            for try await _ in stream {
+                XCTFail("Stream should not yield data when disconnected")
+            }
+            XCTFail("Stream should have thrown an error")
+        } catch let error as POSIXError {
+            XCTAssertEqual(error.code, .ENOTCONN)
+        } catch {
+            XCTFail("Expected POSIXError(.ENOTCONN), got \(error)")
+        }
+    }
+
+    func testURLHostGuard() {
+        // URL with correct scheme but nil host should be rejected by init
+        let noHostURL = URL(string: "smb:")!
+        let credential = URLCredential(user: "user", password: "password", persistence: .forSession)
+        XCTAssertNil(
+            SMB2Manager(url: noHostURL, credential: credential),
+            "SMB2Manager must reject URLs with nil host"
+        )
+    }
+
+    func testCodableRejectsNilHostURL() {
+        // The Codable decoder must also reject URLs with nil host
+        let noHostJSON = """
+        {"url":"smb:","user":"user","timeout":60}
+        """.data(using: .utf8)!
+
+        XCTAssertThrowsError(
+            try JSONDecoder().decode(SMB2Manager.self, from: noHostJSON),
+            "Codable decoder must reject URLs with nil host"
+        )
+    }
+
     func testCopyPreservesPassword() throws {
         let url = URL(string: "smb://192.168.1.1/share")!
         let credential = URLCredential(user: "user", password: "s3cret", persistence: .forSession)

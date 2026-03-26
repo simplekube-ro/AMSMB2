@@ -173,8 +173,10 @@ public final class SMB2FileHandle: @unchecked Sendable {
         handle = nil
         _handleLock.unlock()
         guard let captured else { return }
-        _ = try? client.withContext { context in
-            smb2_close(context, captured)
+        let rawHandle = UInt(bitPattern: captured)
+        client.fireAndForget { context in
+            let fh = OpaquePointer(bitPattern: rawHandle)
+            smb2_close_async(context, fh, SMB2Client.generic_handler_noop, nil)
         }
     }
 
@@ -299,7 +301,7 @@ public final class SMB2FileHandle: @unchecked Sendable {
     }
 
     var maxWriteSize: Int {
-        (try? Int(client.withContext(smb2_get_max_write_size))) ?? -1
+        (try? Int(client.withContext(smb2_get_max_write_size))) ?? 0
     }
 
     var optimizedWriteSize: Int {

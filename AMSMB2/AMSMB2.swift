@@ -202,7 +202,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
     public required init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let url = try container.decode(URL.self, forKey: .url)
-        guard url.scheme?.lowercased() == "smb" else {
+        guard url.scheme?.lowercased() == "smb", url.host != nil else {
             throw DecodingError.dataCorruptedError(
                 forKey: CodingKeys.url, in: container, debugDescription: "URL is not smb."
             )
@@ -571,7 +571,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
                     stat.smb2_mtime_nsec = .init($0.tv_nsec)
                 }
             case .attributeModificationDateKey:
-                attributes.contentModificationDate.map(timespec.init).map {
+                attributes.attributeModificationDate.map(timespec.init).map {
                     stat.smb2_ctime = .init($0.tv_sec)
                     stat.smb2_ctime_nsec = .init($0.tv_nsec)
                 }
@@ -1008,7 +1008,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
         let (result, continuation) = AsyncThrowingStream<Data, any Error>.makeStream(bufferingPolicy: .unbounded)
         
         queue { [client] in
-            guard let client = client else { return }
+            guard let client = client else { continuation.finish(throwing: POSIXError(.ENOTCONN)); return }
             var offset = range.lowerBound
             do {
                 let file = try SMB2FileHandle(forReadingAtPath: path, on: client)
@@ -1450,7 +1450,8 @@ extension SMB2Manager {
         let client = try SMB2Client(timeout: _timeout)
         self.client = client
         initClient(client, encrypted: encrypted)
-        let server = url.host! + (url.port.map { ":\($0)" } ?? "")
+        guard let host = url.host else { throw POSIXError(.EINVAL) }
+        let server = host + (url.port.map { ":\($0)" } ?? "")
         try client.connect(server: server, share: shareName, user: _user)
         return client
     }
@@ -1662,7 +1663,9 @@ extension SMB2Manager {
 
             for item in list {
                 let itemPath = try item.path.unwrap()
-                if item.isDirectory {
+                if item.isSymbolicLink {
+                    try client.unlink(itemPath)
+                } else if item.isDirectory {
                     try client.rmdir(itemPath)
                 } else {
                     try client.unlink(itemPath)
