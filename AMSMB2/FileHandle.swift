@@ -401,8 +401,14 @@ public final class SMB2FileHandle: @unchecked Sendable {
 
             group.wait()
 
+            // Collect all chunks before committing — discard partial window on error.
+            var windowData = [Data]()
+            windowData.reserveCapacity(windowChunks)
             for i in 0..<windowChunks {
-                result.append(try collector.get(index: i))
+                windowData.append(try collector.get(index: i))
+            }
+            for chunk in windowData {
+                result.append(chunk)
             }
 
             currentOffset += UInt64(windowChunks * readSize)
@@ -414,6 +420,9 @@ public final class SMB2FileHandle: @unchecked Sendable {
     /// Writes `data` starting at `offset` using pipelined pwrite requests.
     /// Up to `maxInFlight` requests are dispatched concurrently. The handle pointer
     /// is captured as an integer token — see `pipelinedRead` for the safety argument.
+    ///
+    /// - Note: On error, partial writes may have been committed to the server.
+    ///   The remote file should be considered in an indeterminate state.
     func pipelinedWrite(data: Data, offset: UInt64, chunkSize: Int = 0, maxInFlight: Int = 4) throws -> Int {
         let handle = try handle.unwrap()
         let handleRaw = UInt(bitPattern: handle)
@@ -460,8 +469,15 @@ public final class SMB2FileHandle: @unchecked Sendable {
 
             group.wait()
 
+            // Collect all results before committing — throw on first error without
+            // advancing offsets. Partial writes leave the file indeterminate.
+            var windowWritten = [Int]()
+            windowWritten.reserveCapacity(windowChunks)
             for i in 0..<windowChunks {
-                totalWritten += try collector.get(index: i)
+                windowWritten.append(try collector.get(index: i))
+            }
+            for written in windowWritten {
+                totalWritten += written
             }
 
             dataOffset += windowChunks * writeSize

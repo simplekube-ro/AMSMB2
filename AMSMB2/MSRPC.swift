@@ -71,7 +71,9 @@ enum MSRPC {
 
                 offset += nameActualCount * 2
                 if nameActualCount % 2 == 1 {
-                    // if name length is odd, there is an extra nul char pad for alignment.
+                    guard offset + 2 <= data.count else {
+                        throw POSIXError(.EINVAL, userInfo: [:])
+                    }
                     offset += 2
                 }
 
@@ -93,7 +95,9 @@ enum MSRPC {
                 offset += commentActualCount * 2
 
                 if commentActualCount % 2 == 1 {
-                    // if name length is odd, there is an extra nul char pad for alignment.
+                    guard offset + 2 <= data.count else {
+                        throw POSIXError(.EINVAL, userInfo: [:])
+                    }
                     offset += 2
                 }
 
