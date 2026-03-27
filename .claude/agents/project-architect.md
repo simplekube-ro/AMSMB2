@@ -50,20 +50,20 @@ You **own the architecture**. You do not write or modify code directly. Instead,
 
 ### Consistency with Established Patterns
 - **Layer stack**: SMB2Manager (public API) → SMB2FileHandle (file abstraction) → SMB2Client (context wrapper) → libsmb2 (C library)
-- **Thread safety**: Serial `eventLoopQueue` exclusively owns `smb2_context`; `DispatchSource`-based socket monitoring; per-operation `DispatchSemaphore`; lock-nil-swap pattern for file handles
+- **Thread safety**: Serial `eventLoopQueue` exclusively owns `smb2_context`; `DispatchSource`-based socket monitoring; per-operation `CheckedContinuation`; lock-nil-swap pattern for file handles
 - **C callback bridging**: `Unmanaged<CBData>.passRetained()`/`takeRetainedValue()` for safe C↔Swift callback data
 - **Concurrency**: `@unchecked Sendable` with queue confinement; Swift 6 strict concurrency compliance
-- **Async bridge**: `async_await()` pattern — brief `eventLoopQueue.sync` for PDU setup, then semaphore wait; `generic_handler` signals on completion
+- **Async bridge**: `async_await()` pattern — `eventLoopQueue.async` for PDU setup, then task suspension via `CheckedContinuation`; `generic_handler` resumes on completion
 - **Connection lifecycle**: `connectLock` (NSLock) protects connection state; `operationLock` (NSCondition) tracks in-flight operations; `SocketMonitor` wraps DispatchSource for non-blocking I/O
 
 ## Project Knowledge
 
 You have comprehensive knowledge of:
 - **Architecture layers**: SMB2Manager → SMB2FileHandle → SMB2Client → libsmb2, each with clear responsibilities
-- **Key abstractions**: `SMB2Client` (context wrapper), `SMB2FileHandle` (file operations), `SocketMonitor` (DispatchSource I/O), `BufferPool` (reusable read buffers), `CBData` (C callback bridge), `PipelineCollector` (concurrent result assembly)
+- **Key abstractions**: `SMB2Client` (context wrapper), `SMB2FileHandle` (file operations), `SocketMonitor` (DispatchSource I/O), `BufferPool` (reusable read buffers), `RawBuffer` (stable-pointer read buffer), `CBData` (C callback bridge)
 - **Platform strategy**: iOS 13+, macOS 10.15+, tvOS 14+, watchOS 6+, visionOS 1+, Linux; Swift Package Manager with dynamic linking (LGPL compliance)
 - **Dependencies**: libsmb2 (C library, LGPL v2.1, git submodule), swift-atomics (tests only)
-- **Testing**: TDD mandatory, 60+ tests across 5 files, `swift test` works without server (skips integration tests), Docker-based `make integrationtest`
+- **Testing**: TDD mandatory, 81 tests across 6 files, `swift test` works without server (skips integration tests), Docker-based `make integrationtest`
 - **Change management**: OpenSpec process — `/opsx:propose` → `/opsx:apply` → `/opsx:archive`
 - **Thread safety model**: Documented in `docs/ARCHITECTURE.md` with Mermaid diagrams
 

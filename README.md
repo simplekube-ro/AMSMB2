@@ -12,11 +12,11 @@ This fork extends the original with the following improvements:
 |------|----------|-----------|
 | **Public API surface** | Only `SMB2Manager` is public; internal types are inaccessible | `SMB2Client` and `SMB2FileHandle` exposed as public API for direct file handle operations |
 | **Thread safety** | Context access unprotected in some paths; file handle close/deinit has race conditions | Serial event loop queue exclusively owns `smb2_context`; `DispatchSource`-based socket monitoring; nil-swap close pattern prevents double-close races; `smbClient` getter validates connection under lock |
-| **Performance** | Single-threaded poll loop blocks during each operation; only one operation at a time | Event loop + `DispatchSource` I/O allows multiple in-flight operations; `BufferPool` eliminates per-read allocation; pipelined read/write dispatch concurrent chunks via `DispatchGroup`; `AsyncInputStream` backpressure bounds memory during streaming |
+| **Performance** | Single-threaded poll loop blocks during each operation; only one operation at a time | Event loop + `DispatchSource` I/O allows multiple in-flight operations; `BufferPool` eliminates per-read allocation; pipelined read/write dispatch concurrent chunks via structured concurrency; `AsyncInputStream` backpressure bounds memory during streaming |
 | **Server-side copy** | Sends copy chunks using negotiated write size (~8 MB), exceeding the MS-SMB2 spec limit | Chunks capped at 1 MiB per MS-SMB2 section 3.3.5.15.6.2 — works with all spec-compliant servers |
 | **Symlink creation** | `ReparseDataLength` omits 12-byte symlink header, causing `STATUS_IO_REPARSE_DATA_INVALID` on Samba 4.21+ | Correct reparse data format per MS-FSCC 2.1.2.4 |
 | **Change Notify** | Crashes (signal 5/11) due to re-entrant `smb2_close()` inside callback + dangling `withUnsafeMutablePointer` | Direct PDU construction bypasses re-entrant wrapper; `Unmanaged<CBData>` for safe C callback pointers |
-| **Testing** | Single test file; `swift test` crashes without server env vars; no Docker infrastructure | 76 tests across 6 files; `swift test` works without a server (skips integration tests); Docker-based `make integrationtest` |
+| **Testing** | Single test file; `swift test` crashes without server env vars; no Docker infrastructure | 81 tests across 6 files; `swift test` works without a server (skips integration tests); Docker-based `make integrationtest` |
 | **Documentation** | Minimal README with outdated examples | Architecture guide with Mermaid diagrams, comprehensive API reference, modern async/await examples |
 
 ## Features
@@ -109,7 +109,7 @@ git submodule update --init    # Required — fetches the libsmb2 C library
 swift test
 ```
 
-Runs 32 unit tests. Integration tests are automatically skipped when no SMB server is configured.
+Runs 37 unit tests. Integration tests are automatically skipped when no SMB server is configured.
 
 ### Integration Tests (requires Docker)
 
@@ -117,7 +117,7 @@ Runs 32 unit tests. Integration tests are automatically skipped when no SMB serv
 make integrationtest
 ```
 
-Starts a Samba container, runs the full test suite (76 tests), and tears down. Requires Docker Desktop.
+Starts a Samba container, runs the full test suite (81 tests), and tears down. Requires Docker Desktop.
 
 ### Linux Tests
 

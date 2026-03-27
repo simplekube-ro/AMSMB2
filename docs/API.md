@@ -131,6 +131,22 @@ Lists the contents of a directory.
   - `recursive` — List subdirectories recursively (default: `false`)
 - **Returns:** Array of dictionaries. Each entry contains keys like `.nameKey`, `.pathKey`, `.fileSizeKey`, `.fileResourceTypeKey`, `.contentModificationDateKey`, `.creationDateKey`.
 
+#### `contentsOfDirectory(atPath:recursive:)` (lazy streaming)
+
+```swift
+@available(swift 5.9)
+open func contentsOfDirectory(
+    atPath path: String, recursive: Bool = false
+) -> AsyncThrowingStream<[URLResourceKey: any Sendable], any Error>
+```
+
+Lazy variant that yields one entry at a time. Useful for large directories where loading the full listing into memory is undesirable.
+
+- **Parameters:**
+  - `path` — Directory path (use `"/"` for share root)
+  - `recursive` — List subdirectories recursively (default: `false`)
+- **Returns:** An `AsyncThrowingStream` that yields one attribute dictionary per entry. Throws `POSIXError(.ENOTCONN)` if not connected.
+
 #### `createDirectory(atPath:)`
 
 ```swift
@@ -421,8 +437,22 @@ Represents an open file on the SMB share. Obtained by opening files through `SMB
 | `close()` | Method | Closes the handle. Safe to call from any thread. Uses lock-nil-swap pattern to prevent double-close. |
 | `fstat()` | Method | Returns `smb2_stat_64` with file metadata. Throws on error. |
 | `pread(offset:length:)` | Method | Reads data at offset without changing file position. |
-| `pipelinedRead(offset:totalLength:chunkSize:maxInFlight:)` | Method | Reads `totalLength` bytes using multiple concurrent pread requests. Up to `maxInFlight` (default: 4) chunks are dispatched simultaneously via `DispatchGroup`. Results are returned in offset order. |
+| `pipelinedRead(offset:totalLength:chunkSize:maxInFlight:)` | Method | Reads `totalLength` bytes using multiple concurrent pread requests. Up to `maxInFlight` (default: 4) chunks are dispatched simultaneously via structured concurrency (withThrowingTaskGroup). Results are returned in offset order. |
 | `pipelinedWrite(data:offset:chunkSize:maxInFlight:)` | Method | Writes data using multiple concurrent pwrite requests. Up to `maxInFlight` (default: 4) chunks are dispatched simultaneously. Returns total bytes written. |
+
+### Factory Methods
+
+All factory methods are `async throws` and must be called after `connectShare`.
+
+```swift
+static func open(forReadingAtPath path: String, on client: SMB2Client) async throws -> SMB2FileHandle
+static func open(forWritingAtPath path: String, on client: SMB2Client) async throws -> SMB2FileHandle
+static func open(forUpdatingAtPath path: String, on client: SMB2Client) async throws -> SMB2FileHandle
+static func open(forOverwritingAtPath path: String, on client: SMB2Client) async throws -> SMB2FileHandle
+static func open(forCreatingAndWritingAtPath path: String, on client: SMB2Client) async throws -> SMB2FileHandle
+```
+
+These mirror the `SMB2FileHandle.OpenMode` enum values and are the preferred way to obtain a file handle via direct `SMB2Client` access (advanced use case). Always call `close()` when finished — the handle does not close itself automatically on `deinit`.
 
 ---
 
@@ -517,3 +547,14 @@ All operations throw `POSIXError` on failure. Common codes:
 | 17 | `EEXIST` | File already exists (e.g., `uploadItem` to existing path) |
 | 57 | `ENOTCONN` | Not connected (call `connectShare` first) |
 | 60 | `ETIMEDOUT` | Operation timed out |
+
+---
+
+## Task Cancellation
+
+All `async` methods support Swift structured task cancellation. If the enclosing `Task` is cancelled:
+
+- A fast-path check via `Task.checkCancellation()` fires before any PDU is submitted — if the task was already cancelled, `CancellationError` is thrown immediately with no network activity.
+- If the task is cancelled after the PDU has been submitted, the `withTaskCancellationHandler` `onCancel` closure fires, marks the in-flight operation as abandoned, and resumes the continuation with `CancellationError`. The caller receives `CancellationError` promptly without waiting for a server response or timeout.
+
+This means you can safely use `withTaskCancellationHandler`, `.task` modifiers, and `TaskGroup` cancellation with all AMSMB2 operations.
