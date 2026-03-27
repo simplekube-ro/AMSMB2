@@ -10,10 +10,32 @@
 import Foundation
 import SMB2
 
-/// Reusable fixed-capacity buffer pool. Avoids per-operation `Data` allocation by
-/// recycling buffers between calls. Thread-safe via an internal lock.
+/// Fixed-capacity raw memory buffer managed by `BufferPool`.
+/// The pointer is stable for the lifetime of the `RawBuffer` — safe to pass
+/// to C APIs that hold it across async suspension points.
+struct RawBuffer: @unchecked Sendable {
+    let pointer: UnsafeMutableRawPointer
+    let capacity: Int
+
+    fileprivate init(capacity: Int) {
+        self.pointer = .allocate(byteCount: capacity, alignment: 1)
+        self.capacity = capacity
+    }
+
+    fileprivate func deallocate() {
+        pointer.deallocate()
+    }
+
+    /// Creates a `Data` by copying `count` bytes from the buffer.
+    func data(count: Int) -> Data {
+        Data(bytes: pointer, count: min(count, capacity))
+    }
+}
+
+/// Reusable fixed-capacity buffer pool. Avoids per-operation allocation by
+/// recycling `RawBuffer` instances between calls. Thread-safe via an internal lock.
 final class BufferPool: @unchecked Sendable {
-    private var pool: [Data] = []
+    private var pool: [RawBuffer] = []
     private let maxPoolSize: Int
     private let poolLock = NSLock()
 
@@ -22,28 +44,47 @@ final class BufferPool: @unchecked Sendable {
     }
 
     /// Returns a buffer of at least `minimumSize` bytes.
-    /// Prefers a pooled buffer that is already large enough; otherwise resizes the
-    /// largest available pooled buffer, or allocates a fresh one.
-    func checkout(minimumSize: Int) -> Data {
+    /// Prefers a pooled buffer that is already large enough; otherwise
+    /// deallocates the most-recently-returned pooled buffer and allocates fresh.
+    func checkout(minimumSize: Int) -> RawBuffer {
         poolLock.lock()
         defer { poolLock.unlock() }
-        if let index = pool.lastIndex(where: { $0.count >= minimumSize }) {
+        if let index = pool.lastIndex(where: { $0.capacity >= minimumSize }) {
             return pool.remove(at: index)
         }
+        // No buffer large enough — discard any pooled buffer and allocate fresh.
         if let index = pool.indices.last {
-            var buffer = pool.remove(at: index)
-            buffer.count = minimumSize
-            return buffer
+            pool.remove(at: index).deallocate()
         }
-        return Data(count: minimumSize)
+        return RawBuffer(capacity: minimumSize)
     }
 
-    /// Returns a buffer to the pool. Buffers beyond `maxPoolSize` are discarded.
-    func checkin(_ buffer: Data) {
+    /// Abandons a buffer without returning it to the pool.
+    ///
+    /// Use this on error/cancellation paths where libsmb2 still holds the buffer
+    /// pointer and may write into it after the Swift caller has thrown. Returning
+    /// the buffer to the pool in that situation would cause data corruption if
+    /// another operation checked it out; deallocating it would cause a
+    /// use-after-free. Intentional leak is the only safe choice — it is bounded
+    /// to one buffer per cancelled read operation.
+    func abandon(_ buffer: RawBuffer) {
+        // Deliberately does not call buffer.deallocate() or pool it.
+        // The C callback still owns the pointer; we simply forget it.
+    }
+
+    /// Returns a buffer to the pool. Buffers beyond `maxPoolSize` are deallocated.
+    func checkin(_ buffer: RawBuffer) {
         poolLock.lock()
         defer { poolLock.unlock() }
-        guard pool.count < maxPoolSize else { return }
+        guard pool.count < maxPoolSize else {
+            buffer.deallocate()
+            return
+        }
         pool.append(buffer)
+    }
+
+    deinit {
+        for buffer in pool { buffer.deallocate() }
     }
 }
 
@@ -267,13 +308,17 @@ extension SMB2Client {
         socketMonitor = nil
     }
 
-    /// Fails all in-flight operations. `isAbandoned` is set before signaling so that
-    /// any concurrent libsmb2 callback skips the already-signaled semaphore.
+    /// Fails all in-flight operations. `isAbandoned` is set before resuming so that
+    /// any concurrent libsmb2 callback skips the already-resumed continuation.
     private func failAllPendingOperations(with error: any Error) {
         for (_, cb) in pendingOperations {
             cb.isAbandoned = true
             cb.error = error
-            cb.semaphore.signal()
+            cb.isFinished = true
+            if let continuation = cb.continuation {
+                cb.continuation = nil
+                continuation.resume(throwing: error)
+            }
         }
         pendingOperations.removeAll()
     }
@@ -451,53 +496,61 @@ extension SMB2Client {
 // MARK: Connectivity
 
 extension SMB2Client {
-    func connect(server: String, share: String, user: String) throws {
+    func connect(server: String, share: String, user: String) async throws {
         // Connect uses a temporary poll loop on the event loop queue because
         // DispatchSource can't be created until the socket fd exists.
-        var connectError: (any Error)?
-        eventLoopQueue.sync {
-            do {
-                guard let context = self.context else {
-                    throw POSIXError(.ENOTCONN)
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+            self.eventLoopQueue.async {
+                do {
+                    guard let context = self.context else {
+                        throw POSIXError(.ENOTCONN)
+                    }
+                    let cb = CBData()
+                    let cbPtr = Unmanaged.passRetained(cb).toOpaque()
+                    let result = smb2_connect_share_async(
+                        context, server, share, user, SMB2Client.generic_handler, cbPtr
+                    )
+                    if result < 0 {
+                        // Callback was never registered; balance the retain ourselves.
+                        Unmanaged<CBData>.fromOpaque(cbPtr).release()
+                        try POSIXError.throwIfError(result, description: self.error)
+                    }
+                    try self.pollUntilComplete(cb)
+                    try POSIXError.throwIfError(cb.result, description: self.error)
+                    self.startSocketMonitoring()
+                    continuation.resume()
+                } catch {
+                    continuation.resume(throwing: error)
                 }
-                let cb = CBData()
-                let cbPtr = Unmanaged.passRetained(cb).toOpaque()
-                let result = smb2_connect_share_async(
-                    context, server, share, user, SMB2Client.generic_handler, cbPtr
-                )
-                try POSIXError.throwIfError(result, description: self.error)
-                try self.pollUntilComplete(cb)
-                try POSIXError.throwIfError(cb.result, description: self.error)
-                self.startSocketMonitoring()
-            } catch {
-                connectError = error
             }
         }
-        if let connectError { throw connectError }
     }
 
-    func disconnect() throws {
+    func disconnect() async {
         // Send a best-effort disconnect PDU and tear down in one atomic block
-        // on the event loop queue. Uses fire-and-forget (matching shutdown())
-        // because no caller inspects the disconnect result.
-        eventLoopQueue.sync {
-            guard let context = self.context, smb2_get_fd(context) >= 0 else {
+        // on the event loop queue.
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            self.eventLoopQueue.async {
+                guard let context = self.context, smb2_get_fd(context) >= 0 else {
+                    self.stopSocketMonitoring()
+                    self.failAllPendingOperations(with: POSIXError(.ENOTCONN))
+                    continuation.resume()
+                    return
+                }
+                smb2_disconnect_share_async(context, SMB2Client.generic_handler_noop, nil)
+                smb2_service(context, Int32(POLLOUT))
                 self.stopSocketMonitoring()
                 self.failAllPendingOperations(with: POSIXError(.ENOTCONN))
-                return
+                continuation.resume()
             }
-            smb2_disconnect_share_async(context, SMB2Client.generic_handler_noop, nil)
-            smb2_service(context, Int32(POLLOUT))
-            self.stopSocketMonitoring()
-            self.failAllPendingOperations(with: POSIXError(.ENOTCONN))
         }
     }
 
-    func echo() throws {
+    func echo() async throws {
         if !isConnected {
             throw POSIXError(.ENOTCONN)
         }
-        try async_await { context, cbPtr -> Int32 in
+        try await async_await { context, cbPtr -> Int32 in
             smb2_echo_async(context, SMB2Client.generic_handler, cbPtr)
         }
     }
@@ -506,23 +559,23 @@ extension SMB2Client {
 // MARK: DCE-RPC
 
 extension SMB2Client {
-    func shareEnum() throws -> [SMB2Share] {
-        try async_await(dataHandler: [SMB2Share].init) { context, cbPtr -> Int32 in
+    func shareEnum() async throws -> [SMB2Share] {
+        try await async_await(dataHandler: [SMB2Share].init) { context, cbPtr -> Int32 in
             smb2_share_enum_async(context, SHARE_INFO_1, SMB2Client.generic_handler, cbPtr)
         }.data
     }
 
-    func shareEnumSwift() throws -> [SMB2Share] {
+    func shareEnumSwift() async throws -> [SMB2Share] {
         // Connection to server service.
-        let srvsvc = try SMB2FileHandle(path: "srvsvc", desiredAccess: [.read, .write], createDisposition: .open, on: self)
+        let srvsvc = try await SMB2FileHandle.open(path: "srvsvc", desiredAccess: [.read, .write], createDisposition: .open, on: self)
         // Bind command
-        _ = try srvsvc.write(data: MSRPC.SrvsvcBindData())
-        let recvBindData = try srvsvc.pread(offset: 0, length: Int(Int16.max))
+        _ = try await srvsvc.write(data: MSRPC.SrvsvcBindData())
+        let recvBindData = try await srvsvc.pread(offset: 0, length: Int(Int16.max))
         try MSRPC.validateBindData(recvBindData)
 
         // NetShareEnum request, Level 1 mean we need share name and remark.
-        _ = try srvsvc.pwrite(data: MSRPC.NetShareEnumAllRequest(serverName: try server.unwrap()), offset: 0)
-        let recvData = try srvsvc.pread(offset: 0)
+        _ = try await srvsvc.pwrite(data: MSRPC.NetShareEnumAllRequest(serverName: try server.unwrap()), offset: 0)
+        let recvData = try await srvsvc.pread(offset: 0)
         return try MSRPC.NetShareEnumAllLevel1(data: recvData).shares
     }
 }
@@ -530,76 +583,76 @@ extension SMB2Client {
 // MARK: File information
 
 extension SMB2Client {
-    func stat(_ path: String) throws -> smb2_stat_64 {
+    func stat(_ path: String) async throws -> smb2_stat_64 {
         var st = smb2_stat_64()
-        try async_await { context, cbPtr -> Int32 in
+        try await async_await { context, cbPtr -> Int32 in
             smb2_stat_async(context, path.canonical, &st, SMB2Client.generic_handler, cbPtr)
         }
         return st
     }
 
-    func statvfs(_ path: String) throws -> smb2_statvfs {
+    func statvfs(_ path: String) async throws -> smb2_statvfs {
         var st = smb2_statvfs()
-        try async_await { context, cbPtr -> Int32 in
+        try await async_await { context, cbPtr -> Int32 in
             smb2_statvfs_async(context, path.canonical, &st, SMB2Client.generic_handler, cbPtr)
         }
         return st
     }
 
-    func readlink(_ path: String) throws -> String {
-        try async_await(dataHandler: String.init) { context, cbPtr -> Int32 in
+    func readlink(_ path: String) async throws -> String {
+        try await async_await(dataHandler: String.init) { context, cbPtr -> Int32 in
             smb2_readlink_async(context, path.canonical, SMB2Client.generic_handler, cbPtr)
         }.data
     }
 
-    func symlink(_ path: String, to destination: String) throws {
-        let file = try SMB2FileHandle(path: path, flags: O_RDWR | O_CREAT | O_EXCL | O_SYMLINK | O_SYNC, on: self)
+    func symlink(_ path: String, to destination: String) async throws {
+        let file = try await SMB2FileHandle.open(path: path, flags: O_RDWR | O_CREAT | O_EXCL | O_SYMLINK | O_SYNC, on: self)
         let reparse = IOCtl.SymbolicLinkReparse(path: destination, isRelative: true)
-        try file.fcntl(command: .setReparsePoint, args: reparse)
+        try await file.fcntl(command: .setReparsePoint, args: reparse)
     }
 }
 
 // MARK: File operation
 
 extension SMB2Client {
-    func mkdir(_ path: String) throws {
-        try async_await { context, cbPtr -> Int32 in
+    func mkdir(_ path: String) async throws {
+        try await async_await { context, cbPtr -> Int32 in
             smb2_mkdir_async(context, path.canonical, SMB2Client.generic_handler, cbPtr)
         }
     }
 
-    func rmdir(_ path: String) throws {
-        try async_await { context, cbPtr -> Int32 in
+    func rmdir(_ path: String) async throws {
+        try await async_await { context, cbPtr -> Int32 in
             smb2_rmdir_async(context, path.canonical, SMB2Client.generic_handler, cbPtr)
         }
     }
 
-    func unlink(_ path: String, type: smb2_stat_64.ResourceType = .file) throws {
+    func unlink(_ path: String, type: smb2_stat_64.ResourceType = .file) async throws {
         switch type {
         case .directory:
             throw POSIXError(.EINVAL, description: "Use rmdir() to delete a directory.")
         case .file:
-            try async_await { context, cbPtr -> Int32 in
+            try await async_await { context, cbPtr -> Int32 in
                 smb2_unlink_async(context, path.canonical, SMB2Client.generic_handler, cbPtr)
             }
         case .link:
-            let file = try SMB2FileHandle(path: path, flags: O_RDWR | O_SYMLINK, on: self)
-            try file.setInfo(smb2_file_disposition_info(delete_pending: 1), infoClass: .disposition)
+            let file = try await SMB2FileHandle.open(path: path, flags: O_RDWR | O_SYMLINK, on: self)
+            try await file.setInfo(smb2_file_disposition_info(delete_pending: 1), infoClass: .disposition)
         default:
             preconditionFailure("Not supported file type.")
         }
     }
 
-    func rename(_ path: String, to newPath: String) throws {
-        try async_await { context, cbPtr -> Int32 in
+    func rename(_ path: String, to newPath: String) async throws {
+        try await async_await { context, cbPtr -> Int32 in
             smb2_rename_async(
                 context, path.canonical, newPath.canonical, SMB2Client.generic_handler, cbPtr
             )
         }
     }
 
-    func truncate(_ path: String, toLength: UInt64) throws {
-        try async_await { context, cbPtr -> Int32 in
+    func truncate(_ path: String, toLength: UInt64) async throws {
+        try await async_await { context, cbPtr -> Int32 in
             smb2_truncate_async(
                 context, path.canonical, toLength, SMB2Client.generic_handler, cbPtr
             )
@@ -611,30 +664,39 @@ extension SMB2Client {
 
 extension SMB2Client {
     /// Per-operation callback state. Each in-flight operation gets its own `CBData`.
-    /// The calling thread waits on `semaphore`; `generic_handler` signals it when
-    /// libsmb2 delivers the reply via `smb2_service`.
+    /// `generic_handler` resumes the stored `CheckedContinuation` when libsmb2
+    /// delivers the reply via `smb2_service`.
     ///
-    /// `isAbandoned` prevents the semaphore from being double-signaled when a timeout
-    /// races with the libsmb2 callback. `passRetained`/`takeRetainedValue` keeps the
-    /// object alive until the callback fires, even after the caller has timed out.
-    final class CBData {
+    /// `isAbandoned` prevents the continuation from being double-resumed when a timeout
+    /// or connection drop races with the libsmb2 callback. `passRetained`/`takeRetainedValue`
+    /// keeps the object alive until the callback fires.
+    final class CBData: @unchecked Sendable {
         var result: Int32 = .init(NTStatus.success.rawValue)
-        let semaphore = DispatchSemaphore(value: 0)
         var dataHandler: ((UnsafeMutableRawPointer?) -> Void)?
         var error: (any Error)?
-        /// Set to `true` when the caller has timed out or the connection was dropped.
-        /// The libsmb2 callback checks this flag and skips signaling the semaphore.
+        /// Set to `true` when the caller has timed out, the connection was dropped,
+        /// or the callback has already fired. Prevents double-resume of the continuation.
         var isAbandoned = false
+        /// Set to `true` by `generic_handler`. Used by `pollUntilComplete` (connect path)
+        /// where continuations are not yet available.
+        var isFinished = false
         var status: NTStatus {
             NTStatus(rawValue: result)
         }
+
+        /// Continuation resumed when the operation completes. Nil for the connect path
+        /// (which uses `pollUntilComplete` instead).
+        var continuation: CheckedContinuation<Void, any Error>?
+        /// Cleanup closure that removes this CBData from `pendingOperations`.
+        /// Called on the event loop queue before the continuation is resumed.
+        var cleanup: (() -> Void)?
     }
 
     /// Poll loop used only during `connect()`, before DispatchSource monitoring is running.
     /// Runs synchronously on the event loop queue.
     private func pollUntilComplete(_ cb: CBData) throws {
         let startDate = Date()
-        while cb.error == nil && cb.semaphore.wait(timeout: .now()) == .timedOut {
+        while cb.error == nil && !cb.isFinished {
             guard let context else {
                 throw POSIXError(.ENOTCONN)
             }
@@ -665,16 +727,25 @@ extension SMB2Client {
 
     /// Callback invoked by libsmb2 when an async operation completes (on the event loop queue).
     /// `takeRetainedValue()` balances the `passRetained()` performed at setup.
+    /// Resumes the stored `CheckedContinuation` to unblock the awaiting caller, or sets
+    /// `isFinished` for the `pollUntilComplete` path (connect).
     static let generic_handler: smb2_command_cb = { smb2, status, command_data, cbdata in
         do {
             guard try smb2.unwrap().pointee.fd >= 0 else { return }
             let cbdata = Unmanaged<CBData>.fromOpaque(try cbdata.unwrap()).takeRetainedValue()
-            if cbdata.isAbandoned { return }
+            guard !cbdata.isAbandoned else { return }
+            cbdata.isAbandoned = true
             if NTStatus(rawValue: status) != .success {
                 cbdata.result = status
             }
             cbdata.dataHandler?(command_data)
-            cbdata.semaphore.signal()
+            cbdata.isFinished = true
+            cbdata.cleanup?()
+            cbdata.cleanup = nil
+            if let continuation = cbdata.continuation {
+                cbdata.continuation = nil
+                continuation.resume()
+            }
         } catch {}
     }
 
@@ -688,23 +759,24 @@ extension SMB2Client {
     ) throws -> R
 
     @discardableResult
-    func async_await(execute handler: UnsafeContextHandler<Int32>) throws -> Int32 {
-        try async_await(dataHandler: { _, _ in }, execute: handler).result
+    func async_await(execute handler: @escaping UnsafeContextHandler<Int32>) async throws -> Int32 {
+        try await async_await(dataHandler: { _, _ in }, execute: handler).result
     }
 
-    /// Submits an async libsmb2 operation and blocks the calling thread until the reply arrives.
+    /// Submits an async libsmb2 operation and suspends the calling task until the reply arrives.
     ///
-    /// The libsmb2 call is dispatched synchronously onto the event loop queue (brief — just
-    /// queues the PDU). The calling thread then waits on a per-operation semaphore. When
-    /// DispatchSource fires, `smb2_service` calls `generic_handler` which signals the semaphore.
-    /// Multiple operations can be in-flight simultaneously, each with its own semaphore.
+    /// The libsmb2 call is dispatched onto the event loop queue (brief — just queues the PDU).
+    /// The caller suspends via `CheckedContinuation`. When DispatchSource fires,
+    /// `smb2_service` calls `generic_handler` which resumes the continuation.
+    /// Multiple operations can be in-flight simultaneously, each with its own continuation.
     @discardableResult
     func async_await<DataType>(
         dataHandler: @escaping ContextHandler<DataType>,
-        execute handler: UnsafeContextHandler<Int32>
-    )
-        throws -> (result: Int32, data: DataType)
-    {
+        execute handler: @escaping UnsafeContextHandler<Int32>
+    ) async throws -> (result: Int32, data: DataType) {
+        // Fast-path: bail immediately if the Task is already cancelled.
+        try Task.checkCancellation()
+
         let cb = CBData()
         var resultData: DataType?
         var dataHandlerError: (any Error)?
@@ -719,41 +791,64 @@ extension SMB2Client {
         let cbPtr = Unmanaged.passRetained(cb).toOpaque()
         let cbId = ObjectIdentifier(cb)
 
-        var setupError: (any Error)?
-        eventLoopQueue.sync {
-            guard let context = self.context else {
-                setupError = POSIXError(.ENOTCONN)
-                Unmanaged<CBData>.fromOpaque(cbPtr).release()
-                return
-            }
-            do {
-                let result = try handler(context, cbPtr)
-                try POSIXError.throwIfError(result, description: self.error)
-                self.pendingOperations[cbId] = cb
-                self.socketMonitor?.activateWriteSourceIfNeeded(context: context)
-            } catch {
-                setupError = error
-                Unmanaged<CBData>.fromOpaque(cbPtr).release()
-            }
-        }
-        if let setupError { throw setupError }
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+                self.eventLoopQueue.async {
+                    guard let context = self.context else {
+                        Unmanaged<CBData>.fromOpaque(cbPtr).release()
+                        continuation.resume(throwing: POSIXError(.ENOTCONN))
+                        return
+                    }
+                    do {
+                        let result = try handler(context, cbPtr)
+                        try POSIXError.throwIfError(result, description: self.error)
+                        cb.continuation = continuation
+                        // Check if cancellation arrived before this block ran.
+                        // The onCancel handler sets isAbandoned but couldn't resume
+                        // the continuation (it was nil at the time).
+                        guard !cb.isAbandoned else {
+                            cb.continuation = nil
+                            Unmanaged<CBData>.fromOpaque(cbPtr).release()
+                            continuation.resume(throwing: CancellationError())
+                            return
+                        }
+                        cb.cleanup = { [weak self] in
+                            self?.pendingOperations.removeValue(forKey: cbId)
+                        }
+                        self.pendingOperations[cbId] = cb
+                        self.socketMonitor?.activateWriteSourceIfNeeded(context: context)
 
-        if timeout > 0 {
-            if cb.semaphore.wait(timeout: .now() + timeout) == .timedOut {
-                // On timeout, mark abandoned so that the eventual callback (which will
-                // call takeRetainedValue()) skips signaling the semaphore.
-                eventLoopQueue.sync {
-                    cb.isAbandoned = true
-                    _ = self.pendingOperations.removeValue(forKey: cbId)
+                        // Start timeout timer on the event loop queue.
+                        if self.timeout > 0 {
+                            self.eventLoopQueue.asyncAfter(deadline: .now() + self.timeout) { [weak self] in
+                                guard !cb.isAbandoned else { return }
+                                cb.isAbandoned = true
+                                self?.pendingOperations.removeValue(forKey: cbId)
+                                if let cont = cb.continuation {
+                                    cb.continuation = nil
+                                    cont.resume(throwing: POSIXError(.ETIMEDOUT))
+                                }
+                            }
+                        }
+                    } catch {
+                        Unmanaged<CBData>.fromOpaque(cbPtr).release()
+                        continuation.resume(throwing: error)
+                    }
                 }
-                throw POSIXError(.ETIMEDOUT)
             }
-        } else {
-            cb.semaphore.wait()
+        } onCancel: {
+            // Remove the pending operation and resume with CancellationError.
+            // Dispatched to event loop queue for thread safety.
+            self.eventLoopQueue.async {
+                guard !cb.isAbandoned else { return }
+                cb.isAbandoned = true
+                self.pendingOperations.removeValue(forKey: cbId)
+                if let cont = cb.continuation {
+                    cb.continuation = nil
+                    cont.resume(throwing: CancellationError())
+                }
+            }
         }
-
-        // Remove from pending; may already be absent if failAllPendingOperations ran.
-        eventLoopQueue.sync { _ = self.pendingOperations.removeValue(forKey: cbId) }
 
         if let error = cb.error { throw error }
         let cbResult = cb.result
@@ -763,19 +858,19 @@ extension SMB2Client {
     }
 
     @discardableResult
-    func async_await_pdu(execute handler: UnsafeContextHandler<UnsafeMutablePointer<smb2_pdu>?>)
-        throws -> UInt32
+    func async_await_pdu(execute handler: @escaping UnsafeContextHandler<UnsafeMutablePointer<smb2_pdu>?>)
+        async throws -> UInt32
     {
-        try async_await_pdu(dataHandler: { _, _ in }, execute: handler).status
+        try await async_await_pdu(dataHandler: { _, _ in }, execute: handler).status
     }
 
     @discardableResult
     func async_await_pdu<DataType>(
         dataHandler: @escaping ContextHandler<DataType>,
-        execute handler: UnsafeContextHandler<UnsafeMutablePointer<smb2_pdu>?>
-    )
-        throws -> (status: UInt32, data: DataType)
-    {
+        execute handler: @escaping UnsafeContextHandler<UnsafeMutablePointer<smb2_pdu>?>
+    ) async throws -> (status: UInt32, data: DataType) {
+        try Task.checkCancellation()
+
         let cb = CBData()
         var resultData: DataType?
         var dataHandlerError: (any Error)?
@@ -789,38 +884,61 @@ extension SMB2Client {
         let cbPtr = Unmanaged.passRetained(cb).toOpaque()
         let cbId = ObjectIdentifier(cb)
 
-        var setupError: (any Error)?
-        eventLoopQueue.sync {
-            guard let context = self.context else {
-                setupError = POSIXError(.ENOTCONN)
-                Unmanaged<CBData>.fromOpaque(cbPtr).release()
-                return
-            }
-            do {
-                let pdu = try handler(context, cbPtr).unwrap()
-                smb2_queue_pdu(context, pdu)
-                self.pendingOperations[cbId] = cb
-                self.socketMonitor?.activateWriteSourceIfNeeded(context: context)
-            } catch {
-                setupError = error
-                Unmanaged<CBData>.fromOpaque(cbPtr).release()
-            }
-        }
-        if let setupError { throw setupError }
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+                self.eventLoopQueue.async {
+                    guard let context = self.context else {
+                        Unmanaged<CBData>.fromOpaque(cbPtr).release()
+                        continuation.resume(throwing: POSIXError(.ENOTCONN))
+                        return
+                    }
+                    do {
+                        let pdu = try handler(context, cbPtr).unwrap()
+                        smb2_queue_pdu(context, pdu)
+                        cb.continuation = continuation
+                        // Check if cancellation arrived before this block ran.
+                        // The onCancel handler sets isAbandoned but couldn't resume
+                        // the continuation (it was nil at the time).
+                        guard !cb.isAbandoned else {
+                            cb.continuation = nil
+                            Unmanaged<CBData>.fromOpaque(cbPtr).release()
+                            continuation.resume(throwing: CancellationError())
+                            return
+                        }
+                        cb.cleanup = { [weak self] in
+                            self?.pendingOperations.removeValue(forKey: cbId)
+                        }
+                        self.pendingOperations[cbId] = cb
+                        self.socketMonitor?.activateWriteSourceIfNeeded(context: context)
 
-        if timeout > 0 {
-            if cb.semaphore.wait(timeout: .now() + timeout) == .timedOut {
-                eventLoopQueue.sync {
-                    cb.isAbandoned = true
-                    _ = self.pendingOperations.removeValue(forKey: cbId)
+                        if self.timeout > 0 {
+                            self.eventLoopQueue.asyncAfter(deadline: .now() + self.timeout) { [weak self] in
+                                guard !cb.isAbandoned else { return }
+                                cb.isAbandoned = true
+                                self?.pendingOperations.removeValue(forKey: cbId)
+                                if let cont = cb.continuation {
+                                    cb.continuation = nil
+                                    cont.resume(throwing: POSIXError(.ETIMEDOUT))
+                                }
+                            }
+                        }
+                } catch {
+                    Unmanaged<CBData>.fromOpaque(cbPtr).release()
+                    continuation.resume(throwing: error)
                 }
-                throw POSIXError(.ETIMEDOUT)
             }
-        } else {
-            cb.semaphore.wait()
         }
-
-        eventLoopQueue.sync { _ = self.pendingOperations.removeValue(forKey: cbId) }
+        } onCancel: {
+            self.eventLoopQueue.async {
+                guard !cb.isAbandoned else { return }
+                cb.isAbandoned = true
+                self.pendingOperations.removeValue(forKey: cbId)
+                if let cont = cb.continuation {
+                    cb.continuation = nil
+                    cont.resume(throwing: CancellationError())
+                }
+            }
+        }
 
         if let error = cb.error { throw error }
         try POSIXError.throwIfErrorStatus(cb.status)

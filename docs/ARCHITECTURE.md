@@ -83,23 +83,22 @@ Every SMB2 operation follows the same pattern: Swift async/await is bridged to l
 ```mermaid
 flowchart LR
     A["Swift async/await"] --> B["withCheckedThrowingContinuation"]
-    B --> C["DispatchQueue.async"]
-    C --> D["eventLoopQueue.sync<br/>(queues PDU)"]
+    B --> C["caller suspends<br/>(Swift task suspended)"]
+    C --> D["eventLoopQueue.async<br/>(dispatches PDU setup)"]
     D --> E["smb2_*_async()<br/>(queues PDU)"]
-    E --> F["caller waits on<br/>DispatchSemaphore"]
-    F --> G{"DispatchSource fires<br/>(socket ready)"}
-    G -->|"data ready"| H["smb2_service()<br/>(processes response)"]
-    H --> I["generic_handler<br/>(C callback)"]
-    I --> J["semaphore.signal()"]
-    J --> K["continuation.resume()"]
-    F -->|"timeout"| L["mark CBData abandoned<br/>throw ETIMEDOUT"]
+    E --> F{"DispatchSource fires<br/>(socket ready)"}
+    F -->|"data ready"| G["smb2_service()<br/>(processes response)"]
+    G --> H["generic_handler<br/>(C callback)"]
+    H --> I["continuation.resume()"]
+    I --> J["Swift task resumes<br/>with result"]
+    F -->|"timeout"| K["mark CBData abandoned<br/>throw ETIMEDOUT"]
 ```
 
 Key details:
 - **CBData** is a class (heap-allocated) passed to C callbacks via `Unmanaged<CBData>.passRetained`. The C callback recovers it via `Unmanaged<CBData>.fromOpaque(..).takeRetainedValue()`, balancing the retain count.
 - **DispatchSource** monitors the socket file descriptor for readability and writability. When the socket has I/O events, `handleSocketEvent()` calls `smb2_service()` on the event loop queue, which invokes `generic_handler` for any completed operations.
-- **Multiple operations** can be in-flight simultaneously. Each operation gets its own `CBData` with its own `DispatchSemaphore`. The event loop queue services all pending requests concurrently.
-- **Timeout** is configurable via `SMB2Manager.timeout` (default: 60 seconds). On timeout, `CBData.isAbandoned` is set so the eventual callback skips signaling the already-abandoned semaphore.
+- **Multiple operations** can be in-flight simultaneously. Each operation gets its own `CBData` with its own `CheckedContinuation`. The event loop queue services all pending requests concurrently.
+- **Timeout** is configurable via `SMB2Manager.timeout` (default: 60 seconds). On timeout, `CBData.isAbandoned` is set so the eventual callback skips resuming the already-abandoned continuation.
 - **Connection** uses a temporary poll loop (`pollUntilComplete`) because the `DispatchSource` cannot be created until the socket fd exists. After connect completes, `startSocketMonitoring()` switches to the event-driven model.
 
 ## Thread Safety Model
@@ -109,22 +108,22 @@ graph TB
     subgraph SMB2Manager
         CL["connectLock (NSLock)<br/><i>Protects connection state</i>"]
         OL["operationLock (NSCondition)<br/><i>Tracks in-flight operation count</i>"]
-        DQ["DispatchQueue (concurrent)<br/><i>Serializes operations via queue()</i>"]
+        DQ["queue() helper<br/><i>Wraps each operation in Task { ... } for structured concurrency</i>"]
     end
 
     subgraph SMB2Client
         ELQ["eventLoopQueue (serial DispatchQueue, .userInitiated)<br/><i>Exclusively owns smb2_context</i>"]
         SM["SocketMonitor (DispatchSource)<br/><i>Monitors socket readability/writability</i>"]
-        SEM["Per-operation DispatchSemaphore<br/><i>Caller blocks until reply arrives</i>"]
+        CONT["Per-operation CheckedContinuation<br/><i>Swift task suspends; generic_handler resumes on completion</i>"]
     end
 
     subgraph SMB2FileHandle
         HL["_handleLock (NSLock)<br/><i>Protects handle nil-swap in close/deinit</i>"]
     end
 
-    DQ -->|"eventLoopQueue.sync<br/>(brief PDU setup)"| ELQ
+    DQ -->|"eventLoopQueue.async<br/>(PDU setup)"| ELQ
     SM -->|"socket event"| ELQ
-    ELQ -->|"smb2_service → generic_handler"| SEM
+    ELQ -->|"smb2_service → generic_handler"| CONT
     CL -->|"connect/disconnect"| ELQ
 ```
 
@@ -132,14 +131,14 @@ graph TB
 |-----------|------|----------|-------------|
 | `connectLock` | `NSLock` | `SMB2Manager.client` reference, connection state | `connectShare()`, `disconnectShare()`, `smbClient` getter |
 | `operationLock` | `NSCondition` | `operationCount` — tracks in-flight operations | Increment/decrement around each queued operation |
-| `eventLoopQueue` | Serial `DispatchQueue` (`.userInitiated` QoS) | All access to the `smb2_context` C pointer | PDU setup (brief `sync`), socket event handling, shutdown |
+| `eventLoopQueue` | Serial `DispatchQueue` (`.userInitiated` QoS) | All access to the `smb2_context` C pointer | PDU setup (async dispatch), socket event handling, shutdown |
 | `SocketMonitor` | `DispatchSource` (read + write) | Socket I/O event delivery | Fires on the event loop queue when the socket is readable/writable |
-| `CBData.semaphore` | `DispatchSemaphore` | Per-operation completion signaling | Caller waits after PDU setup; signaled by `generic_handler` |
+| `CBData.continuation` | `CheckedContinuation<Void, any Error>` | Per-operation completion bridging | Swift task suspends; `generic_handler` resumes on completion |
 | `_handleLock` | `NSLock` | `SMB2FileHandle.handle` pointer | `close()` and `deinit` only (nil-swap pattern) |
 
 **Concurrency guarantees:**
 - `SMB2Manager` is `@unchecked Sendable` — safe to share across actors and tasks
-- The serial `eventLoopQueue` exclusively owns the `smb2_context`. All libsmb2 calls execute on this queue. Operations use `eventLoopQueue.sync` only for brief PDU setup, then wait on their own `DispatchSemaphore` — this allows multiple operations to be in-flight simultaneously
+- The serial `eventLoopQueue` exclusively owns the `smb2_context`. All libsmb2 calls execute on this queue. Operations use `eventLoopQueue.async` for PDU setup, then the Swift task suspends via `CheckedContinuation` — this allows multiple operations to be in-flight simultaneously
 - `DispatchSource` monitors socket readability/writability. When I/O events arrive, `handleSocketEvent()` runs on the event loop queue and calls `smb2_service()`, which invokes `generic_handler` for completed operations
 - `CBData` uses `Unmanaged.passRetained()`/`takeRetainedValue()` for safe C callback bridging — the retain count keeps `CBData` alive until the callback fires, even if the caller has timed out
 - Property accessors use `syncOnEventLoop()` with a `DispatchSpecificKey` deadlock guard to safely read context state from any thread
@@ -155,57 +154,77 @@ graph LR
     RS["DispatchSource.makeReadSource<br/><i>Always active after connect</i>"] -->|"socket readable"| HE["handleSocketEvent()"]
     WS["DispatchSource.makeWriteSource<br/><i>Active only when libsmb2 has outgoing data</i>"] -->|"socket writable"| HE
     HE --> SVC["smb2_service(context, revents)"]
-    SVC -->|"operation complete"| GH["generic_handler → semaphore.signal()"]
+    SVC -->|"operation complete"| GH["generic_handler → continuation.resume()"]
     SVC -->|"error (result < 0)"| FAIL["failAllPendingOperations()"]
 ```
 
 - The **read source** is always active after connect. It fires whenever the socket has incoming data.
 - The **write source** is lazily created and toggled via `activateWriteSourceIfNeeded()` — it is resumed when `smb2_which_events()` indicates `POLLOUT` (outgoing data pending), and suspended otherwise.
-- On connection error, `handleSocketEvent()` destroys the context and calls `failAllPendingOperations()`, which sets `isAbandoned` on all pending `CBData` and signals their semaphores with `ECONNRESET`.
+- On connection error, `handleSocketEvent()` destroys the context and calls `failAllPendingOperations()`, which sets `isAbandoned` on all pending `CBData` and resumes their continuations with `ECONNRESET`.
 
 ## Buffer Pool
 
 `BufferPool` is a reusable fixed-capacity buffer pool that eliminates per-read allocation overhead. It is owned by `SMB2Client` and shared across all read operations on that client.
 
-- **`checkout(minimumSize:)`** returns a buffer of at least the requested size — preferring a pooled buffer that is already large enough, resizing one if possible, or allocating fresh.
-- **`checkin(_:)`** returns a buffer to the pool. Buffers beyond `maxPoolSize` (default: 8) are discarded.
+### RawBuffer
+
+`RawBuffer` is the value type managed by `BufferPool`. It wraps an `UnsafeMutableRawPointer` with a fixed capacity:
+
+- **`.pointer: UnsafeMutableRawPointer`** — stable for the entire lifetime of the `RawBuffer`. Because the pointer is not scoped to a `withUnsafeMutableBytes` closure, it is safe to pass to libsmb2 across async suspension points.
+- **`.capacity: Int`** — the allocated size in bytes.
+- **`data(count:)`** — the only place a `Data` copy is created; copies `count` bytes from the buffer into a new `Data` value to return to the caller.
+- **`abandon()`** — intentional leak used on cancel/error paths when libsmb2 still holds the pointer. The buffer is not returned to the pool and its memory is not freed until libsmb2's callback fires and releases it.
+
+### BufferPool
+
+- **`checkout(minimumSize:)`** returns a buffer of at least the requested size — preferring a pooled buffer that is already large enough, or allocating fresh if none fits.
+- **`checkin(_:)`** returns a buffer to the pool. Buffers beyond `maxPoolSize` (default: 8) are deallocated rather than stored.
 - Thread-safe via an internal `NSLock`.
 
-Read operations (`read()`, `pread()`, `pipelinedRead()`) check out a buffer, perform the I/O into it, copy the result into a `Data` value, and check the buffer back in. This avoids per-operation zero-fill and reduces allocation pressure during large file transfers.
+Read operations (`read()`, `pread()`, `pipelinedRead()`) check out a `RawBuffer`, pass its `.pointer` directly to libsmb2, copy the result into a `Data` value via `data(count:)`, and check the buffer back in. This avoids per-operation zero-fill and reduces allocation pressure during large file transfers.
 
 ## Pipelined I/O
 
-`SMB2FileHandle` provides `pipelinedRead()` and `pipelinedWrite()` methods that dispatch multiple concurrent chunk operations via `DispatchGroup` to saturate the network link.
+`SMB2FileHandle` provides `pipelinedRead()` and `pipelinedWrite()` methods that dispatch multiple concurrent chunk operations via structured concurrency (`withThrowingTaskGroup`) to saturate the network link.
 
 ```mermaid
 flowchart TB
     subgraph "pipelinedRead(offset:totalLength:)"
-        PR["Calculate window chunks<br/>(up to maxInFlight)"] --> DISP["Dispatch chunks on DispatchQueue.global()"]
-        DISP --> W1["Chunk 0: pread_async"]
-        DISP --> W2["Chunk 1: pread_async"]
-        DISP --> W3["Chunk 2: pread_async"]
-        DISP --> W4["Chunk 3: pread_async"]
-        W1 --> GW["DispatchGroup.wait()"]
+        PR["Calculate window chunks<br/>(up to maxInFlight)"] --> DISP["withThrowingTaskGroup<br/>adds child tasks"]
+        DISP --> W1["Chunk 0: group.addTask → pread_async"]
+        DISP --> W2["Chunk 1: group.addTask → pread_async"]
+        DISP --> W3["Chunk 2: group.addTask → pread_async"]
+        DISP --> W4["Chunk 3: group.addTask → pread_async"]
+        W1 --> GW["group collects results<br/>(structured concurrency)"]
         W2 --> GW
         W3 --> GW
         W4 --> GW
-        GW --> COLLECT["PipelineCollector assembles<br/>results in offset order"]
+        GW --> COLLECT["chunks.sorted by offset<br/>(inline assembly in order)"]
         COLLECT --> NEXT["Next window (if data remains)"]
         NEXT --> PR
     end
 ```
 
 - **`maxInFlight`** (default: 4) controls how many concurrent requests are in a single window.
-- Each chunk dispatches to `DispatchQueue.global()`, where it calls `client.async_await` — the PDU is set up on the event loop queue, then the global queue thread waits on its semaphore.
-- `PipelineCollector` is a thread-safe indexed container that collects results from concurrent operations and returns them in order.
+- Each chunk is dispatched as a child task via `group.addTask`, where it calls `client.async_await` — the PDU is set up on the event loop queue, then the Swift task suspends via `CheckedContinuation`.
+- Results are sorted inline by offset (`chunks.sorted { $0.0 < $1.0 }.map(\.1)`) — no separate `PipelineCollector` type needed.
 - The file handle pointer is captured as a raw integer (`UInt(bitPattern:)`) to safely cross `Sendable` boundaries.
+
+## Task Cancellation
+
+Every async operation supports Swift task cancellation. The pattern is consistent across all operations:
+
+- **Fast-path check**: `Task.checkCancellation()` is called at the start of every `async_await` and `async_await_pdu` call, before submitting the PDU to libsmb2. If the task is already cancelled, `CancellationError` is thrown immediately without touching the network.
+- **`withTaskCancellationHandler`**: Each `async_await` call is wrapped in `withTaskCancellationHandler`. The `onCancel` closure dispatches to `eventLoopQueue` and sets `CBData.isAbandoned = true`, then resumes the `CheckedContinuation` with `CancellationError`. This unblocks the suspended Swift task immediately even if the network is slow.
+- **Buffer safety**: When a read operation is cancelled after a `RawBuffer` has been checked out, the buffer is passed to `abandon()` rather than `checkin()`. This intentional leak ensures the pointer remains valid for the duration of libsmb2's pending callback — after the callback fires, the abandoned buffer's memory is freed by the callback handler.
+- **No double-resume**: `CBData.isAbandoned` ensures that if `generic_handler` fires after the cancellation path has already resumed the continuation, the completion is silently dropped.
 
 ## Source File Map
 
 | File | Layer | Responsibility |
 |------|-------|----------------|
 | `AMSMB2.swift` | Public API | `SMB2Manager` class — all public file/directory/connection operations |
-| `Context.swift` | Context Wrapper | `SMB2Client` class — smb2_context lifecycle, event loop queue, `SocketMonitor`, `BufferPool`, async operation bridge |
+| `Context.swift` | Context Wrapper | `SMB2Client` class — smb2_context lifecycle, event loop queue, `SocketMonitor`, `BufferPool`, `RawBuffer`, async operation bridge |
 | `FileHandle.swift` | File Abstraction | `SMB2FileHandle` class — open/close/read/write/seek/ioctl/changeNotify, pipelined I/O |
 | `Directory.swift` | File Abstraction | Directory enumeration handle |
 | `Stream.swift` | Public API | `AsyncInputStream` — adapts `AsyncSequence` to `InputStream` for streaming writes, with high-water/low-water mark backpressure |

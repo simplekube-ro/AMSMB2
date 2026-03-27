@@ -40,9 +40,9 @@ make cleanlinuxtest         # Clean Docker build
 
 - **SMB2Manager** ([AMSMB2.swift](AMSMB2/AMSMB2.swift)) - Public API class, thread-safe, supports NSSecureCoding/Codable. Manages connection lifecycle and exposes all file operations (list, read, write, copy, move, delete).
 
-- **SMB2Client** ([Context.swift](AMSMB2/Context.swift)) - Internal wrapper around libsmb2's `smb2_context`. All access serialized through a dedicated `eventLoopQueue` with `DispatchSource`-based socket monitoring.
+- **SMB2Client** ([Context.swift](AMSMB2/Context.swift)) - Internal wrapper around libsmb2's `smb2_context`. All access serialized through a dedicated `eventLoopQueue` with `DispatchSource`-based socket monitoring. Operations use `CheckedContinuation` — callers suspend instead of blocking threads. Supports task cancellation via `withTaskCancellationHandler`.
 
-- **SMB2FileHandle** ([FileHandle.swift](AMSMB2/FileHandle.swift)) - File handle abstraction for reading/writing. Supports various open modes (read, write, update, overwrite, create).
+- **SMB2FileHandle** ([FileHandle.swift](AMSMB2/FileHandle.swift)) - File handle abstraction for reading/writing. Opened via `static func open(...)` async factory methods (Swift has no async init). Supports various open modes (read, write, update, overwrite, create).
 
 ### Supporting Modules
 
@@ -59,6 +59,7 @@ make cleanlinuxtest         # Clean Docker build
 
 - `ShareProperties`, `ShareType` (Context.swift) — used by `listShares()` internally; not exposed to consumers
 - `SMB2Directory` (Directory.swift) — collection wrapper for `smb2dir` C handle
+- `RawBuffer` (Context.swift) — stable `UnsafeMutableRawPointer` buffer for I/O; pointer stays valid across async suspension. On cancel/error, use `bufferPool.abandon(buffer)` (intentional leak) — never `checkin` a buffer that libsmb2 may still be writing into
 
 ### Dependencies
 
@@ -150,11 +151,14 @@ Minimise token usage — this directly affects cost and speed:
 
 ## Testing Gotchas
 
+- `NSLock.lock()`/`unlock()` cannot be called from async contexts — use synchronous helper methods that wrap the lock
+- `withUnsafeMutableBytes`/`withCString` closures cannot contain `await` — move the unsafe closure INSIDE the synchronous handler, not wrapping the `await`
+- `AsyncInputStream` has a premature EOF race when consumed faster than prefetch fills — do NOT use pipelined writes with stream-based I/O; use sequential `pwrite` instead
 - Test files are in `AMSMB2Tests/` (not `Tests/`) — glob `AMSMB2Tests/*.swift`
 - C library functions (`smb2_*`) require `import SMB2` in test files; not re-exported via `@testable import AMSMB2`
 - `SMB2Manager` has multiple `contents(atPath:)` overloads — in async test context, compiler picks `async throws -> Data` over `AsyncThrowingStream`. Use explicit type: `let stream: AsyncThrowingStream<Data, any Error> = smb.contents(atPath:)`
 - `make integrationtest` / `./scripts/test-integration.sh` runs integration tests with Docker — use `-v` for verbose output
-- `SMB2Client.disconnect()` does not nil the context — can't simulate fully disconnected state in unit tests
+- `SMB2Client.disconnect()` is async and does not nil the context — can't simulate fully disconnected state in unit tests
 
 ## Commit Convention
 

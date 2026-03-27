@@ -18,14 +18,17 @@ final class SMB2Directory: Collection {
     private let client: SMB2Client
     private var handle: smb2dirPointer
 
-    init(_ path: String, on client: SMB2Client) throws {
+    private init(path: String, client: SMB2Client, handle: smb2dirPointer) {
         self.path = path
-        let (_, handle) = try client.async_await(dataHandler: OpaquePointer.init) { context, cbPtr -> Int32 in
+        self.client = client
+        self.handle = handle
+    }
+
+    static func open(_ path: String, on client: SMB2Client) async throws -> SMB2Directory {
+        let (_, handle) = try await client.async_await(dataHandler: OpaquePointer.init) { context, cbPtr -> Int32 in
             smb2_opendir_async(context, path, SMB2Client.generic_handler, cbPtr)
         }
-
-        self.client = client
-        self.handle = .init(handle)
+        return SMB2Directory(path: path, client: client, handle: .init(handle))
     }
 
     deinit {
@@ -56,6 +59,7 @@ final class SMB2Directory: Collection {
 
     var endIndex: Int { count }
 
+    @available(*, deprecated, message: "Use lazy enumeration instead of full-scan count.")
     var count: Int {
         (try? client.withContext { context in
             let savedPos = smb2_telldir(context, self.handle)
