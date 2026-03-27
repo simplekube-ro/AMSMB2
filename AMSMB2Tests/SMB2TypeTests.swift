@@ -148,4 +148,47 @@ class SMB2TypeTests: XCTestCase, @unchecked Sendable {
         let c = SMB2FileChangeInfo(action: .modified, fileName: "file.txt")
         XCTAssertNotEqual(a, c)
     }
+
+    // MARK: - BufferPool
+
+    func testBufferPoolCheckoutReturnsRequestedSize() {
+        let pool = BufferPool()
+        let buf = pool.checkout(minimumSize: 1024)
+        XCTAssertGreaterThanOrEqual(buf.capacity, 1024)
+        XCTAssertNotNil(buf.pointer)
+        pool.checkin(buf)
+    }
+
+    func testBufferPoolReusesReturnedBuffer() {
+        let pool = BufferPool()
+        let buf1 = pool.checkout(minimumSize: 512)
+        let ptr1 = buf1.pointer
+        pool.checkin(buf1)
+
+        let buf2 = pool.checkout(minimumSize: 512)
+        XCTAssertEqual(buf2.pointer, ptr1, "Pool should return the same buffer when size fits")
+        pool.checkin(buf2)
+    }
+
+    func testBufferPoolDiscardsWhenFull() {
+        let pool = BufferPool(maxPoolSize: 2)
+        let bufs = (0..<3).map { _ in pool.checkout(minimumSize: 64) }
+        for buf in bufs { pool.checkin(buf) }
+        // Pool holds at most 2; third is discarded (deallocated).
+        // Just verify no crash — the discarded buffer's memory is freed.
+        let buf = pool.checkout(minimumSize: 64)
+        XCTAssertGreaterThanOrEqual(buf.capacity, 64)
+        pool.checkin(buf)
+    }
+
+    func testBufferPoolResizesSmallBuffer() {
+        let pool = BufferPool()
+        let small = pool.checkout(minimumSize: 64)
+        pool.checkin(small)
+
+        // Request larger than what's pooled — pool should resize or allocate fresh.
+        let big = pool.checkout(minimumSize: 4096)
+        XCTAssertGreaterThanOrEqual(big.capacity, 4096)
+        pool.checkin(big)
+    }
 }
