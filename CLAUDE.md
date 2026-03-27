@@ -149,6 +149,15 @@ Minimise token usage — this directly affects cost and speed:
 - **One tool call, not three**: Prefer a single well-constructed command over multiple incremental checks.
 - **Don't narrate tool use**: Skip "Let me read the file" or "Let me check the status" — just do it.
 
+## Test Infrastructure
+
+- **`AMSMB2Tests/TestUtilities.swift`** — Shared test helpers and base class:
+  - `randomData(size:)` — random `Data` for test payloads
+  - `fileName(postfix:name:)` / `folderName(postfix:name:)` — unique names using `#function`
+  - `SMBIntegrationTestCase` — base class for integration tests; skips via `XCTSkipUnless` when `SMB_SERVER` env var is absent; provides lazy `server`, `share`, `credential`, `encrypted` properties
+- **Unit tests** (no server): `SMB2ParserTests`, `SMB2TypeTests`, `SMB2ManagerUnitTests`
+- **Integration tests** (inherit `SMBIntegrationTestCase`): `SMB2ManagerTests`, `SMB2IntegrationTests`, `SMB2DisconnectTimeoutTests`
+
 ## Testing Gotchas
 
 - `NSLock.lock()`/`unlock()` cannot be called from async contexts — use synchronous helper methods that wrap the lock
