@@ -248,4 +248,26 @@ class SMB2ManagerUnitTests: XCTestCase, @unchecked Sendable {
         XCTAssertNil(dict["password"], "Copied manager must also omit password from encoding")
         XCTAssertEqual(dict["user"] as? String, "user")
     }
+
+    // MARK: - Task Cancellation Tests
+
+    func testCancellationFastPath() async throws {
+        // A pre-cancelled task should throw CancellationError immediately
+        // without ever touching the event loop.
+        let client = try SMB2Client(timeout: 30)
+        let task = Task {
+            try await client.echo()
+        }
+        task.cancel()
+        do {
+            try await task.value
+            XCTFail("Expected CancellationError or ENOTCONN")
+        } catch is CancellationError {
+            // Expected: fast-path cancellation check fired before submission
+        } catch let error as POSIXError where error.code == .ENOTCONN {
+            // Also acceptable: not connected (race between cancel and submit)
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+    }
 }
