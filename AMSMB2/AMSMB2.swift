@@ -1799,26 +1799,22 @@ extension SMB2Manager {
             file = try await SMB2FileHandle.open(forCreatingIfNotExistsAtPath: toPath, on: client)
         }
         let chunkSize = chunkSize > 0 ? chunkSize : file.optimizedWriteSize
-        let windowSize = chunkSize * 4
         var totalWritten: UInt64 = 0
 
         try await stream.withOpenStream {
             while true {
-                // Buffer a window of data for pipelined writing.
-                var windowData = Data()
-                windowData.reserveCapacity(windowSize)
-                while windowData.count < windowSize {
-                    let segment = try stream.readData(maxLength: min(chunkSize, windowSize - windowData.count))
-                    if segment.isEmpty { break }
-                    windowData.append(segment)
+                let segment = try stream.readData(maxLength: chunkSize)
+                if segment.isEmpty {
+                    break
                 }
-                if windowData.isEmpty { break }
+                let written = try await file.pwrite(data: segment, offset: UInt64(offset ?? 0) + totalWritten)
+                if written != segment.count {
+                    throw POSIXError(
+                        .EIO, description: "Inconsistency in writing to SMB file handle."
+                    )
+                }
 
-                let written = try await file.pipelinedWrite(
-                    data: windowData, offset: UInt64(offset ?? 0) + totalWritten,
-                    chunkSize: chunkSize
-                )
-                totalWritten += UInt64(written)
+                totalWritten += UInt64(segment.count)
                 if let shouldContinue = progress?(Int64(totalWritten)), !shouldContinue {
                     break
                 }

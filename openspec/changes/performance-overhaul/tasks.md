@@ -27,7 +27,7 @@
 - [x] 4.1 Implement `pipelinedRead(handle:offset:totalLength:chunkSize:maxInFlight:)` in SMB2Client that queues up to `maxInFlight` `smb2_pread_async` calls, collects results in offset order, and replenishes the pipeline as replies arrive — **PRE-EXISTING**: `pipelinedRead` exists in FileHandle.swift
 - [x] 4.2 Implement `pipelinedWrite(handle:data:offset:chunkSize:maxInFlight:)` with the same pipeline pattern for writes, including cancellation of remaining chunks on failure — **PRE-EXISTING**: `pipelinedWrite` exists in FileHandle.swift
 - [x] 4.3 Update `SMB2Manager`'s file read path (the `read` method that reads an entire file in chunks) to use `pipelinedRead` instead of sequential chunk reads — **DONE**: read uses pipelinedRead with 4-chunk windows
-- [x] 4.4 Update `SMB2Manager`'s file write path to use `pipelinedWrite` instead of sequential chunk writes — **DONE**: write buffers window then uses pipelinedWrite
+- [x] 4.4 Update `SMB2Manager`'s file write path to use `pipelinedWrite` instead of sequential chunk writes — **REVERTED**: pipelined writes cause AsyncInputStream premature EOF; sequential pwrite is correct for stream-based I/O
 - [x] 4.5 Update server-side copy (`copyContentsOfItem`) to pipeline copy chunks where possible — **SKIPPED**: server-side copy uses IOCTL chunks (not read/write); pipelining IOCTLs requires separate mechanism and is out of scope
 
 ## 5. Stream Backpressure
