@@ -416,8 +416,8 @@ Low-level wrapper around libsmb2's `smb2_context`. All access to the underlying 
 | Property | Type | Description |
 |----------|------|-------------|
 | `timeout` | `TimeInterval` | Operation timeout |
-| `debugDescription` | `String` | Debug info |
-| `customMirror` | `Mirror` | Mirror with server, security mode, auth, user, version, connection state |
+| `debugDescription` | `String` | Human-readable debug string; safe on unconnected clients |
+| `customMirror` | `Mirror` | Mirror with server, security mode, auth, user, version, connection state; nil-safe on unconnected clients |
 
 Typically accessed via `SMB2Manager.smbClient` (throws if not connected).
 

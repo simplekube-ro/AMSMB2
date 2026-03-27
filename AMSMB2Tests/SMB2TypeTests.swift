@@ -20,6 +20,26 @@ class SMB2TypeTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(client.timeout, 30)
     }
 
+    func testSMB2ClientDebugDescription() throws {
+        let client = try SMB2Client(timeout: 30)
+        let desc = client.debugDescription
+        XCTAssertFalse(desc.isEmpty, "debugDescription must return a non-empty string")
+    }
+
+    func testSMB2ClientCustomMirror() throws {
+        // customMirror always includes isConnected and timeout, even on a fresh client.
+        // Note: server is nil on a fresh client, so the server/auth block is skipped.
+        let client = try SMB2Client(timeout: 30)
+        let mirror = client.customMirror
+        XCTAssertGreaterThanOrEqual(
+            mirror.children.count, 1,
+            "customMirror must have at least one child"
+        )
+        let labels = mirror.children.compactMap(\.label)
+        XCTAssertTrue(labels.contains("timeout"))
+        XCTAssertTrue(labels.contains("isConnected"))
+    }
+
     // MARK: - ShareProperties / ShareType
 
     func testShareTypeUnknownValue() {

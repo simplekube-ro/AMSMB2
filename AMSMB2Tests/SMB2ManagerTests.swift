@@ -17,38 +17,7 @@ import FoundationNetworking
 #endif
 @testable import AMSMB2
 
-private func folderName(postfix: String = "", name: String = #function) -> String {
-    "\(name.trimmingCharacters(in: .init(charactersIn: "()")))\(postfix)"
-}
-
-private func fileName(postfix: String = "", name: String = #function) -> String {
-    "\(name.trimmingCharacters(in: .init(charactersIn: "()")))\(postfix).dat"
-}
-
-class SMB2ManagerTests: XCTestCase, @unchecked Sendable {
-    override func setUpWithError() throws {
-        try super.setUpWithError()
-        try XCTSkipUnless(
-            ProcessInfo.processInfo.environment["SMB_SERVER"] != nil,
-            "SMB server not configured"
-        )
-    }
-
-    lazy var server: URL = URL(string: ProcessInfo.processInfo.environment["SMB_SERVER"] ?? "smb://placeholder")!
-
-    lazy var share: String = ProcessInfo.processInfo.environment["SMB_SHARE"] ?? ""
-
-    lazy var credential: URLCredential? = {
-        if let user = ProcessInfo.processInfo.environment["SMB_USER"],
-           let pass = ProcessInfo.processInfo.environment["SMB_PASSWORD"]
-        {
-            return URLCredential(user: user, password: pass, persistence: .forSession)
-        } else {
-            return nil
-        }
-    }()
-
-    lazy var encrypted: Bool = ProcessInfo.processInfo.environment["SMB_ENCRYPTED"] == "1"
+class SMB2ManagerTests: SMBIntegrationTestCase {
 
     func testConnectDisconnect() async throws {
         let smb = SMB2Manager(url: server, credential: credential)!
@@ -605,10 +574,6 @@ extension SMB2ManagerTests {
         T.random(in: min...max)
     }
 
-    private func randomData(size: Int = 262_144) -> Data {
-        Data((0..<size).map { _ in UInt8.random(in: 0...UInt8.max) })
-    }
-    
     private func dummyFile(size: Int = 262_144, name: String = #function) -> URL {
         let name = fileName(name: name)
         let url = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(name)
