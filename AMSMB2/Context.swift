@@ -183,13 +183,14 @@ public final class SMB2Client: CustomDebugStringConvertible, CustomReflectable, 
     }
 
     public var debugDescription: String {
-        String(reflecting: self)
+        let pairs = customMirror.children.map { "\($0.label ?? "_"): \($0.value)" }
+        return "SMB2Client(\(pairs.joined(separator: ", ")))"
     }
 
     public var customMirror: Mirror {
         var c: [(label: String?, value: Any)] = []
-        if context != nil {
-            c.append((label: "server", value: server!))
+        if context != nil, let server {
+            c.append((label: "server", value: server))
             c.append((label: "securityMode", value: securityMode))
             c.append((label: "authentication", value: authentication))
             clientGuid.map { c.append((label: "clientGuid", value: $0)) }
