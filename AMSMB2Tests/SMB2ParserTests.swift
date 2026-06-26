@@ -190,7 +190,7 @@ class SMB2ParserTests: XCTestCase, @unchecked Sendable {
                 var container = srvsvc_SHARE_INFO_1_CONTAINER()
                 container.EntriesRead = 1
                 container.share_info_1 = shareInfoPtr
-                let shares = Array<SMB2Share>(container)
+                let shares = [SMB2Share](container)
                 XCTAssertEqual(shares.count, 1)
                 XCTAssertEqual(shares[0].name, "TestShare")
                 XCTAssertEqual(shares[0].comment, "")
@@ -209,7 +209,7 @@ class SMB2ParserTests: XCTestCase, @unchecked Sendable {
                 var container = srvsvc_SHARE_INFO_1_CONTAINER()
                 container.EntriesRead = 1
                 container.share_info_1 = shareInfoPtr
-                let shares = Array<SMB2Share>(container)
+                let shares = [SMB2Share](container)
                 XCTAssertEqual(shares.count, 1)
                 XCTAssertEqual(shares[0].name, "")
                 XCTAssertEqual(shares[0].comment, "IPC remark")

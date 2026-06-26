@@ -38,11 +38,10 @@ extension Array where Element == SMB2Share {
     // defensively also handled for netname), ndr_decode_ptr returns early leaving the field
     // as the calloc zero — i.e. a null char *.
     //
-    // Swift imports unannoted char * struct fields as non-optional UnsafeMutablePointer<CChar>,
-    // so we cannot use .map on the pointer directly.  Instead we use
-    // UnsafePointer<CChar>.init?(bitPattern:), whose Optional initialiser returns nil when the
-    // address is zero, matching the .map(String.init(cString:)) ?? "" convention used
-    // throughout Context.swift (lines 341-377).
+    // Unannotated mutable `char *` struct fields import as non-optional UnsafeMutablePointer<CChar>
+    // in Swift (unlike `const char *` which imports as optional). .map is therefore not available
+    // directly; UnsafePointer<CChar>.init?(bitPattern:) converts the raw address to a nullable
+    // pointer so we can use the standard .map(String.init(cString:)) ?? "" null-guard idiom.
     init(_ container: srvsvc_SHARE_INFO_1_CONTAINER) {
         self = [srvsvc_SHARE_INFO_1](
             UnsafeBufferPointer(start: container.share_info_1, count: Int(container.EntriesRead))

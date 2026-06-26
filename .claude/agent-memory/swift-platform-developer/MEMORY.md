@@ -5,3 +5,4 @@
 - [patterns_c_interop_cbdata.md](patterns_c_interop_cbdata.md) — CBData lifetime / Unmanaged retain patterns for libsmb2 callbacks
 - [patterns_dispatch_queue_reentry.md](patterns_dispatch_queue_reentry.md) — Detecting re-entrant eventLoopQueue calls with DispatchSpecificKey
 - [libsmb2_fork_api_changes.md](libsmb2_fork_api_changes.md) — Fork submodule SHA, dreamcast exclude, C struct renames, new transport API symbols
+- [patterns_c_char_pointer_import.md](patterns_c_char_pointer_import.md) — `char *` → non-optional UnsafeMutablePointer (no .map); `const char *` → optional UnsafePointer (has .map). Use bitPattern bridge for null-safe access on mutable fields.
