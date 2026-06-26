@@ -5,16 +5,16 @@ test from the linked spec scenario first); config/manifest tasks are TDD-exempt 
 
 ## T1 — Retarget libsmb2 submodule to the fork (#20) [transport-dependencies]
 
-- [ ] 1.1 Update `.gitmodules`: set `Dependencies/libsmb2` url to `https://github.com/simplekube-ro/libsmb2`
-- [ ] 1.2 `git submodule sync` + `git submodule update --init`; check out the fork commit that contains `smb2_set_transport` (fork `master` head with the transport API); pin the exact SHA in the AMSMB2 commit
-- [ ] 1.3 Verify `swift build --disable-sandbox` and `swift test --disable-sandbox` pass (unit tests; integration skips without a server) with no AMSMB2 Swift source changes
-- [ ] 1.4 Update `CLAUDE.md` / `README.md` prerequisite/submodule-URL notes if they reference the upstream URL
+- [x] 1.1 Update `.gitmodules`: set `Dependencies/libsmb2` url to `https://github.com/simplekube-ro/libsmb2`
+- [x] 1.2 `git submodule sync` + `git submodule update --init`; check out the fork commit that contains `smb2_set_transport` (fork `master` head with the transport API); pin the exact SHA in the AMSMB2 commit
+- [x] 1.3 Verify `swift build --disable-sandbox` and `swift test --disable-sandbox` pass (unit tests; integration skips without a server). **Note:** The fork's `master` (944f7d1) carries a srvsvc DCE/RPC refactor beyond the transport API — upstream symbols `srvsvc_SHARE_INFO_1_carray`, `max_count`, `ses.ShareInfo.Level1.Buffer`, and `.utf8` on fixed char arrays are replaced by `srvsvc_SHARE_INFO_1_CONTAINER`, `EntriesRead`, `ses.ShareEnum.Level1`, and `char *` pointer fields. This required adapting `AMSMB2/Parsers.swift` (`Array<SMB2Share>.init(_ container:)`) to the renamed types and to guard null NDR referents via `UnsafePointer<CChar>(bitPattern:)`. The adaptation is the only required Swift source change; two regression tests cover the null-pointer guard.
+- [x] 1.4 Update `CLAUDE.md` / `README.md` prerequisite/submodule-URL notes if they reference the upstream URL
 
 ## T2 — Expose transport C symbols to the Swift SMB2 module (#21) [transport-dependencies]
 
-- [ ] 2.1 Verify `smb2_set_transport`, `smb2_external_transport`, `SMB2_TRANSPORT_TCP/QUIC/AUTO`, `smb2_get_timeout`, `smb2_service_timeout` import from `import SMB2`; fix the C target modulemap / umbrella header / include settings if any symbol is missing
-- [ ] 2.2 (TDD) Add a Swift smoke test in the test target (`import SMB2`) referencing all five symbols + every `smb2_external_transport` field, and asserting `SMB2_TRANSPORT_TCP==0`, `QUIC==1`, `AUTO==2`
-- [ ] 2.3 Verify `swift build --disable-sandbox` and `swift test --disable-sandbox` pass
+- [x] 2.1 Verify `smb2_set_transport`, `smb2_external_transport`, `SMB2_TRANSPORT_TCP/QUIC/AUTO`, `smb2_get_timeout`, `smb2_service_timeout` import from `import SMB2`; fix the C target modulemap / umbrella header / include settings if any symbol is missing
+- [x] 2.2 (TDD) Add a Swift smoke test in the test target (`import SMB2`) referencing all five symbols + every `smb2_external_transport` field, and asserting `SMB2_TRANSPORT_TCP==0`, `QUIC==1`, `AUTO==2`
+- [x] 2.3 Verify `swift build --disable-sandbox` and `swift test --disable-sandbox` pass
 
 ## T3 — Add SwiftNIO + NIOTransportServices to Package.swift, Apple-guarded (#22) [transport-dependencies]
 

@@ -1,6 +1,6 @@
 # AMSMB2
 
-Swift library for SMB2/3 file operations on Apple platforms (iOS 13+, macOS 10.15+, tvOS 14+, watchOS 6+, visionOS 1+) and Linux. Wraps [libsmb2](https://github.com/sahlberg/libsmb2) with a modern async/await API.
+Swift library for SMB2/3 file operations on Apple platforms (iOS 13+, macOS 10.15+, tvOS 14+, watchOS 6+, visionOS 1+) and Linux. Wraps [libsmb2](https://github.com/simplekube-ro/libsmb2) (our fork of [sahlberg/libsmb2](https://github.com/sahlberg/libsmb2) with a pluggable external-transport API) with a modern async/await API.
 
 ## Heritage
 

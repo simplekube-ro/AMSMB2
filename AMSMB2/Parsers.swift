@@ -26,17 +26,32 @@ extension Array where Element == SMB2Share {
     init(_ client: SMB2Client, _ dataPtr: UnsafeMutableRawPointer?) throws {
         defer { smb2_free_data(client.rawContext, dataPtr) }
         let result = try dataPtr.unwrap().assumingMemoryBound(to: srvsvc_NetrShareEnum_rep.self).pointee
-        self = Array(result.ses.ShareInfo.Level1.Buffer.pointee)
+        self = Array(result.ses.ShareEnum.Level1)
     }
 
-    init(_ ctr1: srvsvc_SHARE_INFO_1_carray) {
+    // srvsvc_SHARE_INFO_1_CONTAINER is the fork's replacement for the upstream's
+    // srvsvc_SHARE_INFO_1_carray: same share_info_1 pointer, EntriesRead for count.
+    //
+    // netname and remark are PTR_UNIQUE NDR referents: the C decoder (lib/dcerpc-srvsvc.c)
+    // calls calloc-zeroed smb2_alloc_data for each entry, then decodes each field via
+    // ndr_decode_ptr.  When the server sends a null referent ID (legal for remark, and
+    // defensively also handled for netname), ndr_decode_ptr returns early leaving the field
+    // as the calloc zero — i.e. a null char *.
+    //
+    // Unannotated mutable `char *` struct fields import as non-optional UnsafeMutablePointer<CChar>
+    // in Swift (unlike `const char *` which imports as optional). .map is therefore not available
+    // directly; UnsafePointer<CChar>.init?(bitPattern:) converts the raw address to a nullable
+    // pointer so we can use the standard .map(String.init(cString:)) ?? "" null-guard idiom.
+    init(_ container: srvsvc_SHARE_INFO_1_CONTAINER) {
         self = [srvsvc_SHARE_INFO_1](
-            UnsafeBufferPointer(start: ctr1.share_info_1, count: Int(ctr1.max_count))
-        ).map {
+            UnsafeBufferPointer(start: container.share_info_1, count: Int(container.EntriesRead))
+        ).map { info in
             SMB2Share(
-                name: .init(cString: $0.netname.utf8),
-                props: .init(rawValue: $0.type),
-                comment: .init(cString: $0.remark.utf8)
+                name: UnsafePointer<CChar>(bitPattern: UInt(bitPattern: info.netname))
+                    .map(String.init(cString:)) ?? "",
+                props: .init(rawValue: info.type),
+                comment: UnsafePointer<CChar>(bitPattern: UInt(bitPattern: info.remark))
+                    .map(String.init(cString:)) ?? ""
             )
         }
     }

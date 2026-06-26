@@ -6,6 +6,7 @@
 //  All rights reserved.
 //
 
+import SMB2
 import XCTest
 
 @testable import AMSMB2
@@ -168,5 +169,51 @@ class SMB2ParserTests: XCTestCase, @unchecked Sendable {
         // When output_count == 0, DecodableResponse.init passes empty Data to init(data:).
         // The parser should throw (can't read count at offset 44) rather than crash.
         XCTAssertThrowsError(try MSRPC.NetShareEnumAllLevel1(data: Data()))
+    }
+
+    // MARK: - srvsvc_SHARE_INFO_1_CONTAINER C-decoder null-pointer guards
+
+    /// NDR protocol allows null referent IDs for optional string fields (remark is optional).
+    /// When a server sends a null remark, `ndr_decode_ptr` leaves the `remark` field NULL.
+    /// Zero-initialising srvsvc_SHARE_INFO_1 produces a null remark pointer at the C level.
+    /// Verify the parser returns "" instead of trapping in `String(cString:)`.
+    func testShareContainerWithNullRemark() {
+        "TestShare".withCString { nameCStr in
+            // srvsvc_SHARE_INFO_1 fields are non-optional in Swift's C-import view, but the
+            // underlying C decoder leaves them as null (0x0) when the NDR referent is absent.
+            // Zero-init gives us that null state without needing to assign nil.
+            var shareInfo = srvsvc_SHARE_INFO_1()
+            shareInfo.netname = UnsafeMutablePointer(mutating: nameCStr)
+            shareInfo.type = 0  // diskTree
+            // shareInfo.remark stays zero-initialised (null pointer — legal NDR null referent)
+            withUnsafeMutablePointer(to: &shareInfo) { shareInfoPtr in
+                var container = srvsvc_SHARE_INFO_1_CONTAINER()
+                container.EntriesRead = 1
+                container.share_info_1 = shareInfoPtr
+                let shares = [SMB2Share](container)
+                XCTAssertEqual(shares.count, 1)
+                XCTAssertEqual(shares[0].name, "TestShare")
+                XCTAssertEqual(shares[0].comment, "")
+            }
+        }
+    }
+
+    /// Verify the parser also guards against a null netname pointer without trapping.
+    func testShareContainerWithNullNetname() {
+        "IPC remark".withCString { remarkCStr in
+            var shareInfo = srvsvc_SHARE_INFO_1()
+            // shareInfo.netname stays zero-initialised (null pointer)
+            shareInfo.type = 3  // ipc
+            shareInfo.remark = UnsafeMutablePointer(mutating: remarkCStr)
+            withUnsafeMutablePointer(to: &shareInfo) { shareInfoPtr in
+                var container = srvsvc_SHARE_INFO_1_CONTAINER()
+                container.EntriesRead = 1
+                container.share_info_1 = shareInfoPtr
+                let shares = [SMB2Share](container)
+                XCTAssertEqual(shares.count, 1)
+                XCTAssertEqual(shares[0].name, "")
+                XCTAssertEqual(shares[0].comment, "IPC remark")
+            }
+        }
     }
 }
