@@ -69,6 +69,14 @@ reschedule. Timers SHALL be cancelled on teardown.
 
 #### Scenario: Timeout path fires when no reply arrives
 
+> **Partially deferred to T8 (#27) — see tasks.md 6.5.** The timer *wiring* is verified at the
+> unit level (`testTimerDrivenTimeoutFiresWithoutHang`: `smb2_set_timeout` is called and the
+> `eventLoopQueue.asyncAfter` chain runs `smb2_service_timeout` without hanging). The end-to-end
+> behavior below — `smb2_service_timeout` aborting a real in-flight PDU and resuming the
+> continuation with a timeout error — is NOT unit-testable here because `MockTransport` cannot emit
+> valid SMB2 without crashing libsmb2's parser (premise-falsified) and a faithful exercise requires
+> a live server. It is deferred to the T8 Samba integration suite.
+
 - **WHEN** a request is in-flight against a mock transport that never replies and the timeout
   elapses
 - **THEN** `smb2_service_timeout` is invoked
@@ -80,6 +88,14 @@ The seam servicing loop SHALL reuse the existing `CheckedContinuation`, `CBData`
 guard, per-operation `asyncAfter` timeout, and `withTaskCancellationHandler` mechanisms unchanged.
 
 #### Scenario: Full mock exchange services correctly
+
+> **Deferred to T8 (#27) — see tasks.md 6.1.** This scenario is NOT satisfied at the unit-test
+> level: `MockTransport` cannot speak real SMB2 without triggering a SIGSEGV in libsmb2's PDU
+> parser (the premise of a "full request/response over a mock" is falsified by libsmb2 reality).
+> A faithful full-exchange verification therefore requires a live Samba server and is deferred to
+> the T8 integration suite. The unit-level `SMB2ServicingLoopTests` instead cover the executable
+> proxies (no-hang connect, inbound-ready signalling, AUTO selector + `fd == -1`, timer wiring,
+> cancellation teardown).
 
 - **WHEN** a full request/response is driven through the seam servicing loop using `MockTransport`
   and the bridge

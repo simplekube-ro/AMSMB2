@@ -6,7 +6,12 @@ The `Dependencies/libsmb2` submodule SHALL point at `simplekube-ro/libsmb2` and 
 commit whose public umbrella header declares `smb2_set_transport`,
 `struct smb2_external_transport`, `SMB2_TRANSPORT_TCP/QUIC/AUTO`, `smb2_get_timeout`, and
 `smb2_service_timeout`. A fresh clone plus `git submodule update --init` plus
-`swift build --disable-sandbox` SHALL succeed. The pinned fork `master` (944f7d1) carries a
+`swift build --disable-sandbox` SHALL succeed. The submodule was pinned to `944f7d1` for T1; T6
+(#25) advanced the pointer to a descendant commit `112803c` ("fix: ext_close once-semantics to
+prevent double-close use-after-free"), which the Swift external-transport close trampoline relies
+on for a single `takeRetainedValue`. References to `944f7d1` below describe the original T1 srvsvc
+adaptation context and remain accurate as ancestry; the current authoritative pin is `112803c`.
+The pinned fork `master` (944f7d1, now 112803c) carries a
 srvsvc DCE/RPC API rename beyond the transport additions (upstream `srvsvc_SHARE_INFO_1_carray`
 → `srvsvc_SHARE_INFO_1_CONTAINER`, inline char arrays → nullable `char *`, `max_count` →
 `EntriesRead`), so `AMSMB2/Parsers.swift` requires a corresponding adaptation — specifically

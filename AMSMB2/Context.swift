@@ -489,10 +489,16 @@ extension SMB2Client {
     }
 
     var isConnected: Bool {
-        #if canImport(Network)
-        if seamConnected { return true }
-        #endif
-        return fileDescriptor != -1
+        // Read seam/fd state on the event loop queue so `seamConnected` (mutated only on
+        // `eventLoopQueue`) is never read concurrently from an off-queue async caller
+        // (e.g. `echo()`, `Optional.unwrap()`). Nested `syncOnEventLoop` is reentrant-safe
+        // via `queueKey`, so the inner `fileDescriptor` access stays correct.
+        syncOnEventLoop {
+            #if canImport(Network)
+            if seamConnected { return true }
+            #endif
+            return fileDescriptor != -1
+        }
     }
 
     var fileDescriptor: Int32 {
@@ -1260,7 +1266,9 @@ extension SMB2Client {
     /// The timer is rescheduled after every service pass so libsmb2's deadline tracking stays
     /// accurate. Must run on `eventLoopQueue`.
     func scheduleSeamTimeout() {
-        guard let context else { return }
+        // Only the seam drives this timer; bail out once the seam is torn down so a
+        // rescheduling chain cannot outlive `transportBridge`.
+        guard let context, transportBridge != nil else { return }
         // Cancel any previously scheduled timer; libsmb2's deadline may have changed.
         pendingTimeoutItem?.cancel()
         pendingTimeoutItem = nil
@@ -1268,19 +1276,10 @@ extension SMB2Client {
         var tv = timeval()
         guard smb2_get_timeout(context, &tv) == 1 else { return }  // 0 = no timer pending
         let remaining = Double(tv.tv_sec) + Double(tv.tv_usec) / 1_000_000.0
-        guard remaining > 0 else {
-            // Due now or already past — defer via asyncAfter with a minimum 1 ms floor.
-            // Using .async would busy-spin the queue if smb2_get_timeout keeps reporting
-            // {0,0} (e.g. persistent timeout churn under heavy load). A 1 ms minimum
-            // gives the Swift concurrency pool and other GCD work a chance to run.
-            eventLoopQueue.asyncAfter(deadline: .now() + 0.001) { [weak self] in
-                guard let self, let ctx = self.context else { return }
-                _ = smb2_service_timeout(ctx)
-                self.flushOutboundForSeam(context: ctx)
-                self.scheduleSeamTimeout()
-            }
-            return
-        }
+        // Due now or already past — defer with a minimum 1 ms floor so the queue does not
+        // busy-spin if `smb2_get_timeout` keeps reporting {0,0} (persistent timeout churn
+        // under heavy load); a 1 ms minimum lets the Swift pool and other GCD work run.
+        let delay = max(remaining, 0.001)
 
         let item = DispatchWorkItem { [weak self] in
             guard let self, let context = self.context else { return }
@@ -1288,8 +1287,10 @@ extension SMB2Client {
             self.flushOutboundForSeam(context: context)
             self.scheduleSeamTimeout()
         }
+        // Track every scheduled item (including the floor path) in `pendingTimeoutItem` so
+        // `teardownSeam()` cancels it and repeated calls naturally deduplicate.
         pendingTimeoutItem = item
-        eventLoopQueue.asyncAfter(deadline: .now() + remaining, execute: item)
+        eventLoopQueue.asyncAfter(deadline: .now() + delay, execute: item)
     }
 
     /// Tears down the seam: cancels the timer, clears the bridge reference, resets
