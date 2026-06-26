@@ -47,6 +47,14 @@ actor MockTransport: SMBTransport {
     // MARK: - State
 
     private let connectBehavior: ConnectBehavior
+    /// When `true`, `send(_:)` silently discards bytes instead of delivering them to `receive()`.
+    ///
+    /// Use this in tests that need a "never-reply" server: the outbound pump can call
+    /// `transport.send(_:)` without the bytes looping back through `receive()` into the
+    /// libsmb2 inbound parser. Without this flag, MockTransport's loopback semantics would
+    /// feed libsmb2's own NEGOTIATE PDU back as a "server response", causing libsmb2 to
+    /// SIGSEGV when trying to parse an invalid SMB2 response.
+    private let sendsAreDropped: Bool
     /// FIFO of chunks ready for the next `receive()` call.
     private var inboundQueue: [Data] = []
     /// Set by `signalGracefulEOF()`; causes an empty-queue `receive()` to return `Data()`.
@@ -58,8 +66,9 @@ actor MockTransport: SMBTransport {
 
     // MARK: - Init
 
-    init(connectBehavior: ConnectBehavior = .succeed) {
+    init(connectBehavior: ConnectBehavior = .succeed, sendsAreDropped: Bool = false) {
         self.connectBehavior = connectBehavior
+        self.sendsAreDropped = sendsAreDropped
     }
 
     // MARK: - SMBTransport conformance
@@ -75,6 +84,10 @@ actor MockTransport: SMBTransport {
 
     func send(_ bytes: Data) async throws {
         guard !isClosed else { throw POSIXError(.ECONNRESET) }
+        // When sends are dropped (sendsAreDropped == true), bytes are silently discarded.
+        // This prevents loopback: the mock won't feed libsmb2's own outbound PDUs back as
+        // incoming server responses, which would cause libsmb2 to parse invalid SMB2 data.
+        guard !sendsAreDropped else { return }
         // Deliver directly to any suspended receive(), bypassing the queue.
         if let continuation = waitingContinuation {
             waitingContinuation = nil

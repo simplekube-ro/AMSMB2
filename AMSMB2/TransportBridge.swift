@@ -64,6 +64,14 @@ final class TransportBridge: @unchecked Sendable {
     /// Set by `close()`. Causes `cRecv()` to return ECONNRESET and terminates pump tasks.
     private var isClosed = false
 
+    // MARK: - Inbound-ready signal
+
+    /// Called (from any thread) immediately after bytes, EOF, or an error are appended to the
+    /// inbound buffer. SMB2Client sets this to `eventLoopQueue.async { serviceContextForSeam() }`.
+    /// Must be assigned once before `startPumps()` / `startInboundPump()` is called; all
+    /// subsequent calls come from the async inbound-pump Task.
+    private var _onInboundReady: (@Sendable () -> Void)?
+
     // MARK: - Pump tasks
 
     private var outboundPumpTask: Task<Void, Never>?
@@ -73,6 +81,20 @@ final class TransportBridge: @unchecked Sendable {
 
     init(transport: any SMBTransport) {
         self.transport = transport
+    }
+
+    // MARK: - Inbound-ready signal API
+
+    /// Registers a callback that fires (on an unspecified thread) after each inbound
+    /// append, EOF, or error. The callback MUST NOT acquire the bridge's internal lock.
+    /// Call this once before `startInboundPump()` / `startPumps()`.
+    ///
+    /// Typical usage: `bridge.setInboundReadyHandler { [weak client] in
+    ///     client?.eventLoopQueue.async { client?.serviceContextForSeam() } }`
+    func setInboundReadyHandler(_ handler: @Sendable @escaping () -> Void) {
+        lock.lock()
+        _onInboundReady = handler
+        lock.unlock()
     }
 
     // MARK: - Lifecycle
@@ -126,6 +148,8 @@ final class TransportBridge: @unchecked Sendable {
         outboundPumpTask = nil
         let capturedInbound = inboundPumpTask
         inboundPumpTask = nil
+        // Clear the inbound-ready handler; bridge is closing, no more signalling needed.
+        _onInboundReady = nil
         lock.unlock()
 
         // Resume any waiting outbound pump outside the lock to avoid priority inversion.
@@ -143,10 +167,19 @@ final class TransportBridge: @unchecked Sendable {
     /// Produces a `smb2_external_transport` struct whose four C function pointers delegate to
     /// this bridge and whose `userdata` is `Unmanaged.passRetained(self).toOpaque()`.
     ///
-    /// - Important: Call exactly once per bridge. The retained reference is balanced in the
-    ///   C close trampoline via `takeRetainedValue()`.
+    /// **Lifetime contract**: `passRetained(self)` produces a +1 reference that libsmb2 owns
+    /// via `ext.userdata`. The C `close` trampoline below calls `takeRetainedValue()` to consume
+    /// that +1 exactly once. The underlying `ext_close` implementation in transport-external.c
+    /// uses once-semantics (clears `ext.close` and `ext.userdata` before invoking the callback),
+    /// so `takeRetainedValue()` is guaranteed to fire at most once even when libsmb2's destroy
+    /// path calls `ext_close` from multiple places (e.g. `smb2_destroy_context` directly and
+    /// again from `negotiate_cb → smb2_close_context → ext_close` within the waitqueue drain).
+    ///
+    /// - Important: Call exactly once per bridge instance.
     func makeExternalTransport() -> smb2_external_transport {
         var ext = smb2_external_transport()
+        // passRetained: +1 reference owned by libsmb2 via ext.userdata.
+        // Balanced by takeRetainedValue() in the close trampoline below.
         ext.userdata = Unmanaged.passRetained(self).toOpaque()
 
         // Non-capturing closures assigned to C function pointer fields.
@@ -177,8 +210,8 @@ final class TransportBridge: @unchecked Sendable {
         ext.close = { userdata -> Int32 in
             guard let userdata else { return 0 }
             // `takeRetainedValue()` consumes the `passRetained` from `makeExternalTransport()`.
-            // ARC takes over the returned `bridge` local; on scope exit ARC releases it,
-            // completing the balanced release.
+            // ext_close (C) already cleared ext.userdata before calling us, so this closure
+            // fires at most once per bridge — no double-takeRetainedValue risk.
             let bridge = Unmanaged<TransportBridge>.fromOpaque(userdata).takeRetainedValue()
             bridge.close()
             return 0
@@ -370,19 +403,25 @@ final class TransportBridge: @unchecked Sendable {
     private func appendInbound(_ data: Data) {
         lock.lock()
         inboundBuffer.append(data)
+        let handler = _onInboundReady
         lock.unlock()
+        handler?()
     }
 
     private func setInboundEOF() {
         lock.lock()
         inboundEOF = true
+        let handler = _onInboundReady
         lock.unlock()
+        handler?()
     }
 
     private func setInboundError(_ error: any Error) {
         lock.lock()
         inboundError = error
+        let handler = _onInboundReady
         lock.unlock()
+        handler?()
     }
 
     /// Atomically swaps out the outbound continuation. Thread-safe (called from onCancel).
