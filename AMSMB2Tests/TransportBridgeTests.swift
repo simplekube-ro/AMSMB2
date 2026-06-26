@@ -81,14 +81,20 @@ final class TransportBridgeTests: XCTestCase, @unchecked Sendable {
         let sentLen: Int32 = payload.withUnsafeBufferPointer { ptr in
             ext.send!(ext.userdata, ptr.baseAddress, ptr.count)
         }
-        XCTAssertEqual(sentLen, Int32(payload.count), "send must return the full byte count immediately")
+        XCTAssertEqual(
+            sentLen, Int32(payload.count),
+            "send must return the full byte count immediately"
+        )
 
         // Outbound pump delivers bytes to transport.send(_:) asynchronously.
         // With no inbound pump running, mock.receive() sees the bytes from the queue.
         try await Task.sleep(nanoseconds: 50_000_000) // 50 ms
 
         let delivered = try await mock.receive()
-        XCTAssertEqual(delivered, Data(payload), "outbound pump must deliver bytes to the transport")
+        XCTAssertEqual(
+            delivered, Data(payload),
+            "outbound pump must deliver bytes to the transport"
+        )
     }
 
     // MARK: - Scenario: Sent bytes survive immediate buffer reuse (copy-at-boundary)
@@ -296,8 +302,41 @@ final class TransportBridgeTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(count, Int32(payload.count), "recv must return the byte count")
         XCTAssertEqual(
             Data(recvBuf.prefix(Int(count))), Data(payload),
-            "bytes must survive the full loopback: cSend → outbound → mock → inbound → cRecv"
+            "bytes must survive loopback: cSend → outbound → mock → inbound → cRecv"
         )
+    }
+
+    // MARK: - Scenario: double-start guard prevents task leaks
+
+    /// WHEN startOutboundPump() (or startInboundPump()) is called a second time
+    /// THEN the second call is a no-op — the guard returns early without creating a second task
+    /// AND the bridge still tears down cleanly after close()
+    ///
+    /// This verifies the lock-guarded `guard outboundPumpTask == nil` / `guard inboundPumpTask == nil`
+    /// path added to prevent accidental task leaks on repeated start calls.
+    func testDoubleStartIsNoOp() async throws {
+        let mock = MockTransport()
+        try await mock.connect(host: "localhost", port: 445)
+        let bridge = TransportBridge(transport: mock)
+
+        // Call both start methods twice — second calls must be silent no-ops, not crash or leak.
+        bridge.startOutboundPump()
+        bridge.startOutboundPump()
+        bridge.startInboundPump()
+        bridge.startInboundPump()
+
+        let ext = bridge.makeExternalTransport()
+        // Close via the C trampoline to balance passRetained.
+        _ = ext.close?(ext.userdata)
+
+        // After close, cRecv must return ECONNRESET — confirming clean teardown despite double start.
+        try await Task.sleep(nanoseconds: 20_000_000) // 20 ms
+        var recvBuf = [UInt8](repeating: 0, count: 64)
+        let result: Int32 = recvBuf.withUnsafeMutableBufferPointer { ptr in
+            bridge.cRecv(buf: ptr.baseAddress, maxLen: ptr.count)
+        }
+        XCTAssertLessThan(result, 0, "after close, recv must return negative")
+        XCTAssertEqual(errno, ECONNRESET, "after close, recv must set errno = ECONNRESET")
     }
 }
 

@@ -26,8 +26,9 @@ import SMB2
 /// appends results to the inbound buffer. The C `recv` callback drains synchronously from that
 /// buffer, returning the would-block signal when the buffer is empty and the transport is open.
 ///
-/// **Concurrency model** (design D3): All mutable state is guarded by `NSLock`. Lock sections
-/// never contain `await`; async work happens outside the locked sections.
+/// **Concurrency model** (design D3): All mutable state — including `outboundPumpTask` and
+/// `inboundPumpTask` — is guarded by `NSLock`. Lock sections never contain `await`; async work
+/// happens outside the locked sections.
 ///
 /// **Lifetime**: `makeExternalTransport()` calls `Unmanaged.passRetained(self)` to hand the
 /// bridge to libsmb2 as `ext.userdata`. The single retained reference is consumed exactly once
@@ -86,12 +87,24 @@ final class TransportBridge: @unchecked Sendable {
     /// Starts only the outbound pump (libsmb2 → transport direction).
     /// Used in unit tests that need to verify outbound delivery without the inbound pump
     /// competing for `transport.receive()` — see MockTransport loopback semantics.
+    ///
+    /// Guards the task assignment under `lock` to prevent data races on `outboundPumpTask`
+    /// and to guard against accidental double-start (which would leak the previous task).
     func startOutboundPump() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard outboundPumpTask == nil else { return }
         outboundPumpTask = Task { [self] in await outboundPump() }
     }
 
     /// Starts only the inbound pump (transport → libsmb2 direction).
+    ///
+    /// Guards the task assignment under `lock` to prevent data races on `inboundPumpTask`
+    /// and to guard against accidental double-start (which would leak the previous task).
     func startInboundPump() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard inboundPumpTask == nil else { return }
         inboundPumpTask = Task { [self] in await inboundPump() }
     }
 
@@ -107,13 +120,19 @@ final class TransportBridge: @unchecked Sendable {
         isClosed = true
         let pendingContinuation = outboundContinuation
         outboundContinuation = nil
+        // Capture and nil the pump tasks under the lock so their Task references are only
+        // accessed while the lock is held — satisfying the @unchecked Sendable contract.
+        let capturedOutbound = outboundPumpTask
+        outboundPumpTask = nil
+        let capturedInbound = inboundPumpTask
+        inboundPumpTask = nil
         lock.unlock()
 
         // Resume any waiting outbound pump outside the lock to avoid priority inversion.
         pendingContinuation?.resume(returning: nil)
 
-        outboundPumpTask?.cancel()
-        inboundPumpTask?.cancel()
+        capturedOutbound?.cancel()
+        capturedInbound?.cancel()
 
         // transport.close() is async; fire-and-forget. Captures transport (not self) so the
         // bridge's own retain count does not prolong the Task's lifetime unnecessarily.
@@ -298,7 +317,11 @@ final class TransportBridge: @unchecked Sendable {
     }
 
     // Result type for the synchronous fast-path dequeue helper.
-    private enum OutboundDequeueResult { case data(Data), closed, empty }
+    private enum OutboundDequeueResult {
+        case data(Data)
+        case closed
+        case empty
+    }
 
     /// Synchronous fast-path: dequeue the first outbound chunk under the lock.
     /// Must not be called from an async context directly — only via `takeOutboundChunk()`.
