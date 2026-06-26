@@ -78,6 +78,41 @@ If the pump stored its continuation AFTER close() ran step 1 (race), the pump ch
 The `onCancel` handler also calls `swapOutboundContinuation()?.resume(returning: nil)`. If the
 continuation was already taken by close(), it's nil — no double-resume.
 
+## Lock All Mutable State — Including Task References
+
+**Rule**: When a type is `@unchecked Sendable` with a doc comment claiming "all mutable state is
+guarded by NSLock", EVERY mutable var must be guarded — including `Task<Void,Never>?` references.
+
+`outboundPumpTask` and `inboundPumpTask` are written in `startOutboundPump()`/`startInboundPump()`
+and read (+ cancelled) in `close()`. These cross-thread accesses require lock protection.
+
+**Pattern**:
+```swift
+// Assign under lock, create Task outside lock only if needed (Task() is non-blocking):
+func startOutboundPump() {
+    lock.lock()
+    defer { lock.unlock() }
+    guard outboundPumpTask == nil else { return }   // double-start guard
+    outboundPumpTask = Task { [self] in await outboundPump() }
+}
+
+// In close(): read+nil under lock, cancel outside:
+lock.lock()
+let capturedOutbound = outboundPumpTask
+outboundPumpTask = nil
+lock.unlock()
+capturedOutbound?.cancel()   // outside lock — cancel is safe anywhere
+```
+
+The double-start guard (`guard pumpTask == nil else { return }`) prevents task leaks when
+start helpers are called more than once (test-only scenario, low production risk).
+
+## ByteFIFO Inlining Note
+
+Design D3 originally sketched a distinct `ByteFIFO` type. In the actual implementation it was
+inlined directly into `TransportBridge` (avoids extra abstraction, no dead code concern).
+Document this in design.md so artifacts match implementation (per CLAUDE.md).
+
 ## Platform Guard
 
 `TransportBridge.swift` wrapped in `#if canImport(Network)`. Tests also guarded.
