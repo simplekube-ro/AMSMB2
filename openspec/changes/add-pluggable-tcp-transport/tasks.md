@@ -42,12 +42,17 @@ test from the linked spec scenario first); config/manifest tasks are TDD-exempt 
 
 ## T5 — Bridge libsmb2 external-transport callbacks to async SMBTransport (#24) [transport-bridge]
 
-- [ ] 5.1 (TDD) Write bridge tests against `MockTransport`: round-trip through C `send`/`recv`, copy-at-boundary (overwrite source buffer after `send` returns), would-block-when-empty, EOF-on-close, clean teardown on cancel
-- [ ] 5.2 Implement the bridge type: synchronous lock-guarded inbound/outbound `Data` FIFOs + the `SMBTransport` instance (design D3/D5)
-- [ ] 5.3 Implement the four C trampolines (`connect`/`send`/`recv`/`close`) populating `smb2_external_transport`; recover the bridge from `userdata` via `Unmanaged` (`passRetained` once, balanced on teardown)
-- [ ] 5.4 Implement copy-at-the-boundary in `send`/`recv` — synchronous unsafe copy, no `await` inside the closure (design D4)
-- [ ] 5.5 Implement outbound-drain and inbound-fill pump `Task`s with would-block/EOF/error semantics and correct cancellation/teardown
-- [ ] 5.6 Verify zero Swift 6 strict-concurrency warnings; tests pass
+- [x] 5.1 (TDD) Write bridge tests against `MockTransport`: round-trip through C `send`/`recv`, copy-at-boundary (overwrite source buffer after `send` returns), would-block-when-empty, EOF-on-close, clean teardown on cancel
+- [x] 5.2 Implement the bridge type: synchronous lock-guarded inbound/outbound `Data` FIFOs + the `SMBTransport` instance (design D3/D5)
+- [x] 5.3 Implement the four C trampolines (`connect`/`send`/`recv`/`close`) populating `smb2_external_transport`; recover the bridge from `userdata` via `Unmanaged` (`passRetained` once, balanced on teardown)
+- [x] 5.4 Implement copy-at-the-boundary in `send`/`recv` — synchronous unsafe copy, no `await` inside the closure (design D4)
+- [x] 5.5 Implement outbound-drain and inbound-fill pump `Task`s with would-block/EOF/error semantics and correct cancellation/teardown
+- [x] 5.6 Verify zero Swift 6 strict-concurrency warnings; tests pass
+  - `swift build --disable-sandbox`: Build complete, 0 warnings
+  - `swift test --disable-sandbox`: 112 tests, 9 new (TransportBridgeTests), 44 skipped (integration — no server), 0 failures
+  - Linux build path: not executed (no Linux toolchain); `TransportBridge.swift` is guarded by `#if canImport(Network)` per design D7, so it is excluded from Linux builds
+  - NSLock gotcha: `lock()` is unavailable in async function bodies (Swift 6); all locking is in synchronous helpers (`dequeueFirstOutbound`, `storeContinuationOrDequeue`, `swapOutboundContinuation`) called from async functions
+  - MockTransport loopback gotcha: with both pumps running, inbound pump's `receive()` steals data sent by the outbound pump; outbound-path tests use `startOutboundPump()` only to avoid contention; full loopback test exercises C send → outbound pump → mock → inbound pump → C recv path
 
 ## T6 — External-transport servicing loop in SMB2Client, opt-in (#25) [transport-servicing]
 
