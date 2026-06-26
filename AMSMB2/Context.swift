@@ -109,6 +109,17 @@ public final class SMB2Client: CustomDebugStringConvertible, CustomReflectable, 
     /// DispatchSource-based socket monitor, created after connect.
     private var socketMonitor: SocketMonitor?
 
+    #if canImport(Network)
+    /// The bridge active when an external-transport seam is in use. Nil on the legacy path.
+    private var transportBridge: TransportBridge?
+    /// Set to `true` after a successful seam-based connect. `smb2_get_fd()` is always -1
+    /// while the seam is active; `isConnected` checks this flag on Apple platforms.
+    private var seamConnected = false
+    /// Pending timer work-item for `smb2_service_timeout`. Rescheduled after each service pass;
+    /// cancelled on seam teardown to prevent use-after-free.
+    private var pendingTimeoutItem: DispatchWorkItem?
+    #endif
+
     /// Tracks all pending operations for error broadcast on connection drop.
     private var pendingOperations: [ObjectIdentifier: CBData] = [:]
 
@@ -133,6 +144,9 @@ public final class SMB2Client: CustomDebugStringConvertible, CustomReflectable, 
     private func shutdown() {
         socketMonitor?.cancel()
         socketMonitor = nil
+        #if canImport(Network)
+        teardownSeam()
+        #endif
         failAllPendingOperations(with: POSIXError(.ECANCELED))
         if let ctx = context {
             if smb2_get_fd(ctx) >= 0 {
@@ -309,6 +323,19 @@ extension SMB2Client {
         socketMonitor = nil
     }
 
+    /// Routes post-operation servicing to the correct path: legacy `SocketMonitor` (fd-based)
+    /// or the seam no-fd loop. Must be called on `eventLoopQueue`.
+    private func activateServicingAfterOperation(context: UnsafeMutablePointer<smb2_context>) {
+        #if canImport(Network)
+        if transportBridge != nil {
+            flushOutboundForSeam(context: context)
+            scheduleSeamTimeout()
+            return
+        }
+        #endif
+        socketMonitor?.activateWriteSourceIfNeeded(context: context)
+    }
+
     /// Fails all in-flight operations. `isAbandoned` is set before resuming so that
     /// any concurrent libsmb2 callback skips the already-resumed continuation.
     private func failAllPendingOperations(with error: any Error) {
@@ -462,7 +489,16 @@ extension SMB2Client {
     }
 
     var isConnected: Bool {
-        fileDescriptor != -1
+        // Read seam/fd state on the event loop queue so `seamConnected` (mutated only on
+        // `eventLoopQueue`) is never read concurrently from an off-queue async caller
+        // (e.g. `echo()`, `Optional.unwrap()`). Nested `syncOnEventLoop` is reentrant-safe
+        // via `queueKey`, so the inner `fileDescriptor` access stays correct.
+        syncOnEventLoop {
+            #if canImport(Network)
+            if seamConnected { return true }
+            #endif
+            return fileDescriptor != -1
+        }
     }
 
     var fileDescriptor: Int32 {
@@ -532,8 +568,22 @@ extension SMB2Client {
         // on the event loop queue.
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             self.eventLoopQueue.async {
+                #if canImport(Network)
+                if self.seamConnected, let context = self.context {
+                    // Seam path: fd is always -1; best-effort disconnect PDU via outbound FIFO.
+                    smb2_disconnect_share_async(context, SMB2Client.generic_handler_noop, nil)
+                    self.flushOutboundForSeam(context: context)
+                    self.teardownSeam()
+                    self.failAllPendingOperations(with: POSIXError(.ENOTCONN))
+                    continuation.resume()
+                    return
+                }
+                #endif
                 guard let context = self.context, smb2_get_fd(context) >= 0 else {
                     self.stopSocketMonitoring()
+                    #if canImport(Network)
+                    self.teardownSeam()
+                    #endif
                     self.failAllPendingOperations(with: POSIXError(.ENOTCONN))
                     continuation.resume()
                     return
@@ -730,9 +780,13 @@ extension SMB2Client {
     /// `takeRetainedValue()` balances the `passRetained()` performed at setup.
     /// Resumes the stored `CheckedContinuation` to unblock the awaiting caller, or sets
     /// `isFinished` for the `pollUntilComplete` path (connect).
-    static let generic_handler: smb2_command_cb = { smb2, status, command_data, cbdata in
+    ///
+    /// Note: the original `fd >= 0` guard was removed so that seam operations — where fd is
+    /// always -1 — also invoke their callbacks correctly. The `isAbandoned` check below is
+    /// sufficient to prevent double-resume when `failAllPendingOperations` races with a
+    /// callback fired by `smb2_destroy_context` during teardown.
+    static let generic_handler: smb2_command_cb = { _, status, command_data, cbdata in
         do {
-            guard try smb2.unwrap().pointee.fd >= 0 else { return }
             let cbdata = Unmanaged<CBData>.fromOpaque(try cbdata.unwrap()).takeRetainedValue()
             guard !cbdata.isAbandoned else { return }
             cbdata.isAbandoned = true
@@ -817,7 +871,7 @@ extension SMB2Client {
                             self?.pendingOperations.removeValue(forKey: cbId)
                         }
                         self.pendingOperations[cbId] = cb
-                        self.socketMonitor?.activateWriteSourceIfNeeded(context: context)
+                        self.activateServicingAfterOperation(context: context)
 
                         // Start timeout timer on the event loop queue.
                         if self.timeout > 0 {
@@ -910,7 +964,7 @@ extension SMB2Client {
                             self?.pendingOperations.removeValue(forKey: cbId)
                         }
                         self.pendingOperations[cbId] = cb
-                        self.socketMonitor?.activateWriteSourceIfNeeded(context: context)
+                        self.activateServicingAfterOperation(context: context)
 
                         if self.timeout > 0 {
                             self.eventLoopQueue.asyncAfter(deadline: .now() + self.timeout) { [weak self] in
@@ -947,6 +1001,315 @@ extension SMB2Client {
         return try (cb.status.rawValue, resultData.unwrap())
     }
 }
+
+// MARK: - External-transport (seam) servicing loop
+
+#if canImport(Network)
+
+extension SMB2Client {
+
+    // MARK: Opt-in connect via transport kind
+
+    /// Connects to `server`/`share` using the external-transport seam.
+    ///
+    /// Builds the concrete transport for `kind`, wraps it in a `TransportBridge`, installs
+    /// the bridge via `smb2_set_transport(AUTO, ext)` before `smb2_connect_share_async`,
+    /// and drives the handshake through the no-fd servicing loop rather than `pollUntilComplete`.
+    ///
+    /// - Note: `TCPTransportApple` (the `tcp`/`automatic` conformer) is implemented in T7 (#26).
+    ///   Until then this throws `POSIXError(.ENOTSUP)` for those cases via the stub transport.
+    func connect(
+        server: String, share: String, user: String,
+        transportKind: SMBTransportKind
+    ) async throws {
+        let transport: any SMBTransport
+        switch transportKind {
+        case .tcp, .automatic:
+            // TCPTransportApple stub (full NIO implementation comes in T7 #26).
+            transport = TCPTransportApple()
+        case .quic:
+            throw POSIXError(.ENOTSUP, description: "QUIC transport not yet implemented")
+        }
+        let bridge = TransportBridge(transport: transport)
+        try await connectWithBridge(server: server, share: share, user: user, bridge: bridge)
+    }
+
+    // MARK: Bridge-based connect (internal, testable with MockTransport)
+
+    /// Connects via the provided bridge, driving libsmb2 through the seam servicing loop.
+    ///
+    /// Exposed as `internal` so tests can inject a `MockTransport`-backed bridge directly,
+    /// bypassing the `TCPTransportApple` kind dispatch. Production code calls
+    /// `connect(server:share:user:transportKind:)` instead.
+    ///
+    /// **Naming trap** (design D1): `SMB2_TRANSPORT_AUTO` is used, not `SMB2_TRANSPORT_TCP`.
+    /// `TCP == 0` selects libsmb2's built-in socket (and ignores `ext`); `AUTO == 2` routes
+    /// our external bridge through the seam. After `smb2_set_transport(AUTO, ext)`, calling
+    /// `smb2_get_fd(context)` returns -1 — no native socket fd exists.
+    func connectWithBridge(
+        server: String, share: String, user: String,
+        bridge: TransportBridge
+    ) async throws {
+        try Task.checkCancellation()
+
+        // `cbPtr` (UnsafeMutableRawPointer) is constructed INSIDE the eventLoopQueue.async
+        // block — a local variable rather than a captured binding — so it does not trigger the
+        // Swift 6 @SendableClosureCaptures warning that affects the legacy async_await functions.
+        // `cb` and `cbId` are Sendable (CBData is @unchecked Sendable, ObjectIdentifier is Sendable)
+        // and are safe to capture across the isolation boundary.
+        let cb = CBData()
+        let cbId = ObjectIdentifier(cb)
+
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+                self.eventLoopQueue.async { [self] in
+                    // Construct the opaque pointer locally to avoid capturing a non-Sendable
+                    // UnsafeMutableRawPointer across the @Sendable closure boundary.
+                    let cbPtr = Unmanaged.passRetained(cb).toOpaque()
+
+                    guard let context = self.context else {
+                        Unmanaged<CBData>.fromOpaque(cbPtr).release()
+                        continuation.resume(throwing: POSIXError(.ENOTCONN))
+                        return
+                    }
+
+                    // Install the bridge as the external transport.
+                    // NAMING TRAP: use AUTO (== 2), not TCP (== 0).
+                    // TCP selects libsmb2's built-in socket and ignores `ext`.
+                    var ext = bridge.makeExternalTransport()
+                    let transportResult = smb2_set_transport(
+                        context, SMB2_TRANSPORT_AUTO, &ext
+                    )
+                    guard transportResult == 0 else {
+                        // smb2_set_transport failed: libsmb2 did NOT install our ext struct,
+                        // so the C close trampoline will never fire. Manually balance the
+                        // passRetained that makeExternalTransport() performed on the bridge.
+                        Unmanaged<TransportBridge>.fromOpaque(ext.userdata!).release()
+                        Unmanaged<CBData>.fromOpaque(cbPtr).release()
+                        continuation.resume(throwing: POSIXError(.EINVAL,
+                            description: "smb2_set_transport failed: \(transportResult)"))
+                        return
+                    }
+                    // Assert the naming trap: after AUTO install, fd must be -1.
+                    assert(smb2_get_fd(context) == -1,
+                        "seam transport must not own a native socket fd")
+
+                    // Propagate our Swift-level timeout into libsmb2 so per-PDU deadlines
+                    // are set. This enables smb2_get_timeout to return a live deadline and
+                    // scheduleSeamTimeout to drive smb2_service_timeout on the event loop.
+                    // Minimum 1 s (libsmb2 takes integer seconds; sub-second Swift timeouts
+                    // are covered by the asyncAfter below).
+                    if self.timeout > 0 {
+                        let libTimeoutSecs = max(1, Int32(self.timeout.rounded(.up)))
+                        smb2_set_timeout(context, libTimeoutSecs)
+                    }
+
+                    // Wire up the inbound-ready signal: bridge → eventLoopQueue → service.
+                    bridge.setInboundReadyHandler { [weak self] in
+                        self?.eventLoopQueue.async { [weak self] in
+                            self?.serviceContextForSeam()
+                        }
+                    }
+                    self.transportBridge = bridge
+
+                    // Register the connect operation.
+                    let connectResult = smb2_connect_share_async(
+                        context, server, share, user,
+                        SMB2Client.generic_handler, cbPtr
+                    )
+                    if connectResult < 0 {
+                        Unmanaged<CBData>.fromOpaque(cbPtr).release()
+                        let errCode = Int32(-connectResult)
+                        let errDesc = self.error.map { "Error code \(errCode): \($0)" }
+                        // Tear down the seam state: transportBridge was just set and the
+                        // bridge registered an inbound-ready handler, but the operation
+                        // never reached the pending-operations table.
+                        self.teardownSeam()
+                        continuation.resume(
+                            throwing: POSIXError(.init(errCode), description: errDesc))
+                        return
+                    }
+
+                    cb.continuation = continuation
+
+                    // Race: onCancel may have fired before the continuation was stored.
+                    if cb.isAbandoned {
+                        cb.continuation = nil
+                        Unmanaged<CBData>.fromOpaque(cbPtr).release()
+                        self.teardownSeam()
+                        continuation.resume(throwing: CancellationError())
+                        return
+                    }
+
+                    cb.cleanup = { [weak self] in
+                        self?.pendingOperations.removeValue(forKey: cbId)
+                        // Mark seam-connected only on success (result == NTStatus.success == 0).
+                        if cb.result == Int32(NTStatus.success.rawValue) {
+                            self?.seamConnected = true
+                        }
+                    }
+                    self.pendingOperations[cbId] = cb
+
+                    // Start pumps now so bytes can flow immediately.
+                    bridge.startPumps()
+
+                    // Flush any outbound PDUs libsmb2 queued during smb2_set_transport
+                    // or smb2_connect_share_async (e.g. NEGOTIATE).
+                    self.flushOutboundForSeam(context: context)
+
+                    // Arm timer-driven servicing (per-request timeouts, QUIC timers later).
+                    self.scheduleSeamTimeout()
+
+                    // Per-operation timeout (distinct from smb2_get_timeout timers).
+                    if self.timeout > 0 {
+                        self.eventLoopQueue.asyncAfter(
+                            deadline: .now() + self.timeout
+                        ) { [weak self] in
+                            guard !cb.isAbandoned else { return }
+                            cb.isAbandoned = true
+                            self?.pendingOperations.removeValue(forKey: cbId)
+                            self?.teardownSeam()
+                            if let cont = cb.continuation {
+                                cb.continuation = nil
+                                cont.resume(throwing: POSIXError(.ETIMEDOUT))
+                            }
+                        }
+                    }
+                }
+            }
+        } onCancel: {
+            self.eventLoopQueue.async { [self] in
+                guard !cb.isAbandoned else { return }
+                cb.isAbandoned = true
+                self.pendingOperations.removeValue(forKey: cbId)
+                self.teardownSeam()
+                if let cont = cb.continuation {
+                    cb.continuation = nil
+                    cont.resume(throwing: CancellationError())
+                }
+            }
+        }
+
+        // After continuation.resume() from generic_handler: check the SMB2 status.
+        if let cbError = cb.error { throw cbError }
+        try POSIXError.throwIfError(cb.result, description: error)
+    }
+
+    // MARK: No-fd servicing loop
+
+    /// Services libsmb2 for the seam path: calls `smb2_service` with the events indicated by
+    /// `smb2_which_events`, then flushes any pending outbound PDUs, then reschedules the timer.
+    ///
+    /// Must run on `eventLoopQueue`. Called exclusively from the bridge's inbound-ready callback
+    /// (installed by `bridge.setInboundReadyHandler` in `connectWithBridge`). The timer
+    /// (`scheduleSeamTimeout`) and outbound flush (`flushOutboundForSeam`) call `smb2_service`
+    /// and `smb2_service_timeout` directly and do NOT route through this function.
+    func serviceContextForSeam() {
+        guard let context else { return }
+
+        // Use smb2_which_events to determine what libsmb2 currently needs, then OR in POLLIN
+        // because this function is always triggered by inbound-byte readiness.
+        let revents = smb2_which_events(context) | Int32(POLLIN)
+        let serviceResult = smb2_service(context, revents)
+        if serviceResult < 0 {
+            let errorMsg = error
+            smb2_destroy_context(context)
+            self.context = nil
+            teardownSeam()
+            failAllPendingOperations(with: POSIXError(.ECONNRESET, description: errorMsg))
+            return
+        }
+
+        // Flush any outbound PDUs that libsmb2 generated during service.
+        flushOutboundForSeam(context: context)
+
+        // Reschedule timer to match the new libsmb2 deadline.
+        scheduleSeamTimeout()
+    }
+
+    /// Calls `smb2_service(POLLOUT)` while libsmb2 reports pending output.
+    ///
+    /// Each POLLOUT service invokes the C `send` trampoline, which enqueues bytes in the
+    /// bridge's outbound FIFO. The outbound pump Task drains the FIFO via `transport.send`.
+    /// The loop is capped at 32 passes to avoid starving other event-loop work. If POLLOUT
+    /// is still set after the cap, a follow-up flush is re-armed asynchronously so pending
+    /// outbound PDUs are not silently stalled.
+    /// Must run on `eventLoopQueue`.
+    func flushOutboundForSeam(context: UnsafeMutablePointer<smb2_context>) {
+        var iterations = 0
+        while (smb2_which_events(context) & Int32(POLLOUT)) != 0, iterations < 32 {
+            let result = smb2_service(context, Int32(POLLOUT))
+            if result < 0 {
+                let errorMsg = error
+                smb2_destroy_context(context)
+                self.context = nil
+                teardownSeam()
+                failAllPendingOperations(with: POSIXError(.ECONNRESET, description: errorMsg))
+                return
+            }
+            iterations += 1
+        }
+        // If POLLOUT is still asserted after 32 passes, re-arm a flush on the next
+        // event-loop turn so large outbound bursts don't stall silently.
+        if iterations == 32, (smb2_which_events(context) & Int32(POLLOUT)) != 0 {
+            eventLoopQueue.async { [weak self] in
+                guard let self, let ctx = self.context else { return }
+                self.flushOutboundForSeam(context: ctx)
+            }
+        }
+    }
+
+    /// Schedules `smb2_service_timeout` at the next deadline reported by `smb2_get_timeout`.
+    ///
+    /// `smb2_get_timeout` returns 1 when a deadline is set and fills `tv` with the remaining
+    /// time until that deadline (relative duration). Returns 0 for "no timer pending".
+    /// The timer is rescheduled after every service pass so libsmb2's deadline tracking stays
+    /// accurate. Must run on `eventLoopQueue`.
+    func scheduleSeamTimeout() {
+        // Only the seam drives this timer; bail out once the seam is torn down so a
+        // rescheduling chain cannot outlive `transportBridge`.
+        guard let context, transportBridge != nil else { return }
+        // Cancel any previously scheduled timer; libsmb2's deadline may have changed.
+        pendingTimeoutItem?.cancel()
+        pendingTimeoutItem = nil
+
+        var tv = timeval()
+        guard smb2_get_timeout(context, &tv) == 1 else { return }  // 0 = no timer pending
+        let remaining = Double(tv.tv_sec) + Double(tv.tv_usec) / 1_000_000.0
+        // Due now or already past — defer with a minimum 1 ms floor so the queue does not
+        // busy-spin if `smb2_get_timeout` keeps reporting {0,0} (persistent timeout churn
+        // under heavy load); a 1 ms minimum lets the Swift pool and other GCD work run.
+        let delay = max(remaining, 0.001)
+
+        let item = DispatchWorkItem { [weak self] in
+            guard let self, let context = self.context else { return }
+            _ = smb2_service_timeout(context)
+            self.flushOutboundForSeam(context: context)
+            self.scheduleSeamTimeout()
+        }
+        // Track every scheduled item (including the floor path) in `pendingTimeoutItem` so
+        // `teardownSeam()` cancels it and repeated calls naturally deduplicate.
+        pendingTimeoutItem = item
+        eventLoopQueue.asyncAfter(deadline: .now() + delay, execute: item)
+    }
+
+    /// Tears down the seam: cancels the timer, clears the bridge reference, resets
+    /// `seamConnected`. Must run on `eventLoopQueue`.
+    ///
+    /// Calling `bridge.close()` cancels the pump Tasks and calls `transport.close()` in a
+    /// background Task (see `TransportBridge.close()`). Idempotent.
+    func teardownSeam() {
+        pendingTimeoutItem?.cancel()
+        pendingTimeoutItem = nil
+        seamConnected = false
+        if let bridge = transportBridge {
+            transportBridge = nil
+            bridge.close()
+        }
+    }
+}
+
+#endif // canImport(Network)
 
 extension SMB2Client {
     struct NegotiateSigning: OptionSet, Sendable, CustomStringConvertible {

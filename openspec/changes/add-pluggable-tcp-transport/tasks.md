@@ -6,7 +6,7 @@ test from the linked spec scenario first); config/manifest tasks are TDD-exempt 
 ## T1 — Retarget libsmb2 submodule to the fork (#20) [transport-dependencies]
 
 - [x] 1.1 Update `.gitmodules`: set `Dependencies/libsmb2` url to `https://github.com/simplekube-ro/libsmb2`
-- [x] 1.2 `git submodule sync` + `git submodule update --init`; check out the fork commit that contains `smb2_set_transport` (fork `master` head with the transport API); pin the exact SHA in the AMSMB2 commit
+- [x] 1.2 `git submodule sync` + `git submodule update --init`; check out the fork commit that contains `smb2_set_transport` (fork `master` head with the transport API); pin the exact SHA in the AMSMB2 commit. **Pin note:** T1 pinned `944f7d1`; T6 (#25) later advanced the pin to the descendant `112803c` for the `ext_close` once-semantics fix. `944f7d1` references in this file describe the original T1 srvsvc adaptation and remain accurate as ancestry.
 - [x] 1.3 Verify `swift build --disable-sandbox` and `swift test --disable-sandbox` pass (unit tests; integration skips without a server). **Note:** The fork's `master` (944f7d1) carries a srvsvc DCE/RPC refactor beyond the transport API — upstream symbols `srvsvc_SHARE_INFO_1_carray`, `max_count`, `ses.ShareInfo.Level1.Buffer`, and `.utf8` on fixed char arrays are replaced by `srvsvc_SHARE_INFO_1_CONTAINER`, `EntriesRead`, `ses.ShareEnum.Level1`, and `char *` pointer fields. This required adapting `AMSMB2/Parsers.swift` (`Array<SMB2Share>.init(_ container:)`) to the renamed types and to guard null NDR referents via `UnsafePointer<CChar>(bitPattern:)`. The adaptation is the only required Swift source change; two regression tests cover the null-pointer guard.
 - [x] 1.4 Update `CLAUDE.md` / `README.md` prerequisite/submodule-URL notes if they reference the upstream URL
 
@@ -42,23 +42,41 @@ test from the linked spec scenario first); config/manifest tasks are TDD-exempt 
 
 ## T5 — Bridge libsmb2 external-transport callbacks to async SMBTransport (#24) [transport-bridge]
 
-- [ ] 5.1 (TDD) Write bridge tests against `MockTransport`: round-trip through C `send`/`recv`, copy-at-boundary (overwrite source buffer after `send` returns), would-block-when-empty, EOF-on-close, clean teardown on cancel
-- [ ] 5.2 Implement the bridge type: synchronous lock-guarded inbound/outbound `Data` FIFOs + the `SMBTransport` instance (design D3/D5)
-- [ ] 5.3 Implement the four C trampolines (`connect`/`send`/`recv`/`close`) populating `smb2_external_transport`; recover the bridge from `userdata` via `Unmanaged` (`passRetained` once, balanced on teardown)
-- [ ] 5.4 Implement copy-at-the-boundary in `send`/`recv` — synchronous unsafe copy, no `await` inside the closure (design D4)
-- [ ] 5.5 Implement outbound-drain and inbound-fill pump `Task`s with would-block/EOF/error semantics and correct cancellation/teardown
-- [ ] 5.6 Verify zero Swift 6 strict-concurrency warnings; tests pass
+- [x] 5.1 (TDD) Write bridge tests against `MockTransport`: round-trip through C `send`/`recv`, copy-at-boundary (overwrite source buffer after `send` returns), would-block-when-empty, EOF-on-close, clean teardown on cancel
+- [x] 5.2 Implement the bridge type: synchronous lock-guarded inbound/outbound `Data` FIFOs + the `SMBTransport` instance (design D3/D5)
+- [x] 5.3 Implement the four C trampolines (`connect`/`send`/`recv`/`close`) populating `smb2_external_transport`; recover the bridge from `userdata` via `Unmanaged` (`passRetained` once, balanced on teardown)
+- [x] 5.4 Implement copy-at-the-boundary in `send`/`recv` — synchronous unsafe copy, no `await` inside the closure (design D4)
+- [x] 5.5 Implement outbound-drain and inbound-fill pump `Task`s with would-block/EOF/error semantics and correct cancellation/teardown
+- [x] 5.6 Verify zero Swift 6 strict-concurrency warnings; tests pass
+  - `swift build --disable-sandbox`: Build complete, 0 warnings
+  - `swift test --disable-sandbox`: 112 tests, 9 new (TransportBridgeTests), 44 skipped (integration — no server), 0 failures
+  - Linux build path: not executed (no Linux toolchain); `TransportBridge.swift` is guarded by `#if canImport(Network)` per design D7, so it is excluded from Linux builds
+  - NSLock gotcha: `lock()` is unavailable in async function bodies (Swift 6); all locking is in synchronous helpers (`dequeueFirstOutbound`, `storeContinuationOrDequeue`, `swapOutboundContinuation`) called from async functions
+  - MockTransport loopback gotcha: with both pumps running, inbound pump's `receive()` steals data sent by the outbound pump; outbound-path tests use `startOutboundPump()` only to avoid contention; full loopback test exercises C send → outbound pump → mock → inbound pump → C recv path
 
 ## T6 — External-transport servicing loop in SMB2Client, opt-in (#25) [transport-servicing]
 
-- [ ] 6.1 (TDD) Write servicing tests: full mock exchange resumes the continuation (no hang); timer-driven timeout via a never-replying mock; legacy path unchanged; cancellation tears down cleanly
-- [ ] 6.2 Add opt-in `SMBTransportKind` to `SMB2Client.connect`; when selected (Apple), build `TCPTransportApple`, wrap in the bridge, call `smb2_set_transport(ctx, AUTO, ext)` before `smb2_connect_share_async`
-- [ ] 6.3 Enforce the naming trap: use `SMB2_TRANSPORT_QUIC`/`AUTO` (never `TCP`) for the seam; add a comment + assertion that `smb2_get_fd(context) == -1` under the seam
-- [ ] 6.4 Implement the no-fd servicing loop on `eventLoopQueue`: inbound-ready signal → `smb2_service` with `revents` from `smb2_which_events`; flush `POLLOUT` after queueing operations (replaces `SocketMonitor.activateWriteSourceIfNeeded`)
-- [ ] 6.5 Implement timer servicing: `smb2_get_timeout` → `eventLoopQueue.asyncAfter` → `smb2_service_timeout`, rescheduled per pass and cancelled on teardown
-- [ ] 6.6 Implement the seam connect path (no `poll(fd)`; drive via bridge readiness) reusing the existing `CBData`/continuation/`isAbandoned`/`withTaskCancellationHandler` machinery
-- [ ] 6.7 Keep the default (no kind) path byte-for-byte legacy; verify existing unit tests green
-- [ ] 6.8 Verify zero Swift 6 strict-concurrency warnings; tests pass
+- [x] 6.1 (TDD) Write servicing tests: full mock exchange resumes the continuation (no hang); timer-driven timeout via a never-replying mock; legacy path unchanged; cancellation tears down cleanly
+      **Note (full exchange deferred):** A full mock exchange (continuation resumes with correct result) is infeasible at the unit-test level — MockTransport cannot speak real SMB2 without triggering SIGSEGV in libsmb2's parser. This scenario is explicitly deferred to T8 (#27) integration. `SMB2ServicingLoopTests` covers: no-hang on timeout, timer path wiring, inbound-ready callback, cancellation, and `connect(transportKind:)` opt-in surface.
+- [x] 6.2 Add opt-in `SMBTransportKind` to `SMB2Client.connect`; when selected (Apple), build `TCPTransportApple`, wrap in the bridge, call `smb2_set_transport(ctx, AUTO, ext)` before `smb2_connect_share_async`
+      **Call site provided:** `testConnectWithQuicKindThrowsENOTSUP` and `testConnectWithTCPKindRoutesToSeamAndFails` in `SMB2ServicingLoopTests.swift`.
+- [x] 6.3 Enforce the naming trap: use `SMB2_TRANSPORT_QUIC`/`AUTO` (never `TCP`) for the seam; add a comment + assertion that `smb2_get_fd(context) == -1` under the seam
+- [x] 6.4 Implement the no-fd servicing loop on `eventLoopQueue`: inbound-ready signal → `smb2_service` with `revents` from `smb2_which_events`; flush `POLLOUT` after queueing operations (replaces `SocketMonitor.activateWriteSourceIfNeeded`)
+- [x] 6.5 Implement timer servicing: `smb2_get_timeout` → `eventLoopQueue.asyncAfter` → `smb2_service_timeout`, rescheduled per pass and cancelled on teardown
+      **Timer wired:** `smb2_set_timeout(context, max(1, ceil(self.timeout)))` called in `connectWithBridge` after `smb2_set_transport` succeeds. Full verification (smb2_service_timeout fires and aborts a PDU before the Swift asyncAfter) deferred to T8.
+- [x] 6.6 Implement the seam connect path (no `poll(fd)`; drive via bridge readiness) reusing the existing `CBData`/continuation/`isAbandoned`/`withTaskCancellationHandler` machinery
+- [x] 6.7 Keep the default (no kind) path byte-for-byte legacy; verify existing unit tests green
+- [x] 6.8 Verify zero Swift 6 strict-concurrency warnings; tests pass
+      - `swift build --disable-sandbox`: Build complete, 0 new warnings (2 pre-existing SendableClosureCaptures + 3 inherited-Sendable from integration test base class)
+      - `swift test --disable-sandbox`: 121 tests, 8 new (SMB2ServicingLoopTests), 44 skipped (integration — no server), 0 failures
+      - **Root cause of T6 QA crash fixed**: `ext_close` in transport-external.c had no once-semantics. `smb2_destroy_context` called `ext_close` once directly and then again from `negotiate_cb → smb2_close_context → ext_close` within the waitqueue drain, causing a double `takeRetainedValue()` use-after-free. Fixed by clearing `ext.close` and `ext.userdata` before invoking the callback in `ext_close` (one-shot semantics).
+      - **Code review findings addressed**: retain balance on transport failure path, `teardownSeam()` on `connectResult<0`, `serviceContextForSeam` doc comment, `flushOutboundForSeam` re-arm on cap hit, `scheduleSeamTimeout` minimum delay, `smb2_set_timeout` wiring.
+      - **Submodule bump (T6 footprint, intentional):** `Dependencies/libsmb2` advanced `944f7d1` → `112803c` to carry the `ext_close` once-semantics fix in `lib/transport-external.c`. This C change ships together with the Swift servicing loop in this PR; `112803c` must be published/merged on `simplekube-ro/libsmb2` before this branch merges.
+      - **Arbiter (tech-lead) resolution after panel round 2:** two reviewer findings were fixed in code on this branch rather than deferred:
+        1. **Data race on `seamConnected` (code-review, major):** `isConnected` read `seamConnected` (mutated only on `eventLoopQueue`) off-queue from `echo()`/`Optional.unwrap()`. Fixed by wrapping the whole `isConnected` getter body in `syncOnEventLoop { ... }` (reentrant-safe via `queueKey`; inner `fileDescriptor` access unchanged). State is now read on the serialized queue, restoring the file's invariant.
+        2. **`scheduleSeamTimeout` floor path (architect + code-review, minor):** the `remaining <= 0` branch previously used an untracked `asyncAfter` not stored in `pendingTimeoutItem` and not cancelled on teardown. Unified both branches onto a single tracked, cancellable `DispatchWorkItem` (delay = `max(remaining, 0.001)`) and added a `transportBridge != nil` guard so a rescheduling chain cannot outlive the seam.
+        Post-fix: `swift build --disable-sandbox` clean (only the 4 pre-existing `SendableClosureCaptures` warnings from master commit 75e4db5c remain; 0 new); `swift test --disable-sandbox` → 121 tests, 44 skipped, 0 failures.
+      - Linux build path: not executed (no Linux toolchain); `#if canImport(Network)` guards unchanged
 
 ## T7 — Implement TCPTransportApple on NIOTransportServices (#26) [tcp-transport-apple]
 

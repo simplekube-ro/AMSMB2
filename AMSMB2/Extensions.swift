@@ -30,7 +30,7 @@ extension Optional {
 
 extension Optional where Wrapped: SMB2Client {
     func unwrap() throws -> SMB2Client {
-        guard let self = self, self.fileDescriptor >= 0 else {
+        guard let self = self, self.isConnected else {
             throw POSIXError(.ENOTCONN, description: "SMB2 server not connected.")
         }
         return self

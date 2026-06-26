@@ -123,10 +123,13 @@ closures cannot host `await`. The async pump tasks own the `await transport.send
 isolates its NIO `Channel` to the channel's event loop.
 
 Concretely the bridge has two concurrency layers:
-- A **synchronous, lock-guarded byte store** (`ByteFIFO`) with `appendInbound`, `drainInbound(max:)`,
-  `enqueueOutbound`, `takeOutbound()`, `markEOF`, `markClosed` helpers — all synchronous, callable
-  from C callbacks and from pump tasks.
-- **Pump `Task`s** that bridge the FIFO to the async `SMBTransport` (see D5).
+- A **synchronous, lock-guarded byte store** (inlined directly into `TransportBridge` — the
+  originally sketched `ByteFIFO` type was not extracted as a separate type; inlining avoids an extra
+  abstraction and the dead-code concern) with synchronous `appendInbound`, `enqueueOutbound`,
+  `setInboundEOF`, `setInboundError` helpers — callable from C callbacks and from pump tasks.
+- **Pump `Task`s** that bridge the byte store to the async `SMBTransport` (see D5). The pump-task
+  `Task` references (`outboundPumpTask`, `inboundPumpTask`) are also guarded by the same `NSLock`
+  to prevent data races between `startOutboundPump`/`startInboundPump` writes and `close()` reads.
 
 ### D4 — Copy at the C/Swift boundary (mandatory)
 
