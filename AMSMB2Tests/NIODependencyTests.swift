@@ -19,7 +19,7 @@ import NIOCore
 import NIOTransportServices
 import XCTest
 
-final class NIODependencyTests: XCTestCase, @unchecked Sendable {
+final class NIODependencyTests: XCTestCase {
 
     // MARK: - NIOCore availability
 
@@ -37,7 +37,7 @@ final class NIODependencyTests: XCTestCase, @unchecked Sendable {
 
     /// Verifies that NIOTransportServices is resolved and NIOTSEventLoopGroup
     /// is constructable (it is the NIO entry point for Network.framework).
-    func testNIOTSEventLoopGroupIsConstructable() throws {
+    func testNIOTSEventLoopGroupIsConstructable() {
         // NIOTSEventLoopGroup wraps a Network.framework dispatch queue.
         // Construction proves the target linked correctly.
         let group = NIOTSEventLoopGroup(loopCount: 1)
