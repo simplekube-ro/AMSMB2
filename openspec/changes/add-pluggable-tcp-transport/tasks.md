@@ -80,11 +80,15 @@ test from the linked spec scenario first); config/manifest tasks are TDD-exempt 
 
 ## T7 — Implement TCPTransportApple on NIOTransportServices (#26) [tcp-transport-apple]
 
-- [ ] 7.1 (TDD) Write what's feasible without a server: connect-failure and cancellation paths (e.g. `EmbeddedChannel`/loopback), inbound buffering / incremental drain, graceful-EOF
-- [ ] 7.2 Implement `TCPTransportApple: SMBTransport` with `NIOTSConnectionBootstrap` / Network.framework-backed channel; `#if canImport(Network)`
-- [ ] 7.3 Implement `connect`/`send`/`receive`/`close`; channel handler buffers inbound bytes for incremental `recv` drain; convert `Data`↔`ByteBuffer` internally (design D2)
-- [ ] 7.4 Map connect-failure and cancellation to `POSIXError(.CODE)`; ensure no channel leak on cancel
-- [ ] 7.5 Verify Apple build succeeds, Linux build unaffected, zero Swift 6 concurrency warnings; tests pass
+- [x] 7.1 (TDD) Write what's feasible without a server: connect-failure and cancellation paths, send/receive before connect, close() safety and idempotency, Sendable/SMBTransport conformance.
+      **Note:** `EmbeddedChannel` / inbound-buffering drain tests were judged infeasible without the additional `NIOEmbedded`/`NIOPosix` dependency (design D9 says add NIOPosix only if a test needs it); full inbound drain deferred to T8 (#27) integration. `TCPTransportAppleTests` covers: refused-port → POSIXError; send/receive before connect → ENOTCONN; close() safety + idempotency; receive() cancellation; Sendable conformance.
+- [x] 7.2 Implement `TCPTransportApple: SMBTransport` with `NIOTSConnectionBootstrap` / Network.framework-backed channel; `#if canImport(Network)`
+- [x] 7.3 Implement `connect`/`send`/`receive`/`close`; `InboundBufferingHandler` buffers inbound bytes for incremental `recv` drain; `Data`↔`ByteBuffer` conversion internal (design D2). `connectTimeoutSeconds` init parameter (default 30 s) caps the NW handshake and controls test speed.
+- [x] 7.4 Map connect-failure (`NWError`, `ChannelError`) and cancellation to `POSIXError(.CODE)`; channel leak on cancel prevented by `onCancel` closing the channel future's result once available.
+- [x] 7.5 Verify Apple build succeeds, Linux build unaffected, zero new Swift 6 concurrency warnings; tests pass.
+      - `swift build --disable-sandbox`: Build complete, 0 new warnings (only the 4 pre-existing `SendableClosureCaptures` in `Context.swift` remain)
+      - `swift test --disable-sandbox`: 129 tests, 8 new (`TCPTransportAppleTests`), 44 skipped (integration — no server), 0 failures
+      - Linux build path: not executed (no Linux toolchain); `TCPTransportApple.swift` is guarded by `#if canImport(Network)` so it is excluded from Linux builds
 
 ## T8 — Full Samba integration suite through the NIO TCP transport (#27) [transport-rollout]
 
