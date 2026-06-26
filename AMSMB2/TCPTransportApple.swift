@@ -64,9 +64,12 @@ public final class TCPTransportApple: SMBTransport, @unchecked Sendable {
     }
 
     deinit {
-        // Best-effort synchronous cleanup when the caller didn't call close().
-        // syncShutdownGracefully blocks until the NIO event loop drains; acceptable
-        // in deinit as a safety net only.
+        // Safety-net: if the caller did not call close(), attempt to close the channel
+        // and synchronously drain the NIO event loop.
+        // CAVEAT: syncShutdownGracefully() will deadlock/precondition-fail if deinit
+        // ever runs on one of the group's own event-loop threads. The likelihood is low
+        // because the group's event loops do not retain the transport object, but
+        // callers are strongly encouraged to call close() for deterministic teardown.
         lock.withLock { _channel }?.close(promise: nil)
         try? group.syncShutdownGracefully()
     }
@@ -126,6 +129,12 @@ public final class TCPTransportApple: SMBTransport, @unchecked Sendable {
         } catch let posix as POSIXError {
             throw posix
         } catch {
+            // If the task was cancelled, the onCancel handler may have closed the channel
+            // before the future completed, causing a ChannelError rather than CancellationError.
+            // Honour cancellation semantics by checking the flag here.
+            if Task.isCancelled {
+                throw POSIXError(.ECANCELED)
+            }
             throw Self.mapError(error)
         }
     }
@@ -148,15 +157,26 @@ public final class TCPTransportApple: SMBTransport, @unchecked Sendable {
     /// Returns the next chunk of bytes from the remote peer.
     ///
     /// Delegates to `InboundBufferingHandler.receive()`. Returns empty `Data` on
-    /// graceful EOF. Supports task cancellation.
+    /// graceful EOF (including after `close()`). Supports task cancellation.
+    ///
+    /// All NWError / ChannelError values thrown by the inbound handler are mapped
+    /// to `POSIXError` before propagating (CLAUDE.md convention).
     public func receive() async throws -> Data {
-        guard !lock.withLock({ _isClosed }) else {
-            throw POSIXError(.ENOTCONN, description: "TCPTransportApple: transport is closed")
+        // EOF convention (SMBTransport contract): return empty Data after close()
+        // rather than throwing, consistent with graceful peer-close signalling.
+        if lock.withLock({ _isClosed }) {
+            return Data()
         }
         guard lock.withLock({ _channel }) != nil else {
             throw POSIXError(.ENOTCONN, description: "TCPTransportApple: not connected")
         }
-        return try await inboundHandler.receive()
+        // Map any raw NIO / NW errors from the handler to POSIXError before
+        // they reach the caller, satisfying the file-level invariant.
+        do {
+            return try await inboundHandler.receive()
+        } catch {
+            throw Self.mapError(error)
+        }
     }
 
     /// Closes the connection and shuts down the NIO event loop group.
@@ -210,6 +230,10 @@ private extension NWError {
         case .tls:
             return POSIXError(.EPROTO, description: "TLS error: \(self)")
         case .wifiAware:
+            // NWError.wifiAware was added in macOS 12 / iOS 15. Modern Xcode (14+) only ships
+            // SDKs that define this case, so omitting it causes a non-exhaustive-switch warning.
+            // Keeping it explicit here is safe: older Xcode versions (which lacked the case)
+            // are no longer in the CI matrix.
             return POSIXError(.ENETUNREACH, description: "Wi-Fi Aware error: \(self)")
         @unknown default:
             return POSIXError(.EIO, description: "Network error: \(self)")

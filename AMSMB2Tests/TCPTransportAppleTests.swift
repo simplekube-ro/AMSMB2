@@ -123,6 +123,10 @@ final class TCPTransportAppleTests: XCTestCase, @unchecked Sendable {
 
     /// WHEN receive() is suspended waiting for data and the enclosing Task is cancelled
     /// THEN receive() terminates promptly (no hang) with an appropriate error.
+    ///
+    /// NOTE: This test exits via the `_channel == nil` guard (transport not connected)
+    /// and validates the pre-connect ENOTCONN fast-path. The `InboundBufferingHandler`
+    /// onCancel path is covered by `testInboundHandlerReceiveCancellationExercisesOnCancelPath`.
     func testReceiveCancellationDoesNotHang() async {
         let transport = TCPTransportApple()
         defer { Task { await transport.close() } }
@@ -148,6 +152,38 @@ final class TCPTransportAppleTests: XCTestCase, @unchecked Sendable {
             )
         } catch {
             XCTFail("Expected CancellationError or POSIXError, got \(type(of: error)): \(error)")
+        }
+    }
+
+    /// Directly exercises the `InboundBufferingHandler.receive()` onCancel path.
+    ///
+    /// The handler is created standalone (not attached to a NIO channel) so no
+    /// NIO event-loop callbacks will fire. `receive()` suspends waiting for data
+    /// and the Task is then cancelled, which should trigger the `onCancel` handler
+    /// and promptly resume the continuation with `CancellationError`.
+    ///
+    /// This validates the documented-deferred race guard: `Task.isCancelled` is
+    /// checked inside the lock before storing the continuation, and `onCancel` drains
+    /// the waiting continuation when it fires concurrently.
+    func testInboundHandlerReceiveCancellationExercisesOnCancelPath() async throws {
+        let handler = InboundBufferingHandler()
+
+        // Spawn a task that will suspend inside handler.receive() with no data available.
+        let task: Task<Data, any Error> = Task {
+            try await handler.receive()
+        }
+
+        // Give the task time to store the waiting continuation.
+        try await Task.sleep(nanoseconds: 20_000_000) // 20 ms
+        task.cancel()
+
+        do {
+            _ = try await task.value
+            XCTFail("Expected task to throw CancellationError after cancellation")
+        } catch is CancellationError {
+            // Expected: onCancel fired and resumed the continuation with CancellationError.
+        } catch {
+            XCTFail("Expected CancellationError, got \(type(of: error)): \(error)")
         }
     }
 
