@@ -31,11 +31,14 @@ test from the linked spec scenario first); config/manifest tasks are TDD-exempt 
 
 ## T4 — Define SMBTransport protocol + SMBTransportKind enum (+ mock) (#23) [transport-seam]
 
-- [ ] 4.1 (TDD) Write the protocol-conformance + `MockTransport` round-trip/EOF/connect-failure tests first
-- [ ] 4.2 Define `public protocol SMBTransport: Sendable` with `connect(host:port:)`, `send(_ bytes: Data)`, `receive() -> Data`, `close()` — NIO-free and libsmb2-free; buffer type is `Data` (design D2)
-- [ ] 4.3 Define `public enum SMBTransportKind: Sendable { case tcp, quic, automatic }`
-- [ ] 4.4 Provide `MockTransport` (in-memory loopback) in the test target with failure/never-reply/graceful-EOF injection
-- [ ] 4.5 Verify zero Swift 6 strict-concurrency warnings; tests pass
+- [x] 4.1 (TDD) Write the protocol-conformance + `MockTransport` round-trip/EOF/connect-failure tests first
+- [x] 4.2 Define `public protocol SMBTransport: Sendable` with `connect(host:port:)`, `send(_ bytes: Data)`, `receive() -> Data`, `close()` — NIO-free and libsmb2-free; buffer type is `Data` (design D2)
+- [x] 4.3 Define `public enum SMBTransportKind: Sendable { case tcp, quic, automatic }`
+- [x] 4.4 Provide `MockTransport` (in-memory loopback) in the test target with failure/never-reply/graceful-EOF injection
+- [x] 4.5 Verify zero Swift 6 strict-concurrency warnings; tests pass
+  - `swift build --disable-sandbox`: Build complete, 0 warnings in new files
+  - `swift test --disable-sandbox`: 103 tests, 9 new (SMBTransportTests), 44 skipped (integration — no server), 0 failures
+  - Linux build path: not executed (no Linux toolchain); `SMBTransport.swift` uses only `Foundation` — no `#if` guard needed; it compiles on Linux as-is
 
 ## T5 — Bridge libsmb2 external-transport callbacks to async SMBTransport (#24) [transport-bridge]
 
