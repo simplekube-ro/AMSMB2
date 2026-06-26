@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-AMSMB2 is a Swift library that wraps [libsmb2](https://github.com/sahlberg/libsmb2) to provide SMB2/3 file operations for Apple platforms (iOS 13+, macOS 10.15+, tvOS 14+, watchOS 6+, visionOS 1+) and Linux.
+AMSMB2 is a Swift library that wraps [libsmb2](https://github.com/simplekube-ro/libsmb2) (fork of [sahlberg/libsmb2](https://github.com/sahlberg/libsmb2) with pluggable external-transport API; `Dependencies/libsmb2` submodule points here) to provide SMB2/3 file operations for Apple platforms (iOS 13+, macOS 10.15+, tvOS 14+, watchOS 6+, visionOS 1+) and Linux.
 
 **License note:** The library must be linked dynamically due to libsmb2's LGPL v2.1 license requirements for App Store distribution.
 

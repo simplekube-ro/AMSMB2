@@ -5,10 +5,10 @@ test from the linked spec scenario first); config/manifest tasks are TDD-exempt 
 
 ## T1 — Retarget libsmb2 submodule to the fork (#20) [transport-dependencies]
 
-- [ ] 1.1 Update `.gitmodules`: set `Dependencies/libsmb2` url to `https://github.com/simplekube-ro/libsmb2`
-- [ ] 1.2 `git submodule sync` + `git submodule update --init`; check out the fork commit that contains `smb2_set_transport` (fork `master` head with the transport API); pin the exact SHA in the AMSMB2 commit
-- [ ] 1.3 Verify `swift build --disable-sandbox` and `swift test --disable-sandbox` pass (unit tests; integration skips without a server) with no AMSMB2 Swift source changes
-- [ ] 1.4 Update `CLAUDE.md` / `README.md` prerequisite/submodule-URL notes if they reference the upstream URL
+- [x] 1.1 Update `.gitmodules`: set `Dependencies/libsmb2` url to `https://github.com/simplekube-ro/libsmb2`
+- [x] 1.2 `git submodule sync` + `git submodule update --init`; check out the fork commit that contains `smb2_set_transport` (fork `master` head with the transport API); pin the exact SHA in the AMSMB2 commit
+- [x] 1.3 Verify `swift build --disable-sandbox` and `swift test --disable-sandbox` pass (unit tests; integration skips without a server) with no AMSMB2 Swift source changes
+- [x] 1.4 Update `CLAUDE.md` / `README.md` prerequisite/submodule-URL notes if they reference the upstream URL
 
 ## T2 — Expose transport C symbols to the Swift SMB2 module (#21) [transport-dependencies]
 
