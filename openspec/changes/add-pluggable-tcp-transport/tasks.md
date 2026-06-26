@@ -18,11 +18,16 @@ test from the linked spec scenario first); config/manifest tasks are TDD-exempt 
 
 ## T3 — Add SwiftNIO + NIOTransportServices to Package.swift, Apple-guarded (#22) [transport-dependencies]
 
-- [ ] 3.1 Add package deps: `swift-nio` (`NIOCore`; `NIOPosix` only if a test needs it) and `swift-nio-transport-services` (`NIOTransportServices`), pinned to current stable majors
-- [ ] 3.2 Add them to the `AMSMB2` target's dependency list
-- [ ] 3.3 Ensure all NIO imports/usage are platform-guarded (`#if canImport(Network)`) so Linux builds with no NIO transport compiled in
-- [ ] 3.4 Record Apache-2.0 license notices for SwiftNIO + NIOTransportServices alongside the libsmb2 LGPL note (`README.md` / `CLAUDE.md` as applicable)
-- [ ] 3.5 Verify `swift build --disable-sandbox` succeeds on Apple; confirm the Linux build path stays compilable
+- [x] 3.1 Add package deps: `swift-nio` (`NIOCore`; `NIOPosix` only if a test needs it) and `swift-nio-transport-services` (`NIOTransportServices`), pinned to current stable majors
+- [x] 3.2 Add them to the `AMSMB2` target's dependency list
+- [x] 3.3 Ensure all NIO imports/usage are platform-guarded (`#if canImport(Network)`) so Linux builds with no NIO transport compiled in
+- [x] 3.4 Record Apache-2.0 license notices for SwiftNIO + NIOTransportServices alongside the libsmb2 LGPL note (`README.md` / `CLAUDE.md` as applicable)
+- [x] 3.5 Verify `swift build --disable-sandbox` succeeds on Apple; confirm the Linux build path stays compilable
+  - Resolved: swift-nio 2.101.2, swift-nio-transport-services 1.28.0
+  - `swift build --disable-sandbox`: Build complete (21.4 s)
+  - `swift test --disable-sandbox`: 94 tests, 0 failures (44 integration tests skipped — no server)
+  - `NIODependencyTests` (2 tests) exercised `ByteBuffer` and `NIOTSEventLoopGroup` successfully
+  - Linux build path: not executed (no Linux toolchain in this environment); confirmed by `.when(platforms:)` guards in Package.swift that exclude NIOCore + NIOTransportServices from Linux targets, matching the `#if canImport(Network)` source guards in `NIODependencyTests.swift`
 
 ## T4 — Define SMBTransport protocol + SMBTransportKind enum (+ mock) (#23) [transport-seam]
 

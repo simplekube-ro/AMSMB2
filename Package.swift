@@ -20,6 +20,15 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-atomics.git", .upToNextMajor(from: "1.2.0")),
+        // SwiftNIO: core abstractions (ByteBuffer, Channel, EventLoop).
+        // Apache-2.0 — compatible with App Store distribution.
+        .package(url: "https://github.com/apple/swift-nio.git", .upToNextMajor(from: "2.65.0")),
+        // NIOTransportServices: Network.framework-backed NIO transport (Apple-only).
+        // Apache-2.0 — compatible with App Store distribution.
+        .package(
+            url: "https://github.com/apple/swift-nio-transport-services.git",
+            .upToNextMajor(from: "1.21.0")
+        ),
     ],
     targets: [
         .target(
@@ -55,6 +64,19 @@ let package = Package(
             name: "AMSMB2",
             dependencies: [
                 "libsmb2",
+                // NIOCore and NIOTransportServices are Apple-only; the Linux build uses the
+                // legacy libsmb2-owned TCP path and never references Network.framework symbols.
+                // All NIO usage in AMSMB2 source files is guarded by #if canImport(Network).
+                .product(
+                    name: "NIOCore",
+                    package: "swift-nio",
+                    condition: .when(platforms: [.macOS, .iOS, .tvOS, .watchOS, .visionOS, .macCatalyst])
+                ),
+                .product(
+                    name: "NIOTransportServices",
+                    package: "swift-nio-transport-services",
+                    condition: .when(platforms: [.macOS, .iOS, .tvOS, .watchOS, .visionOS, .macCatalyst])
+                ),
             ],
             path: "AMSMB2"
         ),
@@ -63,6 +85,19 @@ let package = Package(
             dependencies: [
                 "AMSMB2",
                 .product(name: "Atomics", package: "swift-atomics"),
+                // Mirror the AMSMB2 target's NIO deps so test files can import NIOCore /
+                // NIOTransportServices directly (e.g. NIODependencyTests). Platform-guarded
+                // identically; no NIO on Linux.
+                .product(
+                    name: "NIOCore",
+                    package: "swift-nio",
+                    condition: .when(platforms: [.macOS, .iOS, .tvOS, .watchOS, .visionOS, .macCatalyst])
+                ),
+                .product(
+                    name: "NIOTransportServices",
+                    package: "swift-nio-transport-services",
+                    condition: .when(platforms: [.macOS, .iOS, .tvOS, .watchOS, .visionOS, .macCatalyst])
+                ),
             ],
             path: "AMSMB2Tests"
         ),
