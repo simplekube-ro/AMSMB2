@@ -84,6 +84,11 @@ extension point for QUIC — without changing the public `SMB2Manager` API.
 
 - **`.gitmodules` / submodule pin**: `Dependencies/libsmb2` retargeted to `simplekube-ro/libsmb2`,
   pinned to a commit with `smb2_set_transport`.
+- **`AMSMB2/Parsers.swift`**: `Array<SMB2Share>.init(_ container:)` adapted to the fork's
+  renamed srvsvc types (`srvsvc_SHARE_INFO_1_CONTAINER`, `EntriesRead`, `ses.ShareEnum.Level1`,
+  `char *` pointer fields) because the pinned fork `master` carries a srvsvc DCE/RPC refactor
+  alongside the transport API. Null NDR referents for `netname`/`remark` are guarded via
+  `UnsafePointer<CChar>(bitPattern:)`. Two unit tests cover this guard.
 - **`Package.swift`**: adds `swift-nio` (`NIOCore`, `NIOPosix` for tests if needed) and
   `swift-nio-transport-services` (`NIOTransportServices`) to the `AMSMB2` target.
 - **New files** (Apple-guarded where noted): `SMBTransport.swift` (protocol + kind),

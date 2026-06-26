@@ -31,14 +31,28 @@ extension Array where Element == SMB2Share {
 
     // srvsvc_SHARE_INFO_1_CONTAINER is the fork's replacement for the upstream's
     // srvsvc_SHARE_INFO_1_carray: same share_info_1 pointer, EntriesRead for count.
+    //
+    // netname and remark are PTR_UNIQUE NDR referents: the C decoder (lib/dcerpc-srvsvc.c)
+    // calls calloc-zeroed smb2_alloc_data for each entry, then decodes each field via
+    // ndr_decode_ptr.  When the server sends a null referent ID (legal for remark, and
+    // defensively also handled for netname), ndr_decode_ptr returns early leaving the field
+    // as the calloc zero — i.e. a null char *.
+    //
+    // Swift imports unannoted char * struct fields as non-optional UnsafeMutablePointer<CChar>,
+    // so we cannot use .map on the pointer directly.  Instead we use
+    // UnsafePointer<CChar>.init?(bitPattern:), whose Optional initialiser returns nil when the
+    // address is zero, matching the .map(String.init(cString:)) ?? "" convention used
+    // throughout Context.swift (lines 341-377).
     init(_ container: srvsvc_SHARE_INFO_1_CONTAINER) {
         self = [srvsvc_SHARE_INFO_1](
             UnsafeBufferPointer(start: container.share_info_1, count: Int(container.EntriesRead))
-        ).map {
+        ).map { info in
             SMB2Share(
-                name: .init(cString: $0.netname),
-                props: .init(rawValue: $0.type),
-                comment: .init(cString: $0.remark)
+                name: UnsafePointer<CChar>(bitPattern: UInt(bitPattern: info.netname))
+                    .map(String.init(cString:)) ?? "",
+                props: .init(rawValue: info.type),
+                comment: UnsafePointer<CChar>(bitPattern: UInt(bitPattern: info.remark))
+                    .map(String.init(cString:)) ?? ""
             )
         }
     }

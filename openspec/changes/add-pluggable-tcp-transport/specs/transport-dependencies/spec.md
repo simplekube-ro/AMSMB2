@@ -6,7 +6,12 @@ The `Dependencies/libsmb2` submodule SHALL point at `simplekube-ro/libsmb2` and 
 commit whose public umbrella header declares `smb2_set_transport`,
 `struct smb2_external_transport`, `SMB2_TRANSPORT_TCP/QUIC/AUTO`, `smb2_get_timeout`, and
 `smb2_service_timeout`. A fresh clone plus `git submodule update --init` plus
-`swift build --disable-sandbox` SHALL succeed with no AMSMB2 Swift source changes required.
+`swift build --disable-sandbox` SHALL succeed. The pinned fork `master` (944f7d1) carries a
+srvsvc DCE/RPC API rename beyond the transport additions (upstream `srvsvc_SHARE_INFO_1_carray`
+→ `srvsvc_SHARE_INFO_1_CONTAINER`, inline char arrays → nullable `char *`, `max_count` →
+`EntriesRead`), so `AMSMB2/Parsers.swift` requires a corresponding adaptation — specifically
+`Array<SMB2Share>.init(_ container:)` — to compile against the fork. This adaptation is the
+only required AMSMB2 Swift source change for this task.
 
 #### Scenario: Submodule URL retargeted
 
@@ -18,8 +23,10 @@ commit whose public umbrella header declares `smb2_set_transport`,
 
 - **WHEN** the submodule is initialized and `swift build --disable-sandbox` then
   `swift test --disable-sandbox` are run
-- **THEN** the build succeeds
+- **THEN** the build succeeds (including the adapted `Parsers.swift` for the fork's srvsvc API)
 - **AND** the existing unit-test suite passes (integration tests skip without a server)
+- **AND** the two new null-NDR-referent regression tests (`testShareContainerWithNullRemark`,
+  `testShareContainerWithNullNetname`) pass
 
 ### Requirement: External-transport C symbols are importable from the Swift SMB2 module
 
