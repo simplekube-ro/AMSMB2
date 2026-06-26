@@ -133,6 +133,14 @@ make cleanlinuxtest   # Clean Docker build
 
 ## License
 
-The source code in this repository is MIT licensed. However, it links to [libsmb2](https://github.com/sahlberg/libsmb2) which is LGPL v2.1. The library is configured as a **dynamic** framework (`.dynamic` in Package.swift) to comply with LGPL requirements for App Store distribution.
+The source code in this repository is MIT licensed. However, it links to third-party libraries under different licenses — see the table below.
 
-You **must** link this library dynamically if you distribute your app on the App Store.
+You **must** link this library dynamically if you distribute your app on the App Store (required by LGPL v2.1).
+
+### Third-Party Licenses
+
+| Library | License | Notes |
+|---------|---------|-------|
+| [libsmb2](https://github.com/simplekube-ro/libsmb2) (fork of [sahlberg/libsmb2](https://github.com/sahlberg/libsmb2)) | LGPL v2.1 | Requires dynamic linking for App Store distribution. The framework is configured as `.dynamic` in `Package.swift` to comply. |
+| [SwiftNIO](https://github.com/apple/swift-nio) | Apache-2.0 | Compatible with App Store distribution. Apple-platform only (guarded by `#if canImport(Network)`). |
+| [swift-nio-transport-services](https://github.com/apple/swift-nio-transport-services) | Apache-2.0 | Network.framework-backed NIO transport. Apple-platform only. Compatible with App Store distribution. |
