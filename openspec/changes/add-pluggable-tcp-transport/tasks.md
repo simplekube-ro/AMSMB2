@@ -12,9 +12,9 @@ test from the linked spec scenario first); config/manifest tasks are TDD-exempt 
 
 ## T2 — Expose transport C symbols to the Swift SMB2 module (#21) [transport-dependencies]
 
-- [ ] 2.1 Verify `smb2_set_transport`, `smb2_external_transport`, `SMB2_TRANSPORT_TCP/QUIC/AUTO`, `smb2_get_timeout`, `smb2_service_timeout` import from `import SMB2`; fix the C target modulemap / umbrella header / include settings if any symbol is missing
-- [ ] 2.2 (TDD) Add a Swift smoke test in the test target (`import SMB2`) referencing all five symbols + every `smb2_external_transport` field, and asserting `SMB2_TRANSPORT_TCP==0`, `QUIC==1`, `AUTO==2`
-- [ ] 2.3 Verify `swift build --disable-sandbox` and `swift test --disable-sandbox` pass
+- [x] 2.1 Verify `smb2_set_transport`, `smb2_external_transport`, `SMB2_TRANSPORT_TCP/QUIC/AUTO`, `smb2_get_timeout`, `smb2_service_timeout` import from `import SMB2`; fix the C target modulemap / umbrella header / include settings if any symbol is missing
+- [x] 2.2 (TDD) Add a Swift smoke test in the test target (`import SMB2`) referencing all five symbols + every `smb2_external_transport` field, and asserting `SMB2_TRANSPORT_TCP==0`, `QUIC==1`, `AUTO==2`
+- [x] 2.3 Verify `swift build --disable-sandbox` and `swift test --disable-sandbox` pass
 
 ## T3 — Add SwiftNIO + NIOTransportServices to Package.swift, Apple-guarded (#22) [transport-dependencies]
 
