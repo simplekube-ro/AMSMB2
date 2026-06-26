@@ -85,3 +85,17 @@ The fork adds these symbols visible via `import SMB2`:
 
 **Naming trap**: To route through the external transport seam, use `SMB2_TRANSPORT_QUIC` or
 `SMB2_TRANSPORT_AUTO` — never `SMB2_TRANSPORT_TCP` which selects libsmb2's built-in socket.
+
+**Swift signatures** (as imported by Swift 6):
+```swift
+smb2_set_transport:    @Sendable (UnsafeMutablePointer<smb2_context>?, Int32, UnsafePointer<smb2_external_transport>?) -> Int32
+smb2_get_timeout:      @Sendable (UnsafeMutablePointer<smb2_context>?, UnsafeMutablePointer<timeval>?) -> Int32
+smb2_service_timeout:  @Sendable (UnsafeMutablePointer<smb2_context>?) -> Int32
+```
+
+**Module map note**: `Dependencies/libsmb2/include/module.modulemap` already includes
+`smb2/libsmb2.h` in the `SMB2.LibSMB2` submodule — no module map changes are needed to
+expose transport-seam symbols. Tests access these via `import SMB2` transitively.
+
+**Smoke test**: `AMSMB2Tests/SMB2TransportSymbolTests.swift` — compile-time + runtime
+regression guard for all five transport symbols and all struct fields.
