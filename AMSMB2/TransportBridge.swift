@@ -175,10 +175,14 @@ final class TransportBridge: @unchecked Sendable {
     /// **Lifetime contract**: `passRetained(self)` produces a +1 reference that libsmb2 owns
     /// via `ext.userdata`. The C `close` trampoline below calls `takeRetainedValue()` to consume
     /// that +1 exactly once. The underlying `ext_close` implementation in transport-external.c
-    /// uses once-semantics (clears `ext.close` and `ext.userdata` before invoking the callback),
-    /// so `takeRetainedValue()` is guaranteed to fire at most once even when libsmb2's destroy
-    /// path calls `ext_close` from multiple places (e.g. `smb2_destroy_context` directly and
-    /// again from `negotiate_cb → smb2_close_context → ext_close` within the waitqueue drain).
+    /// uses once-semantics by clearing `ext.close` before invoking the callback (it intentionally
+    /// leaves `ext.userdata` live), so `takeRetainedValue()` is guaranteed to fire at most once even
+    /// when libsmb2's destroy path calls `ext_close` from multiple places (e.g. `smb2_destroy_context`
+    /// directly and again from `negotiate_cb → smb2_close_context → ext_close` within the waitqueue
+    /// drain): the second call sees a NULL `ext.close` and returns without re-invoking us. After
+    /// close, `ext_close` sets `ext_connected = 0` and the C recv/send leaves return `EAGAIN` instead
+    /// of calling our trampolines, so the now-released bridge behind `ext.userdata` is never
+    /// dereferenced.
     ///
     /// - Important: Call exactly once per bridge instance.
     func makeExternalTransport() -> smb2_external_transport {
@@ -215,8 +219,10 @@ final class TransportBridge: @unchecked Sendable {
         ext.close = { userdata -> Int32 in
             guard let userdata else { return 0 }
             // `takeRetainedValue()` consumes the `passRetained` from `makeExternalTransport()`.
-            // ext_close (C) already cleared ext.userdata before calling us, so this closure
-            // fires at most once per bridge — no double-takeRetainedValue risk.
+            // ext_close (C) clears `ext.close` before calling us (once-semantics), so this closure
+            // fires at most once per bridge — no double-takeRetainedValue risk. `ext.userdata` is
+            // left live, but post-close recv/send are blocked by the C `ext_connected` guard, so the
+            // bridge released here is never dereferenced afterwards.
             let bridge = Unmanaged<TransportBridge>.fromOpaque(userdata).takeRetainedValue()
             bridge.close()
             return 0
