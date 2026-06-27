@@ -222,28 +222,35 @@ final class SMB2ServicingLoopTests: XCTestCase, @unchecked Sendable {
         }
     }
 
-    /// WHEN `connect(transportKind: .tcp)` is called
-    /// THEN it routes through the seam (TCPTransportApple stub) and fails without hanging.
+    /// WHEN the eager seam connect (fix-seam-connect-ordering) targets an unreachable endpoint
+    /// through a real `TCPTransportApple`
+    /// THEN it fails with a thrown `POSIXError` bounded by the transport's connect timeout —
+    /// it neither hangs nor surfaces the old downstream `EPERM` symptom.
     ///
-    /// The TCPTransportApple stub throws ENOTSUP from `connect()`. The bridge's inbound pump
-    /// propagates the error, causing `serviceContextForSeam` to detect a recv failure and
-    /// abort the operation. No hang; any POSIXError (or ETIMEDOUT) is acceptable.
-    func testConnectWithTCPKindRoutesToSeamAndFails() async throws {
-        let client = try SMB2Client(timeout: 2)
+    /// Post-#26 `TCPTransportApple` is a real NIO transport (no stub). The connect now happens
+    /// eagerly in `connectWithBridge` *before* the handshake, so an unreachable endpoint surfaces
+    /// as the transport's own `connect` error rather than a downstream servicing-loop abort. A
+    /// 1 s connect timeout keeps the test deterministic regardless of how the host environment
+    /// treats the dead address (refuse vs. black-hole).
+    func testEagerSeamConnectToUnreachableEndpointFailsFast() async throws {
+        let client = try SMB2Client(timeout: 5)
+        // Real NIO transport, short connect timeout so the failure is bounded and deterministic.
+        let transport = TCPTransportApple(connectTimeoutSeconds: 1)
+        let bridge = TransportBridge(transport: transport)
 
         let start = Date()
         do {
-            try await client.connect(
-                server: "testserver", share: "testshare", user: "testuser",
-                transportKind: .tcp
+            // 127.0.0.1:1 has no listener; the connect either refuses or times out within 1 s.
+            try await client.connectWithBridge(
+                server: "127.0.0.1:1", share: "testshare", user: "testuser", bridge: bridge
             )
-            XCTFail("Expected failure: TCPTransportApple stub does not speak SMB2")
-        } catch {
+            XCTFail("Expected failure: connecting to a dead endpoint must throw")
+        } catch let posixError as POSIXError {
             let elapsed = Date().timeIntervalSince(start)
             XCTAssertLessThan(elapsed, 5.0,
-                "seam connect via tcp kind must not hang; elapsed \(elapsed)s")
-            XCTAssertFalse(error is CancellationError,
-                "expected transport/timeout error, not CancellationError")
+                "eager seam connect must not hang; elapsed \(elapsed)s")
+            XCTAssertNotEqual(posixError.code, .EPERM,
+                "must surface the transport connect error, not the old downstream EPERM symptom")
         }
     }
 

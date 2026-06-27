@@ -104,10 +104,23 @@ public final class SMB2Client: CustomDebugStringConvertible, CustomReflectable, 
     let eventLoopQueue: DispatchQueue
 
     /// Used to detect re-entrant calls to the event loop queue and avoid deadlocks.
+    // Immutable process-wide identity token, set once at static init and never mutated; the per-queue
+    // boolean lives in DispatchQueue specific storage, not the key (design D-3). On Apple platforms
+    // `DispatchSpecificKey` is `Sendable`, so a plain `let` is concurrency-safe; on Linux (swift 6.1)
+    // it is not yet `Sendable`, so `nonisolated(unsafe)` launders the safe-but-unconformed token.
+    #if canImport(Darwin)
     private static let queueKey = DispatchSpecificKey<Bool>()
+    #else
+    private static nonisolated(unsafe) let queueKey = DispatchSpecificKey<Bool>()
+    #endif
 
-    /// DispatchSource-based socket monitor, created after connect.
+    /// DispatchSource-based socket monitor, created after connect. This is the legacy
+    /// libsmb2-owned TCP path. On Apple the NIO transport seam replaces it entirely, so it is
+    /// compiled only on non-`Network` platforms (Linux). See the `#else` branches throughout
+    /// this file that pair with `#if canImport(Network)` for the seam.
+    #if !canImport(Network)
     private var socketMonitor: SocketMonitor?
+    #endif
 
     #if canImport(Network)
     /// The bridge active when an external-transport seam is in use. Nil on the legacy path.
@@ -142,10 +155,11 @@ public final class SMB2Client: CustomDebugStringConvertible, CustomReflectable, 
     /// All teardown runs on the event loop queue so that SocketMonitor.cancel() and
     /// smb2_destroy_context() are serialized with any in-flight I/O callbacks.
     private func shutdown() {
-        socketMonitor?.cancel()
-        socketMonitor = nil
         #if canImport(Network)
         teardownSeam()
+        #else
+        socketMonitor?.cancel()
+        socketMonitor = nil
         #endif
         failAllPendingOperations(with: POSIXError(.ECANCELED))
         if let ctx = context {
@@ -222,6 +236,10 @@ public final class SMB2Client: CustomDebugStringConvertible, CustomReflectable, 
 // MARK: - Socket Monitor
 
 extension SMB2Client {
+    // The legacy DispatchSource socket-monitoring path drives libsmb2's built-in TCP socket.
+    // On Apple the seam (no-fd servicing loop) replaces it, so this whole block compiles only
+    // on non-`Network` platforms (Linux). Guard-not-delete: Linux is the sole remaining consumer.
+    #if !canImport(Network)
     /// Monitors a socket file descriptor using `DispatchSource`.
     /// All methods must be called on the event loop queue.
     private final class SocketMonitor {
@@ -322,18 +340,20 @@ extension SMB2Client {
         socketMonitor?.cancel()
         socketMonitor = nil
     }
+    #endif // !canImport(Network)
 
-    /// Routes post-operation servicing to the correct path: legacy `SocketMonitor` (fd-based)
-    /// or the seam no-fd loop. Must be called on `eventLoopQueue`.
+    /// Routes post-operation servicing to the correct path: the seam no-fd loop (Apple) or the
+    /// legacy `SocketMonitor` (fd-based, non-`Network` platforms). Must be called on
+    /// `eventLoopQueue`.
     private func activateServicingAfterOperation(context: UnsafeMutablePointer<smb2_context>) {
         #if canImport(Network)
         if transportBridge != nil {
             flushOutboundForSeam(context: context)
             scheduleSeamTimeout()
-            return
         }
-        #endif
+        #else
         socketMonitor?.activateWriteSourceIfNeeded(context: context)
+        #endif
     }
 
     /// Fails all in-flight operations. `isAbandoned` is set before resuming so that
@@ -533,6 +553,9 @@ extension SMB2Client {
 // MARK: Connectivity
 
 extension SMB2Client {
+    #if !canImport(Network)
+    /// Legacy libsmb2-owned TCP connect. Compiled only on non-`Network` platforms (Linux); on
+    /// Apple `connect(server:share:user:transportKind:)` (the seam) is the sole connect path.
     func connect(server: String, share: String, user: String) async throws {
         // Connect uses a temporary poll loop on the event loop queue because
         // DispatchSource can't be created until the socket fd exists.
@@ -562,6 +585,7 @@ extension SMB2Client {
             }
         }
     }
+    #endif // !canImport(Network)
 
     func disconnect() async {
         // Send a best-effort disconnect PDU and tear down in one atomic block
@@ -569,21 +593,19 @@ extension SMB2Client {
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             self.eventLoopQueue.async {
                 #if canImport(Network)
+                // Apple: the seam is the only transport. fd is always -1; the disconnect PDU
+                // (when a seam is live) is queued via the outbound FIFO and flushed before
+                // teardown.
                 if self.seamConnected, let context = self.context {
-                    // Seam path: fd is always -1; best-effort disconnect PDU via outbound FIFO.
                     smb2_disconnect_share_async(context, SMB2Client.generic_handler_noop, nil)
                     self.flushOutboundForSeam(context: context)
-                    self.teardownSeam()
-                    self.failAllPendingOperations(with: POSIXError(.ENOTCONN))
-                    continuation.resume()
-                    return
                 }
-                #endif
+                self.teardownSeam()
+                self.failAllPendingOperations(with: POSIXError(.ENOTCONN))
+                continuation.resume()
+                #else
                 guard let context = self.context, smb2_get_fd(context) >= 0 else {
                     self.stopSocketMonitoring()
-                    #if canImport(Network)
-                    self.teardownSeam()
-                    #endif
                     self.failAllPendingOperations(with: POSIXError(.ENOTCONN))
                     continuation.resume()
                     return
@@ -593,6 +615,7 @@ extension SMB2Client {
                 self.stopSocketMonitoring()
                 self.failAllPendingOperations(with: POSIXError(.ENOTCONN))
                 continuation.resume()
+                #endif
             }
         }
     }
@@ -728,8 +751,11 @@ extension SMB2Client {
         /// Set to `true` when the caller has timed out, the connection was dropped,
         /// or the callback has already fired. Prevents double-resume of the continuation.
         var isAbandoned = false
-        /// Set to `true` by `generic_handler`. Used by `pollUntilComplete` (connect path)
-        /// where continuations are not yet available.
+        /// Set to `true` by the shared `generic_handler` (used by BOTH the legacy and seam
+        /// connect paths). Consumed only by `pollUntilComplete` on the legacy/Linux connect
+        /// path; on Apple (seam) the field is write-only — the seam servicing loop drives the
+        /// handshake via the stored continuation instead. Intentionally left unguarded so the
+        /// shared handler does not need a platform branch.
         var isFinished = false
         var status: NTStatus {
             NTStatus(rawValue: result)
@@ -743,8 +769,10 @@ extension SMB2Client {
         var cleanup: (() -> Void)?
     }
 
-    /// Poll loop used only during `connect()`, before DispatchSource monitoring is running.
-    /// Runs synchronously on the event loop queue.
+    #if !canImport(Network)
+    /// Poll loop used only during the legacy `connect()`, before DispatchSource monitoring is
+    /// running. Runs synchronously on the event loop queue. Compiled only on non-`Network`
+    /// platforms (Linux); the Apple seam drives its handshake through the no-fd servicing loop.
     private func pollUntilComplete(_ cb: CBData) throws {
         let startDate = Date()
         while cb.error == nil && !cb.isFinished {
@@ -775,6 +803,7 @@ extension SMB2Client {
         }
         if let error = cb.error { throw error }
     }
+    #endif // !canImport(Network)
 
     /// Callback invoked by libsmb2 when an async operation completes (on the event loop queue).
     /// `takeRetainedValue()` balances the `passRetained()` performed at setup.
@@ -842,20 +871,26 @@ extension SMB2Client {
                 dataHandlerError = error
             }
         }
-        // passRetained keeps CBData alive until generic_handler calls takeRetainedValue().
-        let cbPtr = Unmanaged.passRetained(cb).toOpaque()
         let cbId = ObjectIdentifier(cb)
+        // nonisolated(unsafe): `handler` must cross into the @Sendable block but is invoked exactly
+        // once, on eventLoopQueue — the serial owner of smb2_context. Confinement makes the crossing
+        // race-free; this asserts it rather than introducing shared-mutable state (design D-2).
+        nonisolated(unsafe) let confinedHandler = handler
 
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
                 self.eventLoopQueue.async {
+                    // Construct the opaque pointer locally to avoid capturing a non-Sendable
+                    // UnsafeMutableRawPointer across the @Sendable boundary (see connectWithBridge).
+                    // passRetained keeps CBData alive until generic_handler calls takeRetainedValue().
+                    let cbPtr = Unmanaged.passRetained(cb).toOpaque()
                     guard let context = self.context else {
                         Unmanaged<CBData>.fromOpaque(cbPtr).release()
                         continuation.resume(throwing: POSIXError(.ENOTCONN))
                         return
                     }
                     do {
-                        let result = try handler(context, cbPtr)
+                        let result = try confinedHandler(context, cbPtr)
                         try POSIXError.throwIfError(result, description: self.error)
                         cb.continuation = continuation
                         // Check if cancellation arrived before this block ran.
@@ -936,19 +971,26 @@ extension SMB2Client {
                 dataHandlerError = error
             }
         }
-        let cbPtr = Unmanaged.passRetained(cb).toOpaque()
         let cbId = ObjectIdentifier(cb)
+        // nonisolated(unsafe): `handler` must cross into the @Sendable block but is invoked exactly
+        // once, on eventLoopQueue — the serial owner of smb2_context. Confinement makes the crossing
+        // race-free; this asserts it rather than introducing shared-mutable state (design D-2).
+        nonisolated(unsafe) let confinedHandler = handler
 
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
                 self.eventLoopQueue.async {
+                    // Construct the opaque pointer locally to avoid capturing a non-Sendable
+                    // UnsafeMutableRawPointer across the @Sendable boundary (see connectWithBridge).
+                    // passRetained keeps CBData alive until generic_handler calls takeRetainedValue().
+                    let cbPtr = Unmanaged.passRetained(cb).toOpaque()
                     guard let context = self.context else {
                         Unmanaged<CBData>.fromOpaque(cbPtr).release()
                         continuation.resume(throwing: POSIXError(.ENOTCONN))
                         return
                     }
                     do {
-                        let pdu = try handler(context, cbPtr).unwrap()
+                        let pdu = try confinedHandler(context, cbPtr).unwrap()
                         smb2_queue_pdu(context, pdu)
                         cb.continuation = continuation
                         // Check if cancellation arrived before this block ran.
@@ -1016,8 +1058,7 @@ extension SMB2Client {
     /// the bridge via `smb2_set_transport(AUTO, ext)` before `smb2_connect_share_async`,
     /// and drives the handshake through the no-fd servicing loop rather than `pollUntilComplete`.
     ///
-    /// - Note: `TCPTransportApple` (the `tcp`/`automatic` conformer) is implemented in T7 (#26).
-    ///   Until then this throws `POSIXError(.ENOTSUP)` for those cases via the stub transport.
+    /// The `tcp`/`automatic` conformer is `TCPTransportApple` (NIOTransportServices).
     func connect(
         server: String, share: String, user: String,
         transportKind: SMBTransportKind
@@ -1025,13 +1066,73 @@ extension SMB2Client {
         let transport: any SMBTransport
         switch transportKind {
         case .tcp, .automatic:
-            // TCPTransportApple stub (full NIO implementation comes in T7 #26).
             transport = TCPTransportApple()
         case .quic:
             throw POSIXError(.ENOTSUP, description: "QUIC transport not yet implemented")
         }
         let bridge = TransportBridge(transport: transport)
         try await connectWithBridge(server: server, share: share, user: user, bridge: bridge)
+    }
+
+    // MARK: Seam endpoint parsing (mirrors libsmb2 ext_connect)
+
+    /// Parses a libsmb2 `server` string into `(host, port)`, mirroring `ext_connect`
+    /// (`Dependencies/libsmb2/lib/transport-external.c`) byte-for-byte so the eager Swift
+    /// connect targets the exact endpoint libsmb2 would have parsed:
+    /// - A leading `[` marks an IPv6 literal; the host runs to the matching `]`. A missing `]`
+    ///   throws `POSIXError(.EINVAL)`.
+    /// - After the optional `]`, the **first** `:` separates host from port; the remainder is the
+    ///   port (leading decimal digits, à la `strtol(..., 10)`; `0` when absent/non-numeric).
+    /// - No `:` → default port `445`. No DNS resolution — the host is handed over verbatim.
+    static func parseSeamEndpoint(_ server: String) throws -> (host: String, port: Int) {
+        if server.first == "[" {
+            // IPv6 literal in `[...]` form.
+            let afterBracket = server.dropFirst()
+            guard let closeIndex = afterBracket.firstIndex(of: "]") else {
+                throw POSIXError(.EINVAL,
+                    description: "Invalid address: \(server): Missing ']' in IPv6 address")
+            }
+            let host = String(afterBracket[afterBracket.startIndex..<closeIndex])
+            let rest = afterBracket[afterBracket.index(after: closeIndex)...]
+            if let colonIndex = rest.firstIndex(of: ":") {
+                return (host, parseLeadingPort(rest[rest.index(after: colonIndex)...]))
+            }
+            return (host, 445)
+        }
+
+        // Non-IPv6: split host at the first `:`.
+        if let colonIndex = server.firstIndex(of: ":") {
+            let host = String(server[server.startIndex..<colonIndex])
+            return (host, parseLeadingPort(server[server.index(after: colonIndex)...]))
+        }
+
+        return (server, 445)
+    }
+
+    /// Parses leading decimal digits from `text`, mirroring C `strtol(text, NULL, 10)`:
+    /// returns `0` when no leading digit is present.
+    private static func parseLeadingPort(_ text: Substring) -> Int {
+        var port = 0
+        var sawDigit = false
+        for character in text {
+            guard let value = character.wholeNumberValue,
+                  character.isASCII, value >= 0, value <= 9
+            else { break }
+            port = port * 10 + value
+            sawDigit = true
+        }
+        return sawDigit ? port : 0
+    }
+
+    /// Maps a transport `connect` failure to a `POSIXError`. Already-`POSIXError` and
+    /// `CancellationError` values pass through unchanged (preserving the precise mapping
+    /// `TCPTransportApple` produces and cancellation semantics); anything else is wrapped as
+    /// `ECONNREFUSED` so callers never see a raw transport error.
+    static func mapTransportConnectError(_ error: any Error) -> any Error {
+        if error is POSIXError || error is CancellationError {
+            return error
+        }
+        return POSIXError(.ECONNREFUSED, description: "Transport connect failed: \(error)")
     }
 
     // MARK: Bridge-based connect (internal, testable with MockTransport)
@@ -1052,6 +1153,19 @@ extension SMB2Client {
     ) async throws {
         try Task.checkCancellation()
 
+        // Eager connect (fix-seam-connect-ordering): establish the transport BEFORE libsmb2
+        // begins the handshake. `ext_connect` fires NEGOTIATE synchronously on a `>= 0` return,
+        // so the channel must be live first or the first send()/receive() fails with ENOTCONN.
+        // This `await` runs on the caller's task — never on `eventLoopQueue` — so it blocks no
+        // serialized work. A connect failure surfaces here as a thrown `POSIXError`, with no
+        // libsmb2 operation registered and the bridge/transport never installed.
+        let endpoint = try Self.parseSeamEndpoint(server)
+        do {
+            try await bridge.connect(host: endpoint.host, port: endpoint.port)
+        } catch {
+            throw Self.mapTransportConnectError(error)
+        }
+
         // `cbPtr` (UnsafeMutableRawPointer) is constructed INSIDE the eventLoopQueue.async
         // block — a local variable rather than a captured binding — so it does not trigger the
         // Swift 6 @SendableClosureCaptures warning that affects the legacy async_await functions.
@@ -1068,6 +1182,10 @@ extension SMB2Client {
                     let cbPtr = Unmanaged.passRetained(cb).toOpaque()
 
                     guard let context = self.context else {
+                        // The transport was already connected eagerly above; close it so the
+                        // live channel does not leak (the C close trampoline is not wired yet —
+                        // makeExternalTransport() has not run).
+                        bridge.close()
                         Unmanaged<CBData>.fromOpaque(cbPtr).release()
                         continuation.resume(throwing: POSIXError(.ENOTCONN))
                         return
@@ -1083,7 +1201,11 @@ extension SMB2Client {
                     guard transportResult == 0 else {
                         // smb2_set_transport failed: libsmb2 did NOT install our ext struct,
                         // so the C close trampoline will never fire. Manually balance the
-                        // passRetained that makeExternalTransport() performed on the bridge.
+                        // passRetained that makeExternalTransport() performed on the bridge,
+                        // and close the eagerly-connected transport so the channel does not leak.
+                        // bridge.close() touches only the transport/pumps — no double-release of
+                        // the Unmanaged below.
+                        bridge.close()
                         Unmanaged<TransportBridge>.fromOpaque(ext.userdata!).release()
                         Unmanaged<CBData>.fromOpaque(cbPtr).release()
                         continuation.resume(throwing: POSIXError(.EINVAL,
