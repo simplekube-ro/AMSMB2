@@ -224,8 +224,10 @@ tests).
    seam) — connect, NTLM auth, directory listing, large read, large write, cancel/timeout — and
    confirm identical outcomes; add a CI leg exercising the seam.
 3. **Flip (T9, #28)**: only after #27 is green, make `TCPTransportApple` the Apple default and
-   **delete** the now-dead Apple `SocketMonitor`/`DispatchSource` read/write sources and fd
-   servicing (CLAUDE.md same-task dead-code rule). Linux retains the legacy path under `#if`.
+   **compile-out** the now-dead Apple `SocketMonitor`/`DispatchSource` read/write sources and fd
+   servicing by moving them under `#else` of `#if canImport(Network)` (guard-not-delete: Linux
+   retains the legacy path under the same `#if`, so the symbols must survive there — CLAUDE.md
+   same-task dead-code rule means no orphaned references on Apple).
 
 ### D9 — NIO in the main target
 
@@ -257,9 +259,10 @@ production code; `NIOPosix` is added only if a test needs `EmbeddedChannel`/loop
 
 ## Migration
 
-No consumer migration. Internally: T9 removes the Apple legacy `SocketMonitor`/`DispatchSource`
-code in the same task that flips the default; Linux behavior is unchanged. The public `SMB2Manager`
-API is identical before and after.
+No consumer migration. Internally: T9 compiles-out the Apple legacy `SocketMonitor`/`DispatchSource`
+code (guarded under `#else` of `#if canImport(Network)`, Linux retains it) in the same task that
+flips the default; Linux behavior is unchanged. The public `SMB2Manager` API is identical before and
+after.
 
 ## Open Questions
 

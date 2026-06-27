@@ -7,10 +7,20 @@
 //
 
 import XCTest
+#if !canImport(Darwin)
+// On Linux, URLCredential lives in FoundationNetworking, not Foundation. Matches the library's
+// import block (AMSMB2.swift) and the other URLCredential-using test files (TestUtilities, …).
+import FoundationNetworking
+#endif
 
 @testable import AMSMB2
 
 class SMB2ManagerUnitTests: XCTestCase, @unchecked Sendable {
+    // NSKeyedArchiver/NSKeyedUnarchiver secure-coding round-trip is an Apple persistence mechanism;
+    // swift-corelibs-foundation's unarchiver fatally aborts (.raiseException) on the intentionally
+    // unserialized password key, so this test is Apple-only. JSON Codable is covered by testCoding
+    // on all platforms.
+    #if canImport(Darwin)
     @available(iOS 11.0, macOS 10.13, tvOS 11.0, *)
     func testNSCodable() {
         let url = URL(string: "smb://192.168.1.1/share")!
@@ -34,6 +44,7 @@ class SMB2ManagerUnitTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(smb?.timeout, decodedSMB?.timeout)
         XCTAssertNil(unarchiver.error)
     }
+    #endif
 
     func testCoding() {
         let url = URL(string: "smb://192.168.1.1/share")!
@@ -115,6 +126,10 @@ class SMB2ManagerUnitTests: XCTestCase, @unchecked Sendable {
         XCTAssertNil(dict["password"], "Password must not survive a re-encode cycle")
     }
 
+    // Apple-only: NSKeyedUnarchiver secure-coding round-trip fatally aborts on
+    // swift-corelibs-foundation (see testNSCodable). The JSON-based testCodableOmitsPassword covers
+    // the password-redaction invariant on all platforms.
+    #if canImport(Darwin)
     @available(iOS 11.0, macOS 10.13, tvOS 11.0, *)
     func testNSCodingOmitsPassword() throws {
         let url = URL(string: "smb://192.168.1.1/share")!
@@ -137,6 +152,7 @@ class SMB2ManagerUnitTests: XCTestCase, @unchecked Sendable {
         let dict = try JSONSerialization.jsonObject(with: json) as! [String: Any]
         XCTAssertNil(dict["password"], "Password must not survive NSCoding round-trip")
     }
+    #endif
 
     func testDebugDescriptionRedactsCredentials() {
         let url = URL(string: "smb://192.168.1.1/share")!

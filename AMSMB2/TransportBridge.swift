@@ -64,6 +64,11 @@ final class TransportBridge: @unchecked Sendable {
     /// Set by `close()`. Causes `cRecv()` to return ECONNRESET and terminates pump tasks.
     private var isClosed = false
 
+    /// Set to `true` once `connect(host:port:)` has successfully established the transport.
+    /// The C `ext.connect` trampoline (`connectStatus()`) reports this as libsmb2's connect
+    /// result: a `>= 0` return is only emitted after the channel is live (fix-seam-connect-ordering).
+    private var isPreConnected = false
+
     // MARK: - Inbound-ready signal
 
     /// Called (from any thread) immediately after bytes, EOF, or an error are appended to the
@@ -185,14 +190,14 @@ final class TransportBridge: @unchecked Sendable {
         // Non-capturing closures assigned to C function pointer fields.
         // Each recovers the bridge from `userdata` via Unmanaged (design D5).
 
-        ext.connect = { userdata, host, port -> Int32 in
+        ext.connect = { userdata, _, _ -> Int32 in
             guard let userdata else { return -1 }
             let bridge = Unmanaged<TransportBridge>.fromOpaque(userdata).takeUnretainedValue()
-            bridge.kickConnect(
-                host: host.map { String(cString: $0) } ?? "",
-                port: Int(port)
-            )
-            return 0
+            // The transport is established eagerly by `connect(host:port:)` before libsmb2
+            // begins the handshake (fix-seam-connect-ordering). This trampoline only reports
+            // the already-known state; it does NOT initiate a second connect. The host/port
+            // libsmb2 parsed are ignored — Context.swift connected to the verbatim endpoint.
+            return bridge.connectStatus()
         }
 
         ext.send = { userdata, buf, len -> Int32 in
@@ -220,13 +225,40 @@ final class TransportBridge: @unchecked Sendable {
         return ext
     }
 
+    // MARK: - Eager connect (fix-seam-connect-ordering)
+
+    /// Establishes the underlying transport, awaiting the async `connect` to completion.
+    ///
+    /// Called by `connectWithBridge` on the caller's task — *before* the bridge is handed to
+    /// libsmb2 — so that by the time `ext.connect` fires NEGOTIATE the channel is already live.
+    /// On success `isPreConnected` is set so the C trampoline (`connectStatus()`) reports `0`.
+    /// A connect failure is rethrown (never swallowed) and leaves `isPreConnected` `false`.
+    ///
+    /// - Important: Call exactly once per bridge. The `ext.connect` trampoline performs no second
+    ///   connect — it only reports the state recorded here.
+    func connect(host: String, port: Int) async throws {
+        try await transport.connect(host: host, port: port)
+        // Synchronous helper wraps the lock — NSLock.lock() is unavailable in async bodies.
+        markPreConnected()
+    }
+
+    /// Synchronously records that the eager connect succeeded. Wraps the lock so it can be
+    /// called from the async `connect(host:port:)` body (CLAUDE.md: no `lock()` in async).
+    private func markPreConnected() {
+        lock.lock()
+        isPreConnected = true
+        lock.unlock()
+    }
+
     // MARK: - C callback implementations (internal for testability)
 
-    /// Called from the C connect trampoline. Fires `transport.connect(host:port:)` async.
-    /// The connect result is ignored here; T6's servicing loop handles connect errors.
-    func kickConnect(host: String, port: Int) {
-        let connectingTransport = transport
-        Task { try? await connectingTransport.connect(host: host, port: port) }
+    /// Called from the C connect trampoline. Reports the result of the eager
+    /// `connect(host:port:)` performed earlier: `0` when the transport is established,
+    /// `-ECONNREFUSED` otherwise. Performs NO connect itself.
+    func connectStatus() -> Int32 {
+        lock.lock()
+        defer { lock.unlock() }
+        return isPreConnected ? 0 : -ECONNREFUSED
     }
 
     /// Called from the C send trampoline. Copies bytes synchronously (design D4), enqueues.

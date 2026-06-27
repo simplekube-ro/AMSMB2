@@ -246,23 +246,36 @@ final class TransportBridgeTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(errno, ECONNRESET, "after close, recv must set errno = ECONNRESET")
     }
 
-    // MARK: - Scenario: connect trampoline does not crash
+    // MARK: - Scenario: connect trampoline reports state, never connects (ordering fix)
 
-    /// WHEN the C connect trampoline is invoked
-    /// THEN it returns 0 and asynchronously initiates transport.connect
-    func testConnectTrampolineReturnsZero() async throws {
+    /// WHEN the C connect trampoline is invoked BEFORE the transport has been connected
+    /// THEN it reports failure (`< 0`) — it must NOT claim "connected" prematurely
+    /// AND AFTER an eager `bridge.connect(...)` succeeds it reports success (`0`)
+    /// AND it never initiates a second transport connect (no double-connect).
+    ///
+    /// This pins the fix-seam-connect-ordering invariant: libsmb2's `ext_connect` only fires
+    /// NEGOTIATE on a `>= 0` return, so the trampoline may report success only after the channel
+    /// is live. The old `kickConnect` returned `0` unconditionally — the root-cause defect.
+    func testConnectTrampolineReportsStateOnly() async throws {
         let mock = MockTransport()
         let bridge = TransportBridge(transport: mock)
         let ext = bridge.makeExternalTransport()
         defer { _ = ext.close?(ext.userdata) }
 
-        let result: Int32 = "localhost".withCString { hostPtr in
+        // Before the eager connect: the trampoline must report failure, not premature success.
+        let before: Int32 = "localhost".withCString { hostPtr in
             ext.connect!(ext.userdata, hostPtr, 445)
         }
-        XCTAssertEqual(result, 0, "connect trampoline must return 0 (success)")
+        XCTAssertLessThan(before, 0, "trampoline must report failure before the transport connects")
 
-        // Allow async connect task to complete.
-        try await Task.sleep(nanoseconds: 20_000_000) // 20 ms
+        // Establish the transport eagerly (what connectWithBridge does on the caller's task).
+        try await bridge.connect(host: "localhost", port: 445)
+
+        // After the transport is live: the trampoline reports success.
+        let after: Int32 = "localhost".withCString { hostPtr in
+            ext.connect!(ext.userdata, hostPtr, 445)
+        }
+        XCTAssertEqual(after, 0, "trampoline must report success once the transport is connected")
     }
 
     // MARK: - Scenario: Round-trip through C callbacks via MockTransport (loopback)

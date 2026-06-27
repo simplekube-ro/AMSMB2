@@ -12,10 +12,13 @@
 //    AC2 - Inbound-ready signal from bridge triggers servicing on the event loop queue ✓
 //    AC3 - Connect path uses bridge-driven servicing (not poll(fd)); no hang on timeout ✓
 //    AC4 - Timer-driven servicing: smb2_get_timeout / smb2_service_timeout path is WIRED
-//          (smb2_set_timeout is called in connectWithBridge; full verification — i.e. an
-//          in-flight PDU aborted by smb2_service_timeout before the Swift asyncAfter fires —
-//          requires a real server and is deferred to T8 integration (#27)).
-//    AC5 - Cancellation tears down the seam servicing cleanly (no hang) ✓
+//          (smb2_set_timeout is called in connectWithBridge). A sub-second client timeout
+//          deterministically aborts via ETIMEDOUT and removes the pending operation
+//          (testTimeoutThrowsETIMEDOUTAndRemovesPendingOperation) ✓. Full verification that
+//          smb2_service_timeout aborts an in-flight PDU before the Swift asyncAfter fires
+//          requires a real server and is deferred to T8 integration (#27).
+//    AC5 - Cancellation throws CancellationError, tears down the seam, and removes the pending
+//          operation (testCancellationThrowsCancellationErrorAndTearsDownSeam) ✓
 //    AC6 - connect(transportKind:) opt-in surface is callable (quic → ENOTSUP, tcp/auto →
 //          TCPTransportApple stub → seam connect path) ✓
 //    AC7 - Legacy path (no seam) is byte-for-byte unchanged; existing unit tests stay green ✓
@@ -134,19 +137,15 @@ final class SMB2ServicingLoopTests: XCTestCase, @unchecked Sendable {
 
     /// WHEN a connect is in-flight against a never-replying MockTransport
     ///      AND the client timeout elapses
-    /// THEN the operation completes without hanging.
+    /// THEN the operation throws `POSIXError(.ETIMEDOUT)` and the pending operation is removed.
     ///
-    /// This test validates that the seam connect path does not hang when no SMB2 response
-    /// arrives. The completion path depends on which timer fires first:
-    ///   - The Swift asyncAfter (fires at `self.timeout` seconds) aborts via ETIMEDOUT.
-    ///   - The libsmb2 per-PDU timer (driven by `scheduleSeamTimeout` → `smb2_service_timeout`)
-    ///     fires at `max(1, ceil(self.timeout))` seconds and aborts via SMB2_STATUS_IO_TIMEOUT.
-    /// For short timeouts (< 1 s) the Swift asyncAfter fires first; for longer timeouts either
-    /// path may win the race. In both cases the connect completes without hanging.
-    /// Full verification that `smb2_service_timeout` aborts an in-flight PDU before the Swift
-    /// asyncAfter fires is deferred to T8 integration tests (AC4 above).
-    func testTimerDrivenTimeoutFiresWithoutHang() async throws {
-        let client = try SMB2Client(timeout: 0.3) // 300 ms → fast timer-driven completion
+    /// Determinism: with a sub-second client timeout the Swift per-operation `asyncAfter`
+    /// (fires at `self.timeout`) always beats the libsmb2 per-PDU timer (armed at
+    /// `max(1, ceil(self.timeout)) == 1 s`), so the abort is reliably the `ETIMEDOUT` path —
+    /// not the libsmb2 `SMB2_STATUS_IO_TIMEOUT` path. This pins the connect-ordering spec's
+    /// "Operation timeout fires" scenario: `ETIMEDOUT` + pending operation removed.
+    func testTimeoutThrowsETIMEDOUTAndRemovesPendingOperation() async throws {
+        let client = try SMB2Client(timeout: 0.3) // 300 ms → Swift asyncAfter wins the race
         let bridge = TransportBridge(transport: MockTransport(sendsAreDropped: true))
 
         let start = Date()
@@ -155,21 +154,37 @@ final class SMB2ServicingLoopTests: XCTestCase, @unchecked Sendable {
                 server: "testserver", share: "testshare", user: "testuser",
                 bridge: bridge
             )
-            XCTFail("Expected connect to fail or time out")
-        } catch {
+            XCTFail("Expected connect to time out")
+        } catch let posix as POSIXError {
             let elapsed = Date().timeIntervalSince(start)
             XCTAssertLessThan(elapsed, 2.5,
                 "timer-driven path must not hang; elapsed \(elapsed)s with 0.3s timeout")
+            XCTAssertEqual(posix.code, .ETIMEDOUT,
+                "a sub-second client timeout must abort via the ETIMEDOUT path")
         }
+
+        // Teardown requirement: the timed-out operation must be removed, leaving no leaked
+        // pending operation, and the client must not be left in a connected state.
+        XCTAssertEqual(client.pendingSeamOperationCount, 0,
+            "the timed-out seam operation must be removed from the pending table")
+        XCTAssertFalse(client.isConnected,
+            "a timed-out connect must not leave the client seam-connected")
     }
 
     // MARK: - Cancellation tears down seam servicing cleanly
 
     /// WHEN a Task is cancelled during a seam connect in-flight
-    /// THEN the operation throws CancellationError (or ECANCELED)
-    /// AND nothing hangs or leaks
-    func testCancellationTearsDownSeamCleanly() async throws {
-        let client = try SMB2Client(timeout: 30) // long timeout; cancel before it fires
+    /// THEN the operation throws `CancellationError`, the seam is torn down, and the pending
+    /// operation is removed (no leaked continuation).
+    ///
+    /// Determinism: the eager `bridge.connect` resolves instantly against `MockTransport`, and a
+    /// 30 s client timeout means neither the Swift `asyncAfter` nor the libsmb2 timer can fire in
+    /// the test window — so cancellation is the only possible outcome. Whether `onCancel` fires
+    /// before or after the continuation is stored, both paths resume with `CancellationError`,
+    /// so the exact error type is asserted (not hedged against `ECANCELED`/`ETIMEDOUT`). This
+    /// pins the connect-ordering spec's "Cancel mid-operation" scenario.
+    func testCancellationThrowsCancellationErrorAndTearsDownSeam() async throws {
+        let client = try SMB2Client(timeout: 30) // long timeout; cancel before any timer fires
         // sendsAreDropped: true prevents MockTransport from echoing libsmb2's NEGOTIATE PDU
         // back as a server response (which would cause libsmb2 to SIGSEGV on invalid data).
         let bridge = TransportBridge(transport: MockTransport(sendsAreDropped: true))
@@ -189,16 +204,19 @@ final class SMB2ServicingLoopTests: XCTestCase, @unchecked Sendable {
 
         do {
             try await connectTask.value
-            XCTFail("Expected CancellationError or ECANCELED after Task.cancel()")
+            XCTFail("Expected CancellationError after Task.cancel()")
         } catch is CancellationError {
-            // Expected: fast-path or onCancel handler fired.
-        } catch let posix as POSIXError
-            where posix.code == .ECANCELED || posix.code == .ETIMEDOUT
-        {
-            // Also acceptable: cancel raced with timer expiry.
+            // Expected: fast-path (cb.isAbandoned) or onCancel handler resumed with this.
         } catch {
-            XCTFail("Unexpected error after cancellation: \(error)")
+            XCTFail("Cancellation must surface as CancellationError, got \(error)")
         }
+
+        // Teardown requirement: the cancelled operation must be removed and no seam session
+        // left established.
+        XCTAssertEqual(client.pendingSeamOperationCount, 0,
+            "the cancelled seam operation must be removed from the pending table")
+        XCTAssertFalse(client.isConnected,
+            "a cancelled connect must not leave the client seam-connected")
     }
 
     // MARK: - connect(transportKind:) opt-in surface (AC6)
@@ -222,28 +240,35 @@ final class SMB2ServicingLoopTests: XCTestCase, @unchecked Sendable {
         }
     }
 
-    /// WHEN `connect(transportKind: .tcp)` is called
-    /// THEN it routes through the seam (TCPTransportApple stub) and fails without hanging.
+    /// WHEN the eager seam connect (fix-seam-connect-ordering) targets an unreachable endpoint
+    /// through a real `TCPTransportApple`
+    /// THEN it fails with a thrown `POSIXError` bounded by the transport's connect timeout —
+    /// it neither hangs nor surfaces the old downstream `EPERM` symptom.
     ///
-    /// The TCPTransportApple stub throws ENOTSUP from `connect()`. The bridge's inbound pump
-    /// propagates the error, causing `serviceContextForSeam` to detect a recv failure and
-    /// abort the operation. No hang; any POSIXError (or ETIMEDOUT) is acceptable.
-    func testConnectWithTCPKindRoutesToSeamAndFails() async throws {
-        let client = try SMB2Client(timeout: 2)
+    /// Post-#26 `TCPTransportApple` is a real NIO transport (no stub). The connect now happens
+    /// eagerly in `connectWithBridge` *before* the handshake, so an unreachable endpoint surfaces
+    /// as the transport's own `connect` error rather than a downstream servicing-loop abort. A
+    /// 1 s connect timeout keeps the test deterministic regardless of how the host environment
+    /// treats the dead address (refuse vs. black-hole).
+    func testEagerSeamConnectToUnreachableEndpointFailsFast() async throws {
+        let client = try SMB2Client(timeout: 5)
+        // Real NIO transport, short connect timeout so the failure is bounded and deterministic.
+        let transport = TCPTransportApple(connectTimeoutSeconds: 1)
+        let bridge = TransportBridge(transport: transport)
 
         let start = Date()
         do {
-            try await client.connect(
-                server: "testserver", share: "testshare", user: "testuser",
-                transportKind: .tcp
+            // 127.0.0.1:1 has no listener; the connect either refuses or times out within 1 s.
+            try await client.connectWithBridge(
+                server: "127.0.0.1:1", share: "testshare", user: "testuser", bridge: bridge
             )
-            XCTFail("Expected failure: TCPTransportApple stub does not speak SMB2")
-        } catch {
+            XCTFail("Expected failure: connecting to a dead endpoint must throw")
+        } catch let posixError as POSIXError {
             let elapsed = Date().timeIntervalSince(start)
             XCTAssertLessThan(elapsed, 5.0,
-                "seam connect via tcp kind must not hang; elapsed \(elapsed)s")
-            XCTAssertFalse(error is CancellationError,
-                "expected transport/timeout error, not CancellationError")
+                "eager seam connect must not hang; elapsed \(elapsed)s")
+            XCTAssertNotEqual(posixError.code, .EPERM,
+                "must surface the transport connect error, not the old downstream EPERM symptom")
         }
     }
 

@@ -15,7 +15,7 @@ import FoundationNetworking
 #endif
 @testable import AMSMB2
 
-class SMB2IntegrationTests: SMBIntegrationTestCase {
+class SMB2IntegrationTests: SMBIntegrationTestCase, @unchecked Sendable {
 
     // MARK: - Append
 

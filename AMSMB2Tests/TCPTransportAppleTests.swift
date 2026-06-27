@@ -155,6 +155,56 @@ final class TCPTransportAppleTests: XCTestCase, @unchecked Sendable {
         }
     }
 
+    /// WHEN a connect is still pending (a black-holed endpoint that neither accepts nor refuses)
+    /// and the enclosing Task is cancelled
+    /// THEN the connect aborts promptly — well before `connectTimeoutSeconds` — rather than
+    /// blocking until the connect timeout expires.
+    ///
+    /// Regression guard for the `onCancel`-only-fires-`whenSuccess` bug: previously the cancel
+    /// handler closed the channel only *after* a successful connect, so a pending connect could
+    /// not be aborted and waited the full timeout. The fix captures the channel in the
+    /// `channelInitializer` (which runs before connect completes) so cancellation can close it.
+    ///
+    /// `192.0.2.1` is TEST-NET-1 (RFC 5737) — reserved and non-routable, so the connect stays
+    /// pending. A generous 10 s connect timeout means an un-aborted connect would block ~10 s;
+    /// asserting completion under 5 s proves cancellation aborted the in-flight connect. On a
+    /// host that fast-fails the address the test still passes (it just doesn't exercise the
+    /// pending-cancel path), so it is green everywhere but red on a true regression.
+    func testConnectCancellationAbortsPendingConnectPromptly() async {
+        let transport = TCPTransportApple(connectTimeoutSeconds: 10)
+        defer { Task { await transport.close() } }
+
+        let start = Date()
+        let task: Task<Void, any Error> = Task {
+            try await transport.connect(host: "192.0.2.1", port: 445)
+        }
+
+        // Let the connect get in-flight, then cancel while it is still pending.
+        try? await Task.sleep(nanoseconds: 150_000_000) // 150 ms
+        task.cancel()
+
+        do {
+            try await task.value
+            XCTFail("Expected connect to a black-holed endpoint to throw on cancellation")
+        } catch {
+            let elapsed = Date().timeIntervalSince(start)
+            XCTAssertLessThan(
+                elapsed, 5.0,
+                "cancellation must abort the pending connect promptly, not wait for the "
+                    + "10 s connect timeout; elapsed \(elapsed)s"
+            )
+            // When cancellation wins the race the mapped error is ECANCELED; a host that
+            // fast-fails the reserved address may surface a different network POSIXError, which
+            // is also acceptable as long as the timing assertion above holds.
+            if let posix = error as? POSIXError {
+                XCTAssertNotEqual(
+                    posix.code, .ETIMEDOUT,
+                    "a prompt cancel must not surface as the connect-timeout error"
+                )
+            }
+        }
+    }
+
     /// Directly exercises the `InboundBufferingHandler.receive()` onCancel path.
     ///
     /// The handler is created standalone (not attached to a NIO channel) so no
