@@ -36,18 +36,20 @@ to the seam.
 - **THEN** it connects via `TCPTransportApple` through the seam
 - **AND** `smb2_get_fd(context)` returns `-1`
 
-### Requirement: Remove legacy DispatchSource path on Apple; retain on Linux
+### Requirement: Compile-out legacy DispatchSource path on Apple; retain on Linux
 
-After the flip, the build SHALL remove the now-dead Apple legacy socket-handling code in the same
-task — `SocketMonitor`, the `DispatchSource` read/write sources, and the fd-readiness servicing
-specific to the built-in socket — with no orphaned helpers left behind. The legacy libsmb2-owned
-TCP path SHALL remain compiled and functional on Linux behind `#if`.
+After the flip, the build SHALL compile-out the now-dead Apple legacy socket-handling code in the
+same task — `SocketMonitor`, the `DispatchSource` read/write sources, and the fd-readiness servicing
+specific to the built-in socket — by guarding it under `#else` of `#if canImport(Network)` so it is
+not compiled on Apple, with no orphaned helpers or dead references left behind on Apple. The legacy
+libsmb2-owned TCP path SHALL remain compiled and functional on Linux behind that same `#if`
+(guard-not-delete: Linux is the sole remaining consumer).
 
 #### Scenario: Apple legacy code removed
 
 - **WHEN** the Apple sources are inspected post-flip
-- **THEN** `SocketMonitor` and the legacy `DispatchSource` fd servicing are gone, with no dead
-  references to them
+- **THEN** `SocketMonitor` and the legacy `DispatchSource` fd servicing are not compiled on Apple
+  (guarded out under `#else` of `#if canImport(Network)`), with no dead references on Apple
 
 #### Scenario: Linux retains the legacy path
 
