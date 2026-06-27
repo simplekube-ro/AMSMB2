@@ -37,18 +37,6 @@ extension Stream {
     }
 }
 
-extension InputStream {
-    func readData(maxLength length: Int) throws -> Data {
-        var buffer = [UInt8](repeating: 0, count: length)
-        let result = read(&buffer, maxLength: buffer.count)
-        if result < 0 {
-            throw streamError ?? POSIXError(.EIO, description: "Unknown stream error.")
-        } else {
-            return Data(buffer.prefix(result))
-        }
-    }
-}
-
 extension OutputStream {
     func write<DataType: DataProtocol>(_ data: DataType) throws -> Int {
         var buffer = Array(data)
@@ -109,6 +97,10 @@ public class AsyncInputStream<Seq>: InputStream, @unchecked Sendable where Seq: 
     private var bufferOffset = 0
     private var _streamError: (any Error)?
     private var _streamStatus: Stream.Status = .notOpen
+    /// Set (under `bufferLock`) only when the producer's iterator has returned `nil` — i.e. the
+    /// source is genuinely exhausted. A producer error leaves this `false` so the consumer takes
+    /// the error path, not the EOF path.
+    private var producerFinished = false
     private let bufferLock = NSLock()
 
     private let highWaterMark: Int
@@ -163,15 +155,23 @@ public class AsyncInputStream<Seq>: InputStream, @unchecked Sendable where Seq: 
         bufferLock.lock()
 
         if self.buffer == nil || bufferOffset >= self.buffer!.count {
+            // No bytes available right now. Distinguish true EOF (producer exhausted) from a
+            // transient drain (consumer out-paced a still-running producer → would-block).
+            let finished = producerFinished
+            if finished {
+                _streamStatus = .atEnd
+            }
             bufferLock.unlock()
-            return -1
+            return finished ? 0 : -1
         }
 
         let bytesToCopy = min(len, self.buffer!.count - bufferOffset)
         self.buffer!.copyBytes(to: buffer, from: bufferOffset..<(bufferOffset + bytesToCopy))
         bufferOffset += bytesToCopy
 
-        if bufferOffset == self.buffer!.count {
+        // Advance to EOF only when the buffer is fully consumed *and* the producer is done;
+        // otherwise leave the status `.open` so a follow-up read reports would-block.
+        if bufferOffset == self.buffer!.count && producerFinished {
             _streamStatus = .atEnd
         }
 
@@ -232,8 +232,15 @@ public class AsyncInputStream<Seq>: InputStream, @unchecked Sendable where Seq: 
                         }
                     }
                 }
-            } catch {
+                // The loop fell through → iterator returned `nil` → producer is exhausted.
                 bufferLock.withLock {
+                    producerFinished = true
+                }
+            } catch {
+                // G1: store the real error so the consumer surfaces it instead of a generic
+                // EIO fallback. `producerFinished` stays false — an error is not a clean finish.
+                bufferLock.withLock {
+                    _streamError = error
                     _streamStatus = .error
                 }
             }

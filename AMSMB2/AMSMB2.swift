@@ -1802,10 +1802,32 @@ extension SMB2Manager {
         var totalWritten: UInt64 = 0
 
         try await stream.withOpenStream {
-            while true {
-                let segment = try stream.readData(maxLength: chunkSize)
-                if segment.isEmpty {
-                    break
+            readLoop: while true {
+                var buffer = [UInt8](repeating: 0, count: chunkSize)
+                let result = buffer.withUnsafeMutableBufferPointer { ptr -> Int in
+                    guard let base = ptr.baseAddress else { return 0 }
+                    return stream.read(base, maxLength: ptr.count)
+                }
+                let segment: Data
+                if result > 0 {
+                    segment = Data(buffer.prefix(result))
+                } else if result == 0 {
+                    // EOF: producer exhausted and buffer drained.
+                    break readLoop
+                } else {
+                    // result < 0 — classify per the would-block contract (G2/G3).
+                    if stream.streamStatus == .error {
+                        throw stream.streamError ?? POSIXError(.EIO, description: "Stream error.")
+                    }
+                    let isWouldBlock = (stream.streamStatus == .open || stream.streamStatus == .reading)
+                        && stream.streamError == nil
+                    guard isWouldBlock else {
+                        // .closed / .notOpen / .opening: terminal — never retry (would hang).
+                        break readLoop
+                    }
+                    // Would-block: let the prefetch task make progress, then re-read.
+                    await Task.yield()
+                    continue readLoop
                 }
                 let written = try await file.pwrite(data: segment, offset: UInt64(offset ?? 0) + totalWritten)
                 if written != segment.count {
