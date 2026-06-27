@@ -17,7 +17,7 @@ import FoundationNetworking
 #endif
 @testable import AMSMB2
 
-class SMB2ManagerTests: SMBIntegrationTestCase {
+class SMB2ManagerTests: SMBIntegrationTestCase, @unchecked Sendable {
 
     func testConnectDisconnect() async throws {
         let smb = SMB2Manager(url: server, credential: credential)!
@@ -560,7 +560,8 @@ class SMB2ManagerTests: SMBIntegrationTestCase {
                 print(changes)
             }
             group.addTask {
-                try await Task.sleep(nanoseconds: NSEC_PER_SEC)
+                // UInt64() cast: NSEC_PER_SEC is UInt64 on Darwin but Int on Linux/Glibc.
+                try await Task.sleep(nanoseconds: UInt64(NSEC_PER_SEC))
                 try await smbWriter.write(data: Data(), toPath: "\(folderName())/file", progress: nil)
             }
             try await group.waitForAll()

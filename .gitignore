@@ -69,3 +69,6 @@ Package.resolved
 
 # Build/test log artifacts
 *.log
+
+# Linux core dumps from make linuxtest (volume-mounted container crashes)
+core

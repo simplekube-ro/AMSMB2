@@ -1,4 +1,4 @@
-FROM swift:6.0
+FROM swift:6.1
 
 # Add nonroot user
 RUN groupadd -r nonroot && useradd -r -g nonroot nonroot
@@ -15,6 +15,5 @@ VOLUME /home/nonroot/src/app
 COPY AMSMB2 ./AMSMB2
 COPY AMSMB2Tests ./AMSMB2Tests
 COPY Package.swift ./
-COPY Package@swift-6.0.swift ./
 
 ENTRYPOINT ["swift", "test"]

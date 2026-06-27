@@ -15,7 +15,7 @@ import FoundationNetworking
 #endif
 @testable import AMSMB2
 
-class SMB2DisconnectTimeoutTests: SMBIntegrationTestCase {
+class SMB2DisconnectTimeoutTests: SMBIntegrationTestCase, @unchecked Sendable {
 
     // MARK: - Disconnect Behavior
 
