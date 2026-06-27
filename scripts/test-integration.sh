@@ -87,6 +87,12 @@ export SMB_SHARE="testshare"
 export SMB_USER="testuser"
 export SMB_PASSWORD="testpass"
 
+# Transport selection: inherit SMB_TRANSPORT from the caller (default = legacy).
+# `SMB_TRANSPORT=seam` routes the integration suite through the NIO TCP transport seam
+# (Apple only — TCPTransportApple). Re-export so child `swift test` processes see it.
+export SMB_TRANSPORT="${SMB_TRANSPORT:-legacy}"
+echo "Transport: $SMB_TRANSPORT"
+
 TEST_EXIT_CODE=0
 if [[ $VERBOSITY -eq 1 ]]; then
     $TEST_CMD 2>&1 || TEST_EXIT_CODE=$?
