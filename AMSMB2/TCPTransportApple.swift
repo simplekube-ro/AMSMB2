@@ -46,6 +46,14 @@ public final class TCPTransportApple: SMBTransport, @unchecked Sendable {
     private let connectTimeoutSeconds: Int
     /// Channel set after a successful `connect`. Guarded by `lock`.
     private var _channel: (any Channel)?
+    /// Channel captured in the bootstrap's `channelInitializer` while a connect is in flight —
+    /// available *before* the connect completes so a cancellation can abort a still-pending
+    /// connect. Cleared once `connect` returns. Guarded by `lock`.
+    private var _connectingChannel: (any Channel)?
+    /// Set when the in-flight connect is cancelled. If `onCancel` fires before the
+    /// `channelInitializer` has run, the initializer observes this and closes the channel
+    /// immediately. Guarded by `lock`.
+    private var _connectCancelled = false
     /// Set by `close()` to prevent re-use after teardown. Guarded by `lock`.
     private var _isClosed = false
     private let lock = NSLock()
@@ -82,37 +90,62 @@ public final class TCPTransportApple: SMBTransport, @unchecked Sendable {
     /// NIO bootstrap is still connecting, the underlying NWConnection is closed as
     /// soon as it becomes available and `POSIXError(.ECANCELED)` is thrown.
     public func connect(host: String, port: Int) async throws {
-        // Guard: re-use after close() is not supported.
-        let isClosed = lock.withLock { _isClosed }
+        // Guard: re-use after close() is not supported. Reset the per-attempt cancel state so a
+        // fresh connect never inherits a latched flag from a prior cancelled attempt (which would
+        // otherwise make this attempt's channelInitializer close the channel immediately).
+        let isClosed: Bool = lock.withLock {
+            if !_isClosed { _connectCancelled = false }
+            return _isClosed
+        }
         guard !isClosed else {
             throw POSIXError(.ENOTCONN, description: "TCPTransportApple: transport is closed")
         }
 
         let bootstrap = NIOTSConnectionBootstrap(group: group)
             .connectTimeout(.seconds(Int64(connectTimeoutSeconds)))
-            .channelInitializer { [inboundHandler] channel in
-                channel.pipeline.addHandler(inboundHandler)
+            .channelInitializer { [inboundHandler, weak self] channel in
+                // Capture the channel the moment it is created — before the connect completes —
+                // so a cancellation while the connect is still pending can abort it promptly.
+                // (Closing only on `whenSuccess` could never abort a black-holed connect, which
+                // would then block until `connectTimeoutSeconds`.) If cancellation already fired
+                // before we got here, close immediately.
+                if let self {
+                    let cancelNow: Bool = self.lock.withLock {
+                        guard !self._connectCancelled else { return true }
+                        self._connectingChannel = channel
+                        return false
+                    }
+                    if cancelNow { channel.close(promise: nil) }
+                }
+                return channel.pipeline.addHandler(inboundHandler)
             }
 
         // Kick off the connect. The future resolves on the NIO event loop.
         let connectFuture = bootstrap.connect(host: host, port: port)
+        // `_connectingChannel` is valid only for the duration of this connect; drop it on every
+        // exit path (success, failure, or cancellation) so it never outlives the attempt.
+        defer { lock.withLock { _connectingChannel = nil } }
 
         do {
             let channel = try await withTaskCancellationHandler(
                 operation: {
                     // EventLoopFuture.get() is not cooperatively cancellable — the future runs
-                    // to completion regardless. The onCancel closure below closes the NWConnection
-                    // as soon as it becomes available, which causes the future to complete quickly
-                    // with a channel-closed error.
+                    // to completion regardless. The onCancel closure below closes the channel
+                    // captured in the initializer, which calls NWConnection.cancel() and makes
+                    // the future complete quickly with a channel-closed error — even while the
+                    // connect is still pending.
                     try await connectFuture.get()
                 },
-                onCancel: {
-                    // Fires on an unspecified thread when the enclosing Task is cancelled.
-                    // Schedule the channel close on the event loop so NWConnection.cancel() is
-                    // called, unblocking the future.
-                    connectFuture.whenSuccess { channel in
-                        channel.close(promise: nil)
+                onCancel: { [weak self] in
+                    // Fires on an unspecified thread when the enclosing Task is cancelled. Close
+                    // the in-flight channel (if the initializer has run) to abort the connect;
+                    // otherwise flag the cancellation so the initializer closes it on arrival.
+                    guard let self else { return }
+                    let channelToClose: (any Channel)? = self.lock.withLock {
+                        self._connectCancelled = true
+                        return self._connectingChannel
                     }
+                    channelToClose?.close(promise: nil)
                 }
             )
 
@@ -186,7 +219,11 @@ public final class TCPTransportApple: SMBTransport, @unchecked Sendable {
         let channel: (any Channel)? = lock.withLock {
             guard !_isClosed else { return nil }
             _isClosed = true
-            let ch = _channel
+            // Abort an in-flight connect too: flag the cancellation (so a not-yet-run
+            // channelInitializer closes its channel on arrival) and close whichever channel
+            // exists — the connected one, or the one still being established.
+            _connectCancelled = true
+            let ch = _channel ?? _connectingChannel
             _channel = nil
             return ch
         }

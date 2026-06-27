@@ -53,10 +53,21 @@ if ! docker info &>/dev/null; then
     exit 1
 fi
 
+# Pick a Compose CLI: v2 plugin (`docker compose`, default on Linux CI runners) or the
+# standalone v1 binary (`docker-compose`, installed via brew on the macOS leg).
+if docker compose version &>/dev/null; then
+    COMPOSE=(docker compose)
+elif command -v docker-compose &>/dev/null; then
+    COMPOSE=(docker-compose)
+else
+    echo "✗ Neither 'docker compose' nor 'docker-compose' is available."
+    exit 1
+fi
+
 # 2. Start containers
 if [[ "$SKIP_DOCKER" == false ]]; then
     echo "Starting Docker containers..."
-    docker-compose -f "$FIXTURES_DIR/docker-compose.yml" up -d
+    "${COMPOSE[@]}" -f "$FIXTURES_DIR/docker-compose.yml" up -d
 
     # 3. Wait for health checks
     echo "Waiting for SMB (port 445)..."
@@ -67,7 +78,7 @@ if [[ "$SKIP_DOCKER" == false ]]; then
         fi
         if [[ $i -eq 30 ]]; then
             echo "✗ SMB timeout"
-            docker-compose -f "$FIXTURES_DIR/docker-compose.yml" down
+            "${COMPOSE[@]}" -f "$FIXTURES_DIR/docker-compose.yml" down
             exit 1
         fi
         sleep 1
@@ -107,7 +118,7 @@ fi
 # 5. Always stop containers
 if [[ "$SKIP_DOCKER" == false ]]; then
     echo "Stopping Docker containers..."
-    docker-compose -f "$FIXTURES_DIR/docker-compose.yml" down -v
+    "${COMPOSE[@]}" -f "$FIXTURES_DIR/docker-compose.yml" down -v
 fi
 
 # 6. Report and exit

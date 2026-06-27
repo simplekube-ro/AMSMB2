@@ -86,14 +86,21 @@ class SMB2SeamIntegrationTests: SMBIntegrationTestCase, @unchecked Sendable {
 
     // MARK: - Cancel / timeout
 
-    /// Acceptance: cancelling an in-flight operation tears the seam down without hanging.
+    /// Acceptance: cancelling an in-flight operation tears the seam down cleanly — it does not
+    /// hang, and the connection remains usable afterward (proving teardown left no corrupt state).
+    ///
+    /// This live test is deliberately lenient about *which* outcome the cancel produces: against a
+    /// fast loopback Samba server an 8 MiB write can complete before cancellation takes effect, so
+    /// asserting "always throws CancellationError" here would be flaky. The strict contract from
+    /// the connect-ordering spec — cancel throws `CancellationError` + pending op removed, and
+    /// timeout throws `POSIXError(.ETIMEDOUT)` + pending op removed — is asserted deterministically
+    /// in `SMB2ServicingLoopTests` (`testCancellationThrowsCancellationErrorAndTearsDownSeam`,
+    /// `testTimeoutThrowsETIMEDOUTAndRemovesPendingOperation`) using a never-replying mock so timing
+    /// is controlled. What this test adds is the *live* guarantee: no hang, and a reusable seam.
     func testCancelInFlightOperation() async throws {
         let manager = try await makeConnectedManager()
         let file = fileName()
-        addTeardownBlock {
-            try? await manager.connectShare(name: self.share, encrypted: self.encrypted)
-            try? await manager.removeFile(atPath: file)
-        }
+        addTeardownBlock { try? await manager.removeFile(atPath: file) }
 
         let payload = randomData(size: 8 * 1024 * 1024)
         let writeTask = Task {
@@ -109,6 +116,11 @@ class SMB2SeamIntegrationTests: SMBIntegrationTestCase, @unchecked Sendable {
         } catch {
             // A POSIX teardown error is also acceptable; the key requirement is no hang.
         }
+
+        // Teardown assertion: regardless of how the cancel raced, the seam must be left in a
+        // recoverable state. Reconnect and prove a fresh operation succeeds over the seam.
+        try await manager.connectShare(name: share, encrypted: encrypted)
+        try await manager.echo()
     }
 
     /// 8.3 — both-ways parametrization. The matrix is wired here as a reusable driver, but a true

@@ -5,8 +5,11 @@
 The existing Docker-based Samba integration suite SHALL be runnable through the seam
 (`TCPTransportApple` + bridge + servicing loop) via a toggle alongside the `SMB_SERVER`
 convention, and SHALL pass the full acceptance matrix: connect, NTLM authentication, directory
-listing, large read, large write, and cancel/timeout. The suite SHALL be run both ways (legacy
-default and seam) and produce identical outcomes, with a CI leg exercising the seam path.
+listing, large read, large write, and cancel/timeout. The suite SHALL be run both ways and
+produce identical outcomes. Because the legacy path is compiled out on Apple after the T9 flip
+(`fix-seam-connect-ordering`, C4), the two ways are split across hosts: the **seam** leg runs on
+**macOS** (Apple-only transport) and the **legacy** leg runs on **Linux** (its sole remaining
+consumer), against the same Samba fixture and the same suite. CI SHALL exercise both legs.
 
 #### Scenario: Acceptance matrix passes through the seam
 
@@ -16,13 +19,16 @@ default and seam) and produce identical outcomes, with a CI leg exercising the s
 
 #### Scenario: No observable behavior difference vs legacy
 
-- **WHEN** the suite is run via the legacy path and via the seam
+- **WHEN** the suite is run via the legacy path (on Linux) and via the seam (on macOS) against the
+  same Samba fixture
 - **THEN** the outcomes are identical (no observable behavior difference for TCP)
 
-#### Scenario: CI exercises the seam leg
+#### Scenario: CI exercises both legs
 
 - **WHEN** CI runs
-- **THEN** there is a leg that exercises the integration suite through the NIO TCP transport
+- **THEN** there is a macOS leg that exercises the integration suite through the NIO TCP transport
+  (seam)
+- **AND** there is a Linux leg that exercises the same suite through the legacy libsmb2-owned path
 
 ### Requirement: Flip default to TCPTransportApple on Apple after acceptance
 

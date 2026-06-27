@@ -531,6 +531,16 @@ extension SMB2Client {
         }
     }
 
+    #if canImport(Network)
+    /// Number of seam operations currently registered in the pending table, read on the
+    /// serialized event-loop queue. Used by the seam acceptance tests to assert that a
+    /// cancelled or timed-out operation is removed (no leaked continuation / pending op),
+    /// satisfying the connect-ordering spec's teardown requirements.
+    var pendingSeamOperationCount: Int {
+        syncOnEventLoop { pendingOperations.count }
+    }
+    #endif
+
     var error: String? {
         smb2_get_error(context).map(String.init(cString:))
     }

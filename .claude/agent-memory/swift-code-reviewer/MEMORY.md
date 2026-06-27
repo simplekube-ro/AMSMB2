@@ -54,6 +54,29 @@
 - `parseSeamEndpoint` mirrors libsmb2 `ext_connect` byte-for-byte: `[ipv6]`, first-`:` split,
   default 445, strtol-style leading digits, missing `]` -> EINVAL. Unit-test table pins it.
 
+## Seam teardown-ordering invariant (fix-seam-connect-ordering, P1/P2 review fixes) — CONFIRMED
+- `connectWithBridge` timeout (asyncAfter ~:1297) and cancel (onCancel ~:1313) both do
+  `removeValue` + `teardownSeam()` BEFORE `continuation.resume(...)`, all in ONE serial
+  `eventLoopQueue.async` block. So `pendingSeamOperationCount` (Apple-only, Context.swift ~:539,
+  `syncOnEventLoop { pendingOperations.count }`) read from a test thread AFTER the awaited op throws
+  is GUARANTEED 0 (serial-queue happens-before; sync read runs after the resuming block returns).
+  `seamConnected` likewise false before resume → `isConnected` false. Makes the unit asserts
+  deterministic. Empirically: timeout test ~0.316s, cancel test ~0.083s, stable x3.
+- Timeout determinism: `timeout:0.3` → Swift asyncAfter 0.3s vs libsmb2 floor `max(1,ceil)=1s`
+  (smb2_set_timeout). 0.7s margin; serial queue dequeues earlier deadline first; teardownSeam
+  cancels `pendingTimeoutItem`. Cancel determinism: 30s timeout + MockTransport(sendsAreDropped)
+  → only onCancel resumes → always CancellationError; `if cb.isAbandoned` fast-path (~:1268) covers
+  the store-vs-onCancel race.
+- `TCPTransportApple` is SINGLE-USE: fresh instance per production connect (Context.swift:1079).
+  `_connectCancelled`/`_connectingChannel` per-connect, guarded by `lock`, channel ALWAYS closed
+  OUTSIDE `withLock`. Initializer-vs-onCancel race closes the channel exactly once in BOTH lock
+  orderings; NIO `close(promise:nil)` is idempotent (double-close safe). Latent gap (NOT triggered
+  by seam — connect fully completes before any close()): `close()` during a pending connect won't
+  close `_connectingChannel`; backstopped by `group.shutdownGracefully()`. `_connectCancelled` is
+  never reset — fine for single-use, would mis-fire on instance reuse.
+- `mapTransportConnectError` (Context.swift:1141): POSIXError/CancellationError pass through, else
+  wrapped `POSIXError(.ECONNREFUSED)` → eager-connect failures always surface as POSIXError.
+
 ## Conventions confirmed
 - Errors: `POSIXError(.CODE)` only, no custom Error types. 4-space indent, 100/132 width, MIT header.
 - No `NSLock.lock()` in async bodies — wrap in a synchronous helper (e.g. `markPreConnected()`).

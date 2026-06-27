@@ -55,7 +55,7 @@ Approach A or B (design.md) before C1 implementation begins.
 
 ## C3 — Live seam acceptance against Docker Samba [transport-connect-ordering]
 
-- [ ] 3.1 Bring up the fixture, wait for port 445, run the seam suite, then **always** tear down:
+- [x] 3.1 Bring up the fixture, wait for port 445, run the seam suite, then **always** tear down:
 
   ```bash
   docker-compose -f test-fixtures/docker-compose.yml up -d
@@ -89,19 +89,70 @@ Approach A or B (design.md) before C1 implementation begins.
 
 ## C4 — T8/T9 reconciliation: keep rollout artifacts honest [transport-rollout]
 
-- [ ] 4.1 Annotate the archived rollout `tasks.md` T8.3 as superseded by
+- [x] 4.1 Annotate the archived rollout `tasks.md` T8.3 as superseded by
   `fix-seam-connect-ordering` (Apple has no legacy path; A/B-on-one-platform comparison is
   impossible), pointing to this change's `design.md`
-- [ ] 4.2 Re-scope the equivalence claim to "Linux legacy vs Apple seam, same server, same
+      - Addressed the deeper symptom (review finding P1 #1): `.github/workflows/integration.yml`
+        previously ran a `[legacy, seam]` matrix **both on macos-14**, but post-T9 the macOS
+        `legacy` leg routes through the seam (legacy is compiled out on Apple), so it proved
+        nothing. Rewrote the workflow into two host-specific jobs — `seam-macos` (Colima) and
+        `legacy-linux` (native Docker + `swift-actions/setup-swift`). The rollout `tasks.md` T8.3/
+        T8.4 notes still describe the old matrix; this change's design.md C4 is authoritative.
+- [x] 4.2 Re-scope the equivalence claim to "Linux legacy vs Apple seam, same server, same
   assertions" and restate the Apple acceptance criterion as "seam suite green"; reflect in the
   rollout spec/design so no artifact asserts a non-existent Apple legacy path
+      - Updated `add-pluggable-tcp-transport/specs/transport-rollout/spec.md`: the "Integration
+        acceptance" requirement and the "No observable behavior difference" / "CI exercises both
+        legs" scenarios now state the legacy leg runs on Linux and the seam leg on macOS against
+        the same fixture. No artifact asserts an Apple legacy path.
+      - `scripts/test-integration.sh` made Linux-portable: auto-detects `docker compose` (v2) vs
+        `docker-compose` (v1) so the same script drives both CI legs.
+
+## C6 — Review findings addressed (post-acceptance hardening) [transport-connect-ordering]
+
+Three findings from an external review of the seam rollout, all verified against the code first:
+
+- [x] 6.1 **(P1) CI legacy leg was not actually legacy on Apple.** Fixed by splitting
+  `integration.yml` across hosts (see C4.1/C4.2). The Linux `legacy-linux` job is authored but
+  **first-run-on-CI** (no Linux toolchain available in the sandbox to validate it).
+- [x] 6.2 **(P1) Seam cancel/timeout acceptance was not actually asserted.** The deterministic
+  seam unit tests hedged ("no hang" only). Strengthened them to pin the spec contract:
+      - `SMB2ServicingLoopTests.testTimeoutThrowsETIMEDOUTAndRemovesPendingOperation` — a
+        sub-second client timeout deterministically aborts via `POSIXError(.ETIMEDOUT)` (the Swift
+        `asyncAfter` beats the 1 s libsmb2 floor) **and** asserts the pending operation is removed
+        + `isConnected == false`.
+      - `SMB2ServicingLoopTests.testCancellationThrowsCancellationErrorAndTearsDownSeam` — a
+        cancel under a 30 s timeout deterministically throws `CancellationError` (no `ECANCELED`/
+        `ETIMEDOUT` hedge) **and** asserts pending-op removal + `isConnected == false`.
+      - Added `SMB2Client.pendingSeamOperationCount` (Apple-only, reads on the event-loop queue) so
+        teardown is directly observable. The live
+        `SMB2SeamIntegrationTests.testCancelInFlightOperation` now also asserts the seam is reusable
+        after the cancel (reconnect + echo); its inherent loopback-timing leniency is documented and
+        the strict assertions live in the unit suite.
+- [x] 6.3 **(P2) Cancelling during the real NIO connect could wait for the connect timeout.**
+  `TCPTransportApple.connect` only closed the channel on `connectFuture.whenSuccess`, so a pending
+  (black-holed) connect could not be aborted and blocked until `connectTimeoutSeconds`. Fixed by
+  capturing the channel in the bootstrap `channelInitializer` (runs *before* connect resolves) and
+  closing it from `onCancel`, with a `_connectCancelled` flag covering the initializer/onCancel
+  race. New regression test
+  `TCPTransportAppleTests.testConnectCancellationAbortsPendingConnectPromptly` (black-holed
+  `192.0.2.1`, 10 s timeout) now aborts in ~0.15 s; with the bug it waited ~10 s.
 
 ## C5 — Review and verification [transport-connect-ordering]
 
-- [ ] 5.1 `swift-code-reviewer` review (correctness + simplification); confirm no dead code, no new
+- [x] 5.1 `swift-code-reviewer` review (correctness + simplification); confirm no dead code, no new
   warnings, `POSIXError(.CODE)` error style, 4-space indent
-- [ ] 5.2 Address review findings; re-run unit + live seam suite
+      - Reviewed the C6 changes: **Approve**, no Critical/Major defects. Determinism of the new
+        cancel/timeout assertions verified empirically (3× repeated runs: timeout ~0.316 s, cancel
+        ~0.083 s). Build warning-free; `pendingSeamOperationCount` confirmed race-safe and with real
+        call sites (dead-code rule satisfied).
+- [x] 5.2 Address review findings; re-run unit + live seam suite
+      - Addressed both Minor (latent) hardening items so `TCPTransportApple` is correct outside its
+        single-use contract: `connect()` resets the per-attempt `_connectCancelled` flag, and
+        `close()` aborts an in-flight connect symmetrically (`_channel ?? _connectingChannel`).
+      - Unit suite re-run after hardening: 149 tests, 50 skipped (no server), 0 failures. Live seam
+        suite green earlier under C3 (Docker Samba). Build clean, zero new warnings.
 - [x] 5.3 Agent memory updated: new `patterns_seam_connect_ordering.md` (root cause, eager-connect
   fix, parser rules, teardown-on-early-failure, seam-fd-is-always-`-1` gotcha, and the out-of-scope
   AsyncInputStream race) + MEMORY.md index entry.
-- [ ] 5.4 Do NOT commit until the user requests it
+- [x] 5.4 Commit authorized by the user (2026-06-27); folding C6 into this change and archiving.
