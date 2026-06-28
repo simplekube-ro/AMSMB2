@@ -45,8 +45,20 @@ final class TransportBridge: @unchecked Sendable {
 
     // MARK: - Inbound state (transport → libsmb2)
 
-    /// Bytes received from the transport but not yet consumed by the C recv callback.
-    private var inboundBuffer = Data()
+    /// Inbound byte chunks received from the transport but not yet consumed by the C recv
+    /// callback, held as a FIFO of owned `Data` values (each already copied out of the NIO
+    /// `ByteBuffer` at the transport boundary — design D2/D4). Draining a single contiguous
+    /// `Data` with `removeSubrange(..<count)` memmoved the entire queued tail on every `cRecv`
+    /// — super-linear against a multi-PDU backlog, since libsmb2 reads each PDU as several tiny
+    /// preambles. The FIFO + head cursor drains in O(bytes copied) with no tail shifting, and
+    /// enqueues received chunks by reference (no second full-payload copy on append).
+    private var inboundChunks: [Data] = []
+    /// Bytes of `inboundChunks.first` already consumed by previous `cRecv` calls (a 0-based
+    /// offset into the head chunk's logical bytes). Always `0` when `inboundChunks` is empty.
+    private var inboundHead = 0
+    /// Running total of buffered-but-unconsumed inbound bytes. Maintained incrementally so
+    /// `cRecv` can test emptiness and clamp `maxLen` in O(1) without summing the FIFO.
+    private var inboundCount = 0
     /// Set when `transport.receive()` returns empty Data (graceful peer close).
     private var inboundEOF = false
     /// Set when the transport throws an error.
@@ -303,15 +315,35 @@ final class TransportBridge: @unchecked Sendable {
             return -1
         }
 
-        if !inboundBuffer.isEmpty {
-            let count = min(maxLen, inboundBuffer.count)
-            // Synchronous copy into C buffer — no await (design D4, CLAUDE.md constraint).
-            inboundBuffer.withUnsafeBytes { rawSrc in
-                guard let src = rawSrc.baseAddress else { return }
-                buf.update(from: src.assumingMemoryBound(to: UInt8.self), count: count)
+        if inboundCount > 0 {
+            // Gather up to `maxLen` bytes by walking the front of the FIFO, advancing the head
+            // cursor across chunk boundaries. Synchronous copies into the C buffer — no await
+            // (design D4, CLAUDE.md constraint). libsmb2 re-calls cRecv for any remainder, so
+            // returning fewer than `maxLen` (a short read) is valid.
+            let wanted = min(maxLen, inboundCount)
+            var copied = 0
+            while copied < wanted, let chunk = inboundChunks.first {
+                let available = chunk.count - inboundHead
+                let take = min(available, wanted - copied)
+                // `withUnsafeBytes` exposes the chunk's logical bytes rebased to offset 0, so
+                // `inboundHead` indexes correctly even for a non-zero-`startIndex` `Data` slice.
+                chunk.withUnsafeBytes { rawSrc in
+                    guard let base = rawSrc.baseAddress else { return }
+                    let src = base.assumingMemoryBound(to: UInt8.self) + inboundHead
+                    (buf + copied).update(from: src, count: take)
+                }
+                copied += take
+                if take == available {
+                    // Head chunk fully consumed — drop it and reset the cursor.
+                    inboundChunks.removeFirst()
+                    inboundHead = 0
+                } else {
+                    // Head chunk partially consumed — advance the cursor; the loop now exits.
+                    inboundHead += take
+                }
             }
-            inboundBuffer.removeSubrange(..<count)
-            return Int32(count)
+            inboundCount -= copied
+            return Int32(copied)
         }
 
         if inboundEOF { return 0 }
@@ -440,7 +472,13 @@ final class TransportBridge: @unchecked Sendable {
 
     private func appendInbound(_ data: Data) {
         lock.lock()
-        inboundBuffer.append(data)
+        // Enqueue by reference (the bytes are already owned — copied out of the NIO ByteBuffer
+        // at the transport boundary), avoiding a second full-payload copy. Empty chunks are
+        // skipped so the FIFO head always has unconsumed bytes (cRecv's loop invariant).
+        if !data.isEmpty {
+            inboundChunks.append(data)
+            inboundCount += data.count
+        }
         let handler = _onInboundReady
         lock.unlock()
         handler?()

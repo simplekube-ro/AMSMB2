@@ -131,6 +131,14 @@ public final class SMB2Client: CustomDebugStringConvertible, CustomReflectable, 
     /// Pending timer work-item for `smb2_service_timeout`. Rescheduled after each service pass;
     /// cancelled on seam teardown to prevent use-after-free.
     private var pendingTimeoutItem: DispatchWorkItem?
+    /// Inbound-ready debounce flag. `true` while a `serviceContextForSeam` pass is scheduled but
+    /// has not yet started draining. Set under `serviceFlagLock` by `consumeInboundReadySignal()`
+    /// (the bridge's inbound-ready callback) and cleared by `beginServicePass()` at the start of
+    /// the queued pass. Collapses a burst of per-chunk inbound signals into a single dispatch.
+    private var servicePending = false
+    /// Guards `servicePending`. Separate from `eventLoopQueue` so the off-queue inbound-ready
+    /// callback can make the debounce decision without a queue hop.
+    private let serviceFlagLock = NSLock()
     #endif
 
     /// Tracks all pending operations for error broadcast on connection drop.
@@ -1236,10 +1244,16 @@ extension SMB2Client {
                         smb2_set_timeout(context, libTimeoutSecs)
                     }
 
-                    // Wire up the inbound-ready signal: bridge → eventLoopQueue → service.
+                    // Wire up the inbound-ready signal: bridge → (debounce) → eventLoopQueue →
+                    // service. The debounce coalesces a burst of per-chunk signals into a single
+                    // service dispatch (see consumeInboundReadySignal/beginServicePass).
                     bridge.setInboundReadyHandler { [weak self] in
-                        self?.eventLoopQueue.async { [weak self] in
-                            self?.serviceContextForSeam()
+                        guard let self, self.consumeInboundReadySignal() else { return }
+                        self.eventLoopQueue.async { [weak self] in
+                            guard let self else { return }
+                            // Clear the flag BEFORE draining so a chunk arriving mid-drain re-arms.
+                            self.beginServicePass()
+                            self.serviceContextForSeam()
                         }
                     }
                     self.transportBridge = bridge
@@ -1325,6 +1339,28 @@ extension SMB2Client {
         // After continuation.resume() from generic_handler: check the SMB2 status.
         if let cbError = cb.error { throw cbError }
         try POSIXError.throwIfError(cb.result, description: error)
+    }
+
+    // MARK: Inbound-ready debounce
+
+    /// Debounce decision for an inbound-ready signal. Returns `true` for the first signal of a
+    /// burst (the first after the previous pass began) and `false` while a pass is already
+    /// pending, so a flurry of per-chunk signals collapses into a single `serviceContextForSeam`
+    /// dispatch. Thread-safe; called off `eventLoopQueue` from the bridge's inbound-ready callback.
+    func consumeInboundReadySignal() -> Bool {
+        serviceFlagLock.withLock {
+            if servicePending { return false }
+            servicePending = true
+            return true
+        }
+    }
+
+    /// Clears the debounce flag at the START of a queued service pass — BEFORE
+    /// `serviceContextForSeam` drains the inbound buffer. This ordering guarantees no lost
+    /// wakeup: a chunk appended after the reset (even mid-drain) re-arms a fresh pass via
+    /// `consumeInboundReadySignal()`. Runs on `eventLoopQueue`.
+    func beginServicePass() {
+        serviceFlagLock.withLock { servicePending = false }
     }
 
     // MARK: No-fd servicing loop
@@ -1434,6 +1470,10 @@ extension SMB2Client {
         pendingTimeoutItem?.cancel()
         pendingTimeoutItem = nil
         seamConnected = false
+        // Reset the inbound-ready debounce so a stuck `servicePending` can never outlive the seam.
+        // Without this, a client reused across a reconnect would coalesce every future signal
+        // against a stale `true` and silently never schedule a service pass (connect would hang).
+        serviceFlagLock.withLock { servicePending = false }
         if let bridge = transportBridge {
             transportBridge = nil
             bridge.close()

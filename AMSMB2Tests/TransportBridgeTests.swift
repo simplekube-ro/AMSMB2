@@ -351,6 +351,116 @@ final class TransportBridgeTests: XCTestCase, @unchecked Sendable {
         XCTAssertLessThan(result, 0, "after close, recv must return negative")
         XCTAssertEqual(errno, ECONNRESET, "after close, recv must set errno = ECONNRESET")
     }
+
+    // MARK: - Scenario: recv gathers bytes across multiple buffered inbound chunks
+    //
+    // These three tests pin the inbound-buffering contract that the chunk-FIFO refactor
+    // (replacing the contiguous `inboundBuffer: Data` + `removeSubrange(..<count)` front-drain
+    // with a `[Data]` FIFO + head cursor) must preserve byte-for-byte. They pass against the
+    // contiguous implementation and must stay green after the refactor; they fail against the
+    // naive-FIFO mistakes (returning only the head chunk, or indexing a non-zero-startIndex
+    // chunk with absolute offsets).
+
+    /// WHEN several distinct chunks have been buffered (each arrives as its own `receive()`
+    ///      result, i.e. a separate FIFO entry)
+    /// AND a single C recv is issued with `maxLen` larger than the total buffered
+    /// THEN recv gathers ALL buffered bytes across chunk boundaries, in FIFO order, in one call.
+    func testRecvGathersBytesAcrossMultipleBufferedChunks() async throws {
+        let mock = MockTransport()
+        try await mock.connect(host: "localhost", port: 445)
+        let bridge = TransportBridge(transport: mock)
+        bridge.startInboundPump()           // inbound only
+        let ext = bridge.makeExternalTransport()
+        defer { _ = ext.close?(ext.userdata) }
+
+        // Three separate server writes → three distinct inbound-pump receive() results.
+        let c1 = Data("AAAA".utf8)          // 4
+        let c2 = Data("BBBBBB".utf8)        // 6
+        let c3 = Data("CC".utf8)            // 2
+        try await mock.send(c1)
+        try await mock.send(c2)
+        try await mock.send(c3)
+        try await Task.sleep(nanoseconds: 80_000_000) // 80 ms — let the pump append all three
+
+        var recvBuf = [UInt8](repeating: 0, count: 64)
+        let count: Int32 = recvBuf.withUnsafeMutableBufferPointer { ptr in
+            ext.recv!(ext.userdata, ptr.baseAddress, ptr.count)
+        }
+        XCTAssertEqual(
+            count, Int32(c1.count + c2.count + c3.count),
+            "a single recv with ample maxLen must gather all buffered chunks"
+        )
+        XCTAssertEqual(
+            Data(recvBuf.prefix(Int(count))), c1 + c2 + c3,
+            "recv must reassemble bytes across chunk boundaries in FIFO order"
+        )
+    }
+
+    /// WHEN buffered chunks are drained by successive recv calls whose `maxLen` lands in the
+    ///      MIDDLE of a chunk
+    /// THEN the read cursor advances across the chunk boundary so the next recv resumes exactly
+    ///      where the previous one stopped — no bytes dropped, duplicated, or reordered.
+    func testRecvPartialDrainAdvancesCursorAcrossChunkBoundary() async throws {
+        let mock = MockTransport()
+        try await mock.connect(host: "localhost", port: 445)
+        let bridge = TransportBridge(transport: mock)
+        bridge.startInboundPump()
+        let ext = bridge.makeExternalTransport()
+        defer { _ = ext.close?(ext.userdata) }
+
+        let c1 = Data("AAAA".utf8)          // 4
+        let c2 = Data("BBBBBB".utf8)        // 6
+        let c3 = Data("CC".utf8)            // 2  → 12 total
+        try await mock.send(c1)
+        try await mock.send(c2)
+        try await mock.send(c3)
+        try await Task.sleep(nanoseconds: 80_000_000)
+
+        // First recv: maxLen 5 → 4 bytes from c1 + 1 byte from c2.
+        var buf1 = [UInt8](repeating: 0, count: 5)
+        let n1: Int32 = buf1.withUnsafeMutableBufferPointer { ptr in
+            ext.recv!(ext.userdata, ptr.baseAddress, ptr.count)
+        }
+        XCTAssertEqual(n1, 5, "first recv returns maxLen bytes when more are buffered")
+        XCTAssertEqual(Data(buf1.prefix(Int(n1))), Data("AAAAB".utf8))
+
+        // Second recv: drains the remainder — 5 bytes from c2 + 2 bytes from c3.
+        var buf2 = [UInt8](repeating: 0, count: 64)
+        let n2: Int32 = buf2.withUnsafeMutableBufferPointer { ptr in
+            ext.recv!(ext.userdata, ptr.baseAddress, ptr.count)
+        }
+        XCTAssertEqual(n2, 7, "second recv resumes exactly where the first stopped")
+        XCTAssertEqual(Data(buf2.prefix(Int(n2))), Data("BBBBBCC".utf8))
+    }
+
+    /// WHEN a buffered chunk is a `Data` slice with a NON-ZERO `startIndex` (as produced by
+    ///      slicing inbound bytes — `ByteBuffer.readableBytesView`-derived Data can be such)
+    /// THEN recv copies the slice's logical bytes, honoring its index range — never indexing
+    ///      with absolute offsets (which would SIGTRAP or corrupt under a by-reference FIFO).
+    func testRecvHandlesNonZeroStartIndexChunk() async throws {
+        let mock = MockTransport()
+        try await mock.connect(host: "localhost", port: 445)
+        let bridge = TransportBridge(transport: mock)
+        bridge.startInboundPump()
+        let ext = bridge.makeExternalTransport()
+        defer { _ = ext.close?(ext.userdata) }
+
+        let backing = Data((0..<32).map { UInt8($0) })
+        let slice = backing[8...]           // startIndex == 8, 24 bytes: values 8...31
+        XCTAssertNotEqual(slice.startIndex, 0, "precondition: slice must have a non-zero startIndex")
+        try await mock.send(slice)
+        try await Task.sleep(nanoseconds: 60_000_000)
+
+        var recvBuf = [UInt8](repeating: 0, count: 64)
+        let count: Int32 = recvBuf.withUnsafeMutableBufferPointer { ptr in
+            ext.recv!(ext.userdata, ptr.baseAddress, ptr.count)
+        }
+        XCTAssertEqual(count, 24, "recv must return the slice's logical byte count")
+        XCTAssertEqual(
+            Data(recvBuf.prefix(Int(count))), Data((8...31).map { UInt8($0) }),
+            "recv must copy a non-zero-startIndex chunk by honoring its index range"
+        )
+    }
 }
 
 #endif // canImport(Network)
