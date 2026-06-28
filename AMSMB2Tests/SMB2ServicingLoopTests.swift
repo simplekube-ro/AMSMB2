@@ -102,6 +102,71 @@ final class SMB2ServicingLoopTests: XCTestCase, @unchecked Sendable {
         await fulfillment(of: [signalExpectation], timeout: 2.0)
     }
 
+    // MARK: - Inbound-ready debounce coalesces per-chunk service dispatches
+
+    /// WHEN several inbound-ready signals arrive before the scheduled service pass begins
+    /// THEN only the first schedules a pass — the rest coalesce (no extra eventLoopQueue dispatch)
+    /// AND once the pass begins (clearing the flag BEFORE it drains), a later signal re-arms a
+    ///     fresh pass, so buffered bytes are never lost (no lost wakeup).
+    ///
+    /// This pins the inbound-ready debounce: under a burst of TCP segments the seam previously
+    /// fired one `eventLoopQueue.async { serviceContextForSeam() }` per chunk. The debounce
+    /// collapses a burst into ~one pass while guaranteeing every appended chunk is serviced —
+    /// the reset-BEFORE-drain ordering is what makes a signal racing the drain re-arm correctly.
+    func testInboundReadyDebounceCoalescesUntilPassBegins() throws {
+        let client = try SMB2Client(timeout: 30)
+
+        // First signal of a burst schedules a pass.
+        XCTAssertTrue(
+            client.consumeInboundReadySignal(),
+            "first inbound-ready signal in a burst must schedule a service pass"
+        )
+        // Further signals while that pass is still pending must coalesce.
+        XCTAssertFalse(
+            client.consumeInboundReadySignal(),
+            "a signal while a pass is already pending must coalesce (no second dispatch)"
+        )
+        XCTAssertFalse(
+            client.consumeInboundReadySignal(),
+            "additional pending-window signals must also coalesce"
+        )
+
+        // The queued pass begins and clears the flag BEFORE draining the inbound buffer.
+        client.beginServicePass()
+
+        // A signal arriving after the drain has begun must re-arm a fresh pass — no lost wakeup.
+        XCTAssertTrue(
+            client.consumeInboundReadySignal(),
+            "a signal after the pass begins must re-arm a fresh pass (no lost wakeup)"
+        )
+    }
+
+    /// WHEN the seam is torn down while a service pass is still pending (scheduled but not yet
+    ///      begun)
+    /// THEN the debounce flag is cleared, so a subsequent inbound-ready signal re-arms a fresh
+    ///      pass rather than coalescing forever against a stale pending state.
+    ///
+    /// Guards against a silent total stall if a client is ever reused across a reconnect: a
+    /// `servicePending` left stuck `true` would make every future signal coalesce, so the next
+    /// connection's NEGOTIATE response would never be serviced (connect hangs to timeout).
+    func testTeardownSeamResetsInboundReadyDebounce() throws {
+        let client = try SMB2Client(timeout: 30)
+
+        // Arm a pending pass and coalesce a second signal against it.
+        XCTAssertTrue(client.consumeInboundReadySignal())
+        XCTAssertFalse(client.consumeInboundReadySignal())
+
+        // Teardown must clear the pending flag (no live seam was established, so this only
+        // exercises the debounce reset).
+        client.teardownSeam()
+
+        // After teardown, the very next signal must schedule a fresh pass again.
+        XCTAssertTrue(
+            client.consumeInboundReadySignal(),
+            "teardownSeam must reset the debounce flag so a reused client can re-arm servicing"
+        )
+    }
+
     // MARK: - connectWithBridge: seam connect path (no poll(fd))
 
     /// WHEN `connectWithBridge` is called with a MockTransport-backed bridge

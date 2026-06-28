@@ -103,6 +103,15 @@ public final class TCPTransportApple: SMBTransport, @unchecked Sendable {
 
         let bootstrap = NIOTSConnectionBootstrap(group: group)
             .connectTimeout(.seconds(Int64(connectTimeoutSeconds)))
+            // Raise the NIOTransportServices receive granularity from its 8 KB default so a large
+            // SMB2 READ reply (up to the ~1 MB negotiated max-read) arrives in fewer, larger
+            // ByteBuffers instead of fragmenting into ~8 KB chunks. Each NWConnection completion
+            // drives a Data copy, an inbound-FIFO enqueue, and an eventLoopQueue service hop, so a
+            // coarser receive cuts per-byte op-count on the streaming read path. Throughput (per-
+            // byte copy volume) is unchanged; this is an op-count optimisation. `minimumIncomplete-
+            // ReceiveLength` stays at its default (1) so small control PDUs still flush immediately
+            // with no added latency.
+            .channelOption(NIOTSChannelOptions.maximumReceiveLength, value: 1 << 18) // 256 KB
             .channelInitializer { [inboundHandler, weak self] channel in
                 // Capture the channel the moment it is created — before the connect completes —
                 // so a cancellation while the connect is still pending can abort it promptly.
