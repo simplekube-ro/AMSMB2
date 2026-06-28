@@ -149,8 +149,32 @@ public final class SMB2Client: CustomDebugStringConvertible, CustomReflectable, 
 
     var timeout: TimeInterval
 
+    /// Serializes libsmb2's process-global context registry (`active_contexts`) and the
+    /// static counter inside `smb2_init_context` — neither of which libsmb2 locks (see
+    /// `SMB2_LIST_ADD`/`SMB2_LIST_REMOVE` in init.c). Every SMB2 context in this library is
+    /// created and destroyed through `createContext`/`destroyContext`, so this lock fully
+    /// orders create/destroy across the independent per-context event-loop queues and
+    /// prevents the global-list corruption that crashes inside `smb2_destroy_context`.
+    private static let globalContextLock = NSLock()
+
+    /// Allocates an `smb2_context` under ``globalContextLock`` so the `SMB2_LIST_ADD` into
+    /// the global registry is serialized against every other create/destroy.
+    private static func createContext() throws -> UnsafeMutablePointer<smb2_context> {
+        globalContextLock.lock()
+        defer { globalContextLock.unlock() }
+        return try smb2_init_context().unwrap()
+    }
+
+    /// Destroys an `smb2_context` under ``globalContextLock`` so the `SMB2_LIST_REMOVE` from
+    /// the global registry is serialized against every other create/destroy.
+    private static func destroyContext(_ context: UnsafeMutablePointer<smb2_context>) {
+        globalContextLock.lock()
+        defer { globalContextLock.unlock() }
+        smb2_destroy_context(context)
+    }
+
     internal init(timeout: TimeInterval) throws {
-        let ctx = try smb2_init_context().unwrap()
+        let ctx = try Self.createContext()
         self.context = ctx
         self.timeout = timeout
         self.eventLoopQueue = DispatchQueue(
@@ -176,7 +200,7 @@ public final class SMB2Client: CustomDebugStringConvertible, CustomReflectable, 
                 smb2_disconnect_share_async(ctx, SMB2Client.generic_handler_noop, nil)
                 smb2_service(ctx, Int32(POLLOUT))
             }
-            smb2_destroy_context(ctx)
+            Self.destroyContext(ctx)
             context = nil
         }
     }
@@ -322,7 +346,7 @@ extension SMB2Client {
         let result = smb2_service(context, revents)
         if result < 0 {
             let errorMsg = error
-            smb2_destroy_context(context)
+            Self.destroyContext(context)
             self.context = nil
             socketMonitor?.cancel()
             socketMonitor = nil
@@ -814,7 +838,7 @@ extension SMB2Client {
 
             let result = smb2_service(context, Int32(pfd.revents))
             if result < 0 {
-                smb2_destroy_context(context)
+                Self.destroyContext(context)
                 self.context = nil
                 throw POSIXError(.ECONNRESET, description: error)
             }
@@ -1381,7 +1405,7 @@ extension SMB2Client {
         let serviceResult = smb2_service(context, revents)
         if serviceResult < 0 {
             let errorMsg = error
-            smb2_destroy_context(context)
+            Self.destroyContext(context)
             self.context = nil
             teardownSeam()
             failAllPendingOperations(with: POSIXError(.ECONNRESET, description: errorMsg))
@@ -1409,7 +1433,7 @@ extension SMB2Client {
             let result = smb2_service(context, Int32(POLLOUT))
             if result < 0 {
                 let errorMsg = error
-                smb2_destroy_context(context)
+                Self.destroyContext(context)
                 self.context = nil
                 teardownSeam()
                 failAllPendingOperations(with: POSIXError(.ECONNRESET, description: errorMsg))
