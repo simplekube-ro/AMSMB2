@@ -1,18 +1,22 @@
 # AMSMB2 Architecture
 
-This document describes the internal architecture of AMSMB2, a Swift library that wraps [libsmb2](https://github.com/sahlberg/libsmb2) to provide SMB2/3 file operations for Apple platforms and Linux.
+This document describes the internal architecture of AMSMB2, a Swift library that wraps the [simplekube-ro/libsmb2](https://github.com/simplekube-ro/libsmb2) fork (a fork of [sahlberg/libsmb2](https://github.com/sahlberg/libsmb2) that adds a pluggable external-transport C API) to provide SMB2/3 file operations for Apple platforms and Linux.
+
+The external-transport API lets AMSMB2 carry the SMB2 byte stream over a Swift-owned transport instead of libsmb2's built-in BSD socket. On Apple platforms the library uses this seam by default to run SMB2 over `NIOTransportServices` (SwiftNIO on Network.framework); on Linux it keeps libsmb2's built-in socket. See [Transport Layer](#transport-layer) for the full picture.
 
 ## Layer Stack
 
-AMSMB2 is organized in four layers. Each layer depends only on the layer below it.
+AMSMB2 is organized in four layers. Each layer depends only on the layer below it. Below `SMB2Client`, the path from libsmb2 to the network differs by platform: Apple routes through the transport seam; Linux uses libsmb2's built-in socket.
 
 ```mermaid
 graph TB
     App["Your Application"]
     Manager["SMB2Manager<br/><i>Public API — async/await, thread-safe</i>"]
     FileHandle["SMB2FileHandle<br/><i>File handle abstraction — read, write, seek</i>"]
-    Client["SMB2Client<br/><i>Swift wrapper — event loop, DispatchSource I/O</i>"]
+    Client["SMB2Client<br/><i>Swift wrapper — event loop queue, servicing</i>"]
     LibSMB2["libsmb2 (C)<br/><i>SMB2/3 protocol implementation</i>"]
+    Bridge["TransportBridge → SMBTransport<br/><i>Apple — external-transport seam</i>"]
+    TCP["TCPTransportApple<br/><i>NIOTransportServices (Network.framework)</i>"]
     Server["SMB Server"]
 
     App --> Manager
@@ -20,13 +24,18 @@ graph TB
     Manager --> Client
     FileHandle --> Client
     Client --> LibSMB2
-    LibSMB2 -->|"TCP/445"| Server
+    LibSMB2 -->|"Apple: external-transport callbacks"| Bridge
+    Bridge --> TCP
+    TCP -->|"TCP/445"| Server
+    LibSMB2 -->|"Linux: built-in BSD socket, TCP/445"| Server
 
     style App fill:#f9f,stroke:#333
     style Manager fill:#bbf,stroke:#333
     style FileHandle fill:#bfb,stroke:#333
     style Client fill:#fbb,stroke:#333
     style LibSMB2 fill:#fdb,stroke:#333
+    style Bridge fill:#dfd,stroke:#333
+    style TCP fill:#dfd,stroke:#333
     style Server fill:#ddd,stroke:#333
 ```
 
@@ -34,8 +43,9 @@ graph TB
 |-------|-------|----------------|
 | **Public API** | `SMB2Manager` | Connection lifecycle, all file/directory operations, NSSecureCoding/Codable (passwords excluded from serialization), Obj-C compatibility |
 | **File Abstraction** | `SMB2FileHandle` | Open/close files, read/write/seek, IOCTL (fsctl), Change Notify |
-| **Context Wrapper** | `SMB2Client` | Wraps `smb2_context`, provides thread-safe access via a serial event loop queue, manages `DispatchSource`-based async operations |
-| **C Library** | libsmb2 | SMB2/3 protocol encoding/decoding, network I/O, NTLM authentication |
+| **Context Wrapper** | `SMB2Client` | Wraps `smb2_context`, provides thread-safe access via a serial event loop queue, drives servicing (Apple: seam signal loop; Linux: `DispatchSource`) |
+| **Transport (Apple)** | `TransportBridge`, `SMBTransport`, `TCPTransportApple` | Carries the SMB2 byte stream over a Swift-owned NIO/Network.framework TCP connection via libsmb2's external-transport callbacks |
+| **C Library** | libsmb2 | SMB2/3 protocol encoding/decoding, network I/O (Linux), NTLM authentication |
 
 ## Connection Lifecycle
 
@@ -44,6 +54,7 @@ sequenceDiagram
     participant App
     participant Manager as SMB2Manager
     participant Client as SMB2Client
+    participant Transport as TransportBridge / TCPTransportApple<br/>(Apple only)
     participant Server as SMB Server
 
     App->>Manager: SMB2Manager(url:, credential:)
@@ -53,7 +64,14 @@ sequenceDiagram
     Manager->>Manager: connectLock.lock()
     Manager->>Client: SMB2Client(timeout:)
     Client->>Client: smb2_init_context()
-    Manager->>Client: connect(server:, share:, user:)
+    Note over Manager,Client: Apple: connect(...transportKind: .automatic)<br/>Linux: connect(server:share:user:) (built-in socket)
+    opt Apple seam (transportKind != nil)
+        Client->>Transport: connect(host:port:) — eager TCP handshake
+        Transport->>Server: TCP connect
+        Server-->>Transport: Channel live
+        Client->>Client: smb2_set_transport(ctx, SMB2_TRANSPORT_AUTO, ext)
+        Note over Client: Naming trap — AUTO (2), not TCP (0).<br/>smb2_get_fd(ctx) returns -1 (no native fd)
+    end
     Client->>Server: SMB2 NEGOTIATE
     Server-->>Client: Negotiate response
     Client->>Server: SMB2 SESSION_SETUP (NTLM)
@@ -104,7 +122,7 @@ operations (e.g. a connection pool that leases clients to concurrent readers):
 
 ## Async Operation Flow
 
-Every SMB2 operation follows the same pattern: Swift async/await is bridged to libsmb2's C callback-based async API through a serial event loop queue and `DispatchSource`-based socket monitoring.
+Every SMB2 operation follows the same pattern: Swift async/await is bridged to libsmb2's C callback-based async API through a serial event loop queue. What signals the queue to call `smb2_service()` is platform-dependent — on Apple, an inbound-ready signal from the transport bridge; on Linux, `DispatchSource` socket monitoring — but everything from `smb2_service()` onward is identical.
 
 ```mermaid
 flowchart LR
@@ -112,7 +130,7 @@ flowchart LR
     B --> C["caller suspends<br/>(Swift task suspended)"]
     C --> D["eventLoopQueue.async<br/>(dispatches PDU setup)"]
     D --> E["smb2_*_async()<br/>(queues PDU)"]
-    E --> F{"DispatchSource fires<br/>(socket ready)"}
+    E --> F{"readiness signal<br/>(Apple: bridge inbound-ready /<br/>Linux: DispatchSource fd)"}
     F -->|"data ready"| G["smb2_service()<br/>(processes response)"]
     G --> H["generic_handler<br/>(C callback)"]
     H --> I["continuation.resume()"]
@@ -122,10 +140,12 @@ flowchart LR
 
 Key details:
 - **CBData** is a class (heap-allocated) passed to C callbacks via `Unmanaged<CBData>.passRetained`. The C callback recovers it via `Unmanaged<CBData>.fromOpaque(..).takeRetainedValue()`, balancing the retain count.
-- **DispatchSource** monitors the socket file descriptor for readability and writability. When the socket has I/O events, `handleSocketEvent()` calls `smb2_service()` on the event loop queue, which invokes `generic_handler` for any completed operations.
+- **Readiness signalling** differs by platform but converges on `smb2_service()`:
+  - **Apple (seam):** the bridge's inbound pump appends received bytes and fires an inbound-ready signal; a (debounced) `eventLoopQueue.async` then calls `serviceContextForSeam()` → `smb2_service()`. There is no socket fd (`smb2_get_fd == -1`). See [Transport Layer](#transport-layer).
+  - **Linux (legacy):** `DispatchSource` monitors the socket file descriptor; on I/O events `handleSocketEvent()` calls `smb2_service()` on the event loop queue. See [Socket Monitoring (Linux)](#socket-monitoring-linux).
 - **Multiple operations** can be in-flight simultaneously. Each operation gets its own `CBData` with its own `CheckedContinuation`. The event loop queue services all pending requests concurrently.
-- **Timeout** is configurable via `SMB2Manager.timeout` (default: 60 seconds). On timeout, `CBData.isAbandoned` is set so the eventual callback skips resuming the already-abandoned continuation.
-- **Connection** uses a temporary poll loop (`pollUntilComplete`) because the `DispatchSource` cannot be created until the socket fd exists. After connect completes, `startSocketMonitoring()` switches to the event-driven model.
+- **Timeout** is configurable via `SMB2Manager.timeout` (default: 60 seconds). On timeout, `CBData.isAbandoned` is set so the eventual callback skips resuming the already-abandoned continuation. Under the seam, libsmb2's own per-PDU deadlines are additionally driven by a timer (`smb2_get_timeout` / `smb2_service_timeout`).
+- **Connection** on Apple completes through the seam servicing loop (bridge-driven, no fd poll). On Linux it uses a temporary poll loop (`pollUntilComplete`) because the `DispatchSource` cannot be created until the socket fd exists; after connect, `startSocketMonitoring()` switches to the event-driven model.
 
 ## Thread Safety Model
 
@@ -139,7 +159,8 @@ graph TB
 
     subgraph SMB2Client
         ELQ["eventLoopQueue (serial DispatchQueue, .userInitiated)<br/><i>Exclusively owns smb2_context</i>"]
-        SM["SocketMonitor (DispatchSource)<br/><i>Monitors socket readability/writability</i>"]
+        SM["SocketMonitor (DispatchSource) — Linux<br/><i>Monitors socket readability/writability</i>"]
+        BR["TransportBridge inbound-ready signal — Apple<br/><i>Pump appends bytes, debounced service dispatch</i>"]
         CONT["Per-operation CheckedContinuation<br/><i>Swift task suspends; generic_handler resumes on completion</i>"]
     end
 
@@ -148,7 +169,8 @@ graph TB
     end
 
     DQ -->|"eventLoopQueue.async<br/>(PDU setup)"| ELQ
-    SM -->|"socket event"| ELQ
+    SM -->|"socket event (Linux)"| ELQ
+    BR -->|"inbound-ready (Apple)"| ELQ
     ELQ -->|"smb2_service → generic_handler"| CONT
     CL -->|"connect/disconnect"| ELQ
 ```
@@ -157,21 +179,78 @@ graph TB
 |-----------|------|----------|-------------|
 | `connectLock` | `NSLock` | `SMB2Manager.client` reference, connection state | `connectShare()`, `disconnectShare()`, `smbClient` getter |
 | `operationLock` | `NSCondition` | `operationCount` — tracks in-flight operations | Increment/decrement around each queued operation |
-| `eventLoopQueue` | Serial `DispatchQueue` (`.userInitiated` QoS) | All access to the `smb2_context` C pointer | PDU setup (async dispatch), socket event handling, shutdown |
-| `SocketMonitor` | `DispatchSource` (read + write) | Socket I/O event delivery | Fires on the event loop queue when the socket is readable/writable |
+| `eventLoopQueue` | Serial `DispatchQueue` (`.userInitiated` QoS) | All access to the `smb2_context` C pointer | PDU setup (async dispatch), readiness/timeout servicing, shutdown |
+| `SocketMonitor` (Linux) | `DispatchSource` (read + write) | Socket I/O event delivery | Fires on the event loop queue when the socket is readable/writable |
+| `TransportBridge.lock` (Apple) | `NSLock` | Inbound/outbound FIFOs, pump tasks, EOF/error flags | Each `cSend`/`cRecv` callback and pump-task mutation (never holds `await`) |
 | `CBData.continuation` | `CheckedContinuation<Void, any Error>` | Per-operation completion bridging | Swift task suspends; `generic_handler` resumes on completion |
 | `_handleLock` | `NSLock` | `SMB2FileHandle.handle` pointer | `close()` and `deinit` only (nil-swap pattern) |
 
 **Concurrency guarantees:**
 - `SMB2Manager` is `@unchecked Sendable` — safe to share across actors and tasks
-- The serial `eventLoopQueue` exclusively owns the `smb2_context`. All libsmb2 calls execute on this queue. Operations use `eventLoopQueue.async` for PDU setup, then the Swift task suspends via `CheckedContinuation` — this allows multiple operations to be in-flight simultaneously
-- `DispatchSource` monitors socket readability/writability. When I/O events arrive, `handleSocketEvent()` runs on the event loop queue and calls `smb2_service()`, which invokes `generic_handler` for completed operations
+- The serial `eventLoopQueue` exclusively owns the `smb2_context`. All libsmb2 calls execute on this queue (on both platforms — only what *signals* the queue differs). Operations use `eventLoopQueue.async` for PDU setup, then the Swift task suspends via `CheckedContinuation` — this allows multiple operations to be in-flight simultaneously
+- **Apple:** the `TransportBridge` inbound pump appends received bytes and fires an inbound-ready signal that dispatches `serviceContextForSeam()` → `smb2_service()` on the event loop queue (no socket fd). **Linux:** `DispatchSource` monitors socket readability/writability and `handleSocketEvent()` calls `smb2_service()`. Either way, `smb2_service()` invokes `generic_handler` for completed operations
 - `CBData` uses `Unmanaged.passRetained()`/`takeRetainedValue()` for safe C callback bridging — the retain count keeps `CBData` alive until the callback fires, even if the caller has timed out
 - Property accessors use `syncOnEventLoop()` with a `DispatchSpecificKey` deadlock guard to safely read context state from any thread
 - `deinit` dispatches `shutdown()` onto the event loop queue, and `fireAndForget()` captures `self` strongly for safe cleanup of file handles
 - Multiple `SMB2Manager` instances (separate connections) can operate fully in parallel
 
-## Socket Monitoring
+## Transport Layer
+
+> **Platform:** Apple only (`#if canImport(Network)`). This is the **default** transport for Apple platforms — `SMB2Manager.connectShare(...)` routes through it automatically. Linux keeps libsmb2's built-in socket (see [Socket Monitoring (Linux)](#socket-monitoring-linux)).
+
+On Apple platforms, AMSMB2 does not let libsmb2 own a BSD socket. Instead it installs a Swift-owned transport through libsmb2's **external-transport** C API, so the SMB2 byte stream rides over `NIOTransportServices` (SwiftNIO on Network.framework). This is the *transport seam*: a narrow, NIO-free, libsmb2-free boundary that decouples the SMB2 client from any specific wire implementation (TCP today, QUIC reserved for the future).
+
+```mermaid
+flowchart TB
+    subgraph libsmb2["libsmb2 (C)"]
+        EXT["smb2_external_transport<br/>connect / send / recv / close trampolines"]
+    end
+    subgraph bridge["TransportBridge (Apple)"]
+        OUT["Outbound FIFO<br/>cSend copies bytes (D4), enqueues"]
+        OPUMP["Outbound pump Task<br/>drains → transport.send()"]
+        IPUMP["Inbound pump Task<br/>transport.receive() → inbound FIFO"]
+        IN["Inbound FIFO + head cursor<br/>cRecv drains synchronously"]
+    end
+    Proto["SMBTransport (protocol)<br/><i>Data-based, NIO-free</i>"]
+    TCP["TCPTransportApple<br/>NIOTransportServices channel"]
+    Server["SMB Server"]
+
+    EXT -->|"cSend"| OUT --> OPUMP --> Proto
+    Proto -->|"receive()"| IPUMP --> IN -->|"cRecv"| EXT
+    Proto --> TCP
+    TCP <-->|"TCP/445"| Server
+    IN -.->|"inbound-ready signal"| SVC["eventLoopQueue → smb2_service()"]
+```
+
+### Types
+
+| Type | Visibility | Role |
+|------|-----------|------|
+| `SMBTransport` | `public protocol` | The seam. Async `connect(host:port:)` / `send(_:)` / `receive()` / `close()` over `Data`. No SwiftNIO, no libsmb2 — unit-testable in isolation and reusable by a future QUIC transport. `receive()` returning empty `Data` signals graceful EOF. |
+| `SMBTransportKind` | `public enum` | Selects a transport: `.tcp`, `.quic` (reserved — throws `ENOTSUP`), `.automatic`. |
+| `TCPTransportApple` | `public final class` | Concrete `SMBTransport` over `NIOTransportServices`. Converts `Data` ↔ `ByteBuffer` internally; buffers inbound bytes (`InboundBufferingHandler`) for incremental drain; maps NWError/ChannelError → `POSIXError`. One instance = one connection lifetime. |
+| `TransportBridge` | `internal final class` | Wires libsmb2's four external-transport C callbacks to an `SMBTransport`. Backs `ext.userdata` via `Unmanaged.passRetained`, balanced exactly once in the C `close` trampoline. |
+
+### How servicing works without a socket fd
+
+Because the external transport is installed with `smb2_set_transport(ctx, SMB2_TRANSPORT_AUTO, ext)`, libsmb2 owns **no** native socket — `smb2_get_fd(ctx) == -1`. The `DispatchSource` fd model cannot apply, so `SMB2Client` drives libsmb2 differently:
+
+- **Eager connect ordering.** The bridge connects the transport (`TCPTransportApple.connect(host:port:)`) on the caller's task **before** libsmb2 begins NEGOTIATE. `ext_connect` fires NEGOTIATE synchronously on a `>= 0` return, so the channel must already be live or the first `send`/`receive` would fail with `ENOTCONN`. A transport-connect failure surfaces here as a thrown `POSIXError` (`.ECONNREFUSED`/`.ETIMEDOUT`), with nothing installed and nothing leaked.
+- **Naming trap.** The selector must be `SMB2_TRANSPORT_AUTO` (== 2), **not** `SMB2_TRANSPORT_TCP` (== 0). `TCP` selects libsmb2's built-in socket and ignores `ext`.
+- **Outbound.** The C `send` callback copies bytes out of libsmb2's buffer synchronously (libsmb2 may reuse the buffer immediately — no `await` in the copy), enqueues them, and returns the byte count without blocking. The **outbound pump** task drains the queue into `SMBTransport.send(_:)`. After an operation is queued, `smb2_service(POLLOUT)` is run when `smb2_which_events()` reports pending output.
+- **Inbound.** The **inbound pump** task calls `SMBTransport.receive()` and appends results to an inbound FIFO (a list of `Data` chunks with a head cursor — O(bytes copied), no tail shifting). The C `recv` callback drains synchronously: bytes available → copy up to `max_len`; empty but open → libsmb2 would-block signal; empty + EOF → `0`; errored → negative.
+- **Inbound-ready signal.** When the inbound pump appends bytes, it fires an inbound-ready handler that (after a debounce) does `eventLoopQueue.async { serviceContextForSeam() }`, calling `smb2_service` with `revents` derived from `smb2_which_events`. This is the Apple analogue of a `DispatchSource` read event.
+- **Timer-driven servicing.** With no fd there is no socket timeout, so the Swift `timeout` is pushed into libsmb2 via `smb2_set_timeout`; after each service pass the client queries `smb2_get_timeout` and schedules an `eventLoopQueue.asyncAfter` that calls `smb2_service_timeout` at the deadline. Timers are cancelled on teardown.
+
+All libsmb2 calls still run exclusively on `eventLoopQueue`, and the existing `CheckedContinuation`, `CBData.isAbandoned` guard, per-operation timeout, and `withTaskCancellationHandler` mechanisms are reused unchanged. Cancellation and teardown cancel both pump tasks, close the transport, and resume any suspended continuations with no leaks.
+
+### Public-API note
+
+The transport seam types are `public` (for extensibility and a future QUIC transport), but `SMB2Manager` does **not** currently expose transport selection — `connectShare(...)` always uses `.automatic` on Apple. Consumers cannot yet inject a custom `SMBTransport` or pick a `SMBTransportKind` through the public API.
+
+## Socket Monitoring (Linux)
+
+> **Platform:** This is the legacy libsmb2-owned socket path. It is compiled only on platforms **without** Network.framework — i.e. Linux — under `#if !canImport(Network)`. On Apple platforms it is compiled out entirely; servicing runs through the [Transport Layer](#transport-layer) seam instead.
 
 After a connection is established, `SMB2Client` creates a `SocketMonitor` — a private helper that wraps `DispatchSource` for efficient, non-blocking socket I/O.
 
@@ -251,7 +330,10 @@ Every async operation supports Swift task cancellation. The pattern is consisten
 | File | Layer | Responsibility |
 |------|-------|----------------|
 | `AMSMB2.swift` | Public API | `SMB2Manager` class — all public file/directory/connection operations |
-| `Context.swift` | Context Wrapper | `SMB2Client` class — smb2_context lifecycle, event loop queue, `SocketMonitor`, `BufferPool`, `RawBuffer`, async operation bridge |
+| `Context.swift` | Context Wrapper | `SMB2Client` class — smb2_context lifecycle, event loop queue, `BufferPool`, `RawBuffer`, async operation bridge; seam servicing loop (Apple) and `SocketMonitor`/`DispatchSource` fd path (Linux, `#if !canImport(Network)`) |
+| `SMBTransport.swift` | Transport (Apple) | `SMBTransport` protocol and `SMBTransportKind` enum — the NIO-free, libsmb2-free transport seam |
+| `TransportBridge.swift` | Transport (Apple) | `TransportBridge` — wires libsmb2's external-transport C callbacks to an async `SMBTransport`; inbound/outbound pumps and FIFOs (`#if canImport(Network)`) |
+| `TCPTransportApple.swift` | Transport (Apple) | `TCPTransportApple` — concrete `SMBTransport` over `NIOTransportServices`; `Data` ↔ `ByteBuffer`, inbound buffering, POSIXError mapping (`#if canImport(Network)`) |
 | `FileHandle.swift` | File Abstraction | `SMB2FileHandle` class — open/close/read/write/seek/ioctl/changeNotify, pipelined I/O |
 | `Directory.swift` | File Abstraction | Directory enumeration handle |
 | `Stream.swift` | Public API | `AsyncInputStream` — adapts `AsyncSequence` to `InputStream` for streaming writes, with high-water/low-water mark backpressure |
