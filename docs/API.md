@@ -13,6 +13,9 @@ Complete reference for the AMSMB2 public API. All async methods also have comple
 | [`SMB2FileChangeType`](#smb2filechangetype) | OptionSet for Change Notify filter flags |
 | [`SMB2FileChangeAction`](#smb2filechangeaction) | Action type in a change notification (added, removed, modified, renamed) |
 | [`SMB2FileChangeInfo`](#smb2filechangeinfo) | Single change notification entry (action + file name) |
+| [`SMBTransport`](#smbtransport) | Public protocol — the transport seam carrying SMB2 bytes over the wire (Apple) |
+| [`SMBTransportKind`](#smbtransportkind) | Enum selecting a transport: `.tcp` / `.quic` / `.automatic` |
+| [`TCPTransportApple`](#tcptransportapple) | Concrete `SMBTransport` over `NIOTransportServices` (Apple only) |
 
 ---
 
@@ -74,6 +77,7 @@ Connects to a named share on the server. Must be called before any file operatio
   - `name` — Share name (e.g., `"Documents"`)
   - `encrypted` — Enable SMB3 encryption (default: `false`)
 - **Throws:** `POSIXError` on connection failure (auth error, share not found, network error)
+- **Transport note:** On Apple platforms this connects through the [`SMBTransport`](#smbtransport) seam (NIO/Network.framework `TCPTransportApple`, selected as `.automatic`); on Linux it uses libsmb2's built-in socket. The transport is not currently selectable through the public API. See [ARCHITECTURE.md → Transport Layer](ARCHITECTURE.md#transport-layer).
 
 #### `disconnectShare(gracefully:)`
 
@@ -535,6 +539,62 @@ This prevents unbounded memory growth when the producer (async sequence) is fast
 
 ---
 
+## SMBTransport
+
+```swift
+public protocol SMBTransport: Sendable {
+    func connect(host: String, port: Int) async throws
+    func send(_ bytes: Data) async throws
+    func receive() async throws -> Data
+    func close() async
+}
+```
+
+The transport seam: the abstraction that carries raw SMB2 bytes over the network, decoupled from any specific wire implementation. It is intentionally free of SwiftNIO and libsmb2 dependencies, so conformers can be unit-tested in isolation and reused by both the TCP transport and a future QUIC transport.
+
+- **Buffer type:** `Foundation.Data` (concrete transports convert to/from NIO `ByteBuffer` internally).
+- **EOF convention:** `receive()` returning empty `Data` signals graceful peer close. Stop the receive loop on an empty result.
+- **Concurrency:** conformers must be `Sendable` (use an `actor`, or a `final class` with justified `@unchecked Sendable`).
+- **Errors:** `connect(host:port:)` throws `POSIXError` on failure (e.g. `.ECONNREFUSED`).
+
+> On Apple platforms, `SMB2Manager.connectShare(...)` drives this seam automatically. The protocol is `public` for extensibility, but the public API does not yet expose injecting a custom transport. See [ARCHITECTURE.md → Transport Layer](ARCHITECTURE.md#transport-layer).
+
+## SMBTransportKind
+
+```swift
+public enum SMBTransportKind: Sendable, Equatable, Hashable {
+    case tcp
+    case quic
+    case automatic
+}
+```
+
+Selects which transport a connection uses.
+
+| Case | Meaning |
+|------|---------|
+| `.tcp` | Explicit TCP. On Apple routes through `NIOTransportServices`; on Linux falls back to libsmb2's built-in BSD socket. |
+| `.quic` | SMB-over-QUIC. Reserved for a future milestone — **not yet implemented** (selecting it throws `POSIXError(.ENOTSUP)`). |
+| `.automatic` | Let the library choose the best available transport on the current platform. This is what `SMB2Manager` uses on Apple. |
+
+## TCPTransportApple
+
+```swift
+public final class TCPTransportApple: SMBTransport, @unchecked Sendable {
+    public init(connectTimeoutSeconds: Int = 30)
+}
+```
+
+Concrete `SMBTransport` backed by `NIOTransportServices` (SwiftNIO over Network.framework). **Apple only** (`#if canImport(Network)`); absent on Linux.
+
+- One instance maps to one TCP connection lifetime — after `close()` the instance is unusable; create a fresh one to reconnect.
+- Converts the seam's `Data` payloads to/from NIO `ByteBuffer` internally and buffers inbound bytes so the bridge's synchronous `recv` can drain incrementally.
+- All NWError / ChannelError values are mapped to `POSIXError` before propagating, matching the library's error convention.
+- **Parameters:**
+  - `connectTimeoutSeconds` — maximum time (whole seconds) for the TCP handshake (default: 30, matching the libsmb2 default).
+
+---
+
 ## Common Errors
 
 All operations throw `POSIXError` on failure. Common codes:
@@ -546,8 +606,12 @@ All operations throw `POSIXError` on failure. Common codes:
 | 5 | `EIO` | I/O error (network or protocol) |
 | 13 | `EACCES` | Permission denied |
 | 17 | `EEXIST` | File already exists (e.g., `uploadItem` to existing path) |
+| 45 | `ENOTSUP` | Operation not supported (e.g., selecting the not-yet-implemented QUIC transport) |
 | 57 | `ENOTCONN` | Not connected (call `connectShare` first) |
-| 60 | `ETIMEDOUT` | Operation timed out |
+| 60 | `ETIMEDOUT` | Operation timed out (also a transport connect timeout) |
+| 61 | `ECONNREFUSED` | Connection refused by the peer (e.g., transport connect failure) |
+
+> Numeric values shown are Darwin (Apple) `errno` codes; the symbolic constant is what you match in `catch`. Linux assigns different numbers to the same symbols.
 
 ---
 

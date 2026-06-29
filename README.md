@@ -11,12 +11,13 @@ This fork extends the original with the following improvements:
 | Area | Original | This Fork |
 |------|----------|-----------|
 | **Public API surface** | Only `SMB2Manager` is public; internal types are inaccessible | `SMB2Client` and `SMB2FileHandle` exposed as public API for direct file handle operations |
-| **Thread safety** | Context access unprotected in some paths; file handle close/deinit has race conditions | Serial event loop queue exclusively owns `smb2_context`; `DispatchSource`-based socket monitoring; nil-swap close pattern prevents double-close races; `smbClient` getter validates connection under lock |
-| **Performance** | Single-threaded poll loop blocks during each operation; only one operation at a time | Event loop + `DispatchSource` I/O allows multiple in-flight operations; `BufferPool` eliminates per-read allocation; pipelined read/write dispatch concurrent chunks via structured concurrency; `AsyncInputStream` backpressure bounds memory during streaming |
+| **Thread safety** | Context access unprotected in some paths; file handle close/deinit has race conditions | Serial event loop queue exclusively owns `smb2_context`; servicing is non-blocking on both platforms (Apple: NIO transport seam, no socket fd; Linux: `DispatchSource` socket monitoring); nil-swap close pattern prevents double-close races; `smbClient` getter validates connection under lock |
+| **Performance** | Single-threaded poll loop blocks during each operation; only one operation at a time | Event loop with non-blocking servicing (Apple: NIO transport seam; Linux: `DispatchSource` I/O) allows multiple in-flight operations; `BufferPool` eliminates per-read allocation; pipelined read/write dispatch concurrent chunks via structured concurrency; `AsyncInputStream` backpressure bounds memory during streaming |
+| **Transport** | libsmb2 owns a built-in BSD socket on every platform | Pluggable external-transport seam: Apple runs SMB2 over a Swift-owned `NIOTransportServices` (Network.framework) transport (`TCPTransportApple`); Linux keeps libsmb2's built-in socket |
 | **Server-side copy** | Sends copy chunks using negotiated write size (~8 MB), exceeding the MS-SMB2 spec limit | Chunks capped at 1 MiB per MS-SMB2 section 3.3.5.15.6.2 — works with all spec-compliant servers |
 | **Symlink creation** | `ReparseDataLength` omits 12-byte symlink header, causing `STATUS_IO_REPARSE_DATA_INVALID` on Samba 4.21+ | Correct reparse data format per MS-FSCC 2.1.2.4 |
 | **Change Notify** | Crashes (signal 5/11) due to re-entrant `smb2_close()` inside callback + dangling `withUnsafeMutablePointer` | Direct PDU construction bypasses re-entrant wrapper; `Unmanaged<CBData>` for safe C callback pointers |
-| **Testing** | Single test file; `swift test` crashes without server env vars; no Docker infrastructure | 83 tests across 6 files; `swift test` works without a server (skips integration tests); Docker-based `make integrationtest` |
+| **Testing** | Single test file; `swift test` crashes without server env vars; no Docker infrastructure | 158 tests across 19 files; `swift test` works without a server (skips integration tests); Docker-based `make integrationtest` |
 | **Documentation** | Minimal README with outdated examples | Architecture guide with Mermaid diagrams, comprehensive API reference, modern async/await examples |
 
 ## Features
@@ -31,6 +32,7 @@ This fork extends the original with the following improvements:
 - Change Notify (file monitoring)
 - Streaming writes via `AsyncSequence` with backpressure flow control
 - Pipelined read/write for high-throughput file transfers
+- Pluggable transport seam — on Apple, SMB2 runs over SwiftNIO/Network.framework (`TCPTransportApple`); Linux uses libsmb2's built-in socket
 - `NSSecureCoding` and `Codable` support for connection serialization (passwords intentionally excluded for security)
 - Objective-C compatibility layer
 - Direct access to `SMB2Client` and `SMB2FileHandle` for advanced use cases
@@ -109,7 +111,7 @@ git submodule update --init    # Required — fetches the libsmb2 C library
 swift test
 ```
 
-Runs 39 unit tests. Integration tests are automatically skipped when no SMB server is configured.
+Runs the unit tests (no server required). Integration tests are automatically skipped when no SMB server is configured.
 
 ### Integration Tests (requires Docker)
 
@@ -117,7 +119,7 @@ Runs 39 unit tests. Integration tests are automatically skipped when no SMB serv
 make integrationtest
 ```
 
-Starts a Samba container, runs the full test suite (83 tests), and tears down. Requires Docker Desktop.
+Starts a Samba container, runs the full test suite (158 tests across 19 files), and tears down. Requires Docker Desktop.
 
 ### Linux Tests
 
@@ -128,12 +130,12 @@ make cleanlinuxtest   # Clean Docker build
 
 ## Documentation
 
-- **[Architecture](docs/ARCHITECTURE.md)** — Layer stack, event loop model, socket monitoring, buffer pool, pipelined I/O, thread safety model
+- **[Architecture](docs/ARCHITECTURE.md)** — Layer stack, event loop model, transport layer (Apple seam) and socket monitoring (Linux), buffer pool, pipelined I/O, thread safety model
 - **[API Reference](docs/API.md)** — Complete reference for all public types and methods
 
 ## License
 
-The source code in this repository is MIT licensed. However, it links to third-party libraries under different licenses — see the table below.
+The source code in this repository is MIT licensed. However, it links to third-party libraries under different licenses — see the table below and [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for the full notices.
 
 You **must** link this library dynamically if you distribute your app on the App Store (required by LGPL v2.1).
 

@@ -38,8 +38,12 @@ The README SHALL document how to run unit tests (`swift test`), integration test
 
 ### Requirement: License section accuracy
 
-The README SHALL accurately describe the dual-license situation (MIT source + LGPL v2.1 libsmb2) and the dynamic linking requirement for App Store distribution.
+The README SHALL accurately describe the multi-license situation (MIT source + LGPL v2.1 libsmb2, plus the Apache-2.0 SwiftNIO / NIOTransportServices transport dependencies on Apple) and the dynamic linking requirement for App Store distribution. The third-party notices SHALL be recorded in a discoverable place (a third-party notices file and/or the README license table) alongside the libsmb2 LGPL v2.1 note.
 
 #### Scenario: License understanding
 - **WHEN** a developer reads the license section
 - **THEN** they SHALL understand the requirement to link AMSMB2 dynamically
+
+#### Scenario: Third-party notices are recorded
+- **WHEN** a developer inspects the project's license documentation
+- **THEN** they SHALL find Apache-2.0 notices for SwiftNIO and NIOTransportServices alongside the libsmb2 LGPL v2.1 note (e.g. in `THIRD-PARTY-NOTICES.md` and the README license table)
