@@ -25,7 +25,41 @@
   (a) consumer `Task.yield()` retry is a busy-poll — fine for file-backed producers, can spin-burn
   CPU for a slow generic `AsyncSequence`; (b) `buffer` Data grows to the FULL stream size
   (`bufferOffset` only advances, consumed prefix never freed) — backpressure bounds only
-  `count-offset`, not total; (c) `$0.baseAddress!` in the consumer would crash if `chunkSize==0`.
+  `count-offset`, not total; (c) `$0.baseAddress!` was replaced by `guard let base ... else
+  { return 0 }` — now silently reports EOF (success, empty file) if `chunkSize==0` rather than
+  crashing; chunkSize is `>0 ? : optimizedWriteSize` so dead in practice, but silent-loss shape.
+- 4.1 REVIEW FINDING (should-fix, low-probability): this fix makes `_streamError` the FIRST
+  cross-thread-mutable field (was always-nil/effectively-const pre-fix — confirmed via git). Prefetch
+  writes `_streamError`+`_streamStatus=.error` UNDER bufferLock, but the new consumer classification
+  in `write(...)` reads `stream.streamStatus` (3x) + `stream.streamError` (2x) ALL UNLOCKED, and the
+  `streamError`/`streamStatus` computed getters read the backing vars without the lock. Violates the
+  project's own "every read of `_streamError` under bufferLock" rule. A torn read (status `.error`
+  visible, `_streamError` not) surfaces `POSIXError(.EIO)` instead of the real error → defeats G1.
+  Fix: one locked snapshot consumed once per classification, e.g. `func statusSnapshot() ->
+  (Stream.Status, (any Error)?) { bufferLock.withLock {(_streamStatus, _streamError)} }`. The bare
+  `_streamStatus` unlocked reads are pre-existing (open/close/switch); the change only makes them
+  newly load-bearing for the error path. Build clean, 0 new warnings on changed files.
+- 4.1 VERIFY PASS (working tree, pre-commit): finding-1 fixed via `statusSnapshot() ->
+  (Stream.Status,(any Error)?)` = `bufferLock.withLock {(_streamStatus,_streamError)}` + an internal
+  marker protocol `StreamStatusSnapshotting` (AsyncInputStream conforms) so the `InputStream`-typed
+  consumer does `(stream as? any StreamStatusSnapshotting)?.statusSnapshot() ?? (stream.streamStatus,
+  stream.streamError)`. SOUND + simplest viable: generic param can't be cast away and you can't
+  override a stdlib-class method via extension, so `as?`-to-protocol is the idiomatic erasure. No
+  orphans (1 conformer, 1 call site + 1 test). Fallback is safe: the consumer is also fed plain
+  `InputStream(data:)` (1099/1153) & `InputStream(url:)` (1338/1347) — synchronous stdlib streams
+  set status/error on the same thread before `read` returns -1, nothing to tear. Finding-2:
+  `precondition(chunkSize>0)` + `guard let base ... else { return -1 }` (was `return 0`) — makes the
+  -1 unreachable and kills the silent-empty-success shape. VERDICT APPROVED: build 0 warnings; test
+  158 exec / 51 skip / 0 fail; 5/5 AsyncInputStreamTests. Minor (noted, non-blocking):
+  `precondition` traps in release vs throwing EINVAL — defensible (chunkSize==0 = internal invariant
+  breach from negotiated optimizedWriteSize, not user input).
+
+## Marker-protocol erasure for generic InputStream subclass (REUSABLE PATTERN)
+- To call a method on a generic `InputStream` subclass (`AsyncInputStream<Seq>`) from code holding a
+  base `InputStream`: you canNOT spell/cast the generic param, and you canNOT override a stdlib-class
+  method via Swift extension. Solution: declare a non-generic `protocol P { func f() -> ... }`,
+  `extension AsyncInputStream: P {}`, then `(stream as? any P)?.f() ?? <plain-stream fallback>`.
+  Keep P internal even though the class is public (conformance is internal — fine).
 
 ## Transport seam architecture (Apple = seam-only after T9)
 - Apple routes ALL connections through the NIO seam (`TransportBridge` + `TCPTransportApple`).

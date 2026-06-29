@@ -1811,13 +1811,16 @@ extension SMB2Manager {
             file = try await SMB2FileHandle.open(forCreatingIfNotExistsAtPath: toPath, on: client)
         }
         let chunkSize = chunkSize > 0 ? chunkSize : file.optimizedWriteSize
+        precondition(chunkSize > 0, "write chunk size must be positive")
         var totalWritten: UInt64 = 0
 
         try await stream.withOpenStream {
             readLoop: while true {
                 var buffer = [UInt8](repeating: 0, count: chunkSize)
                 let result = buffer.withUnsafeMutableBufferPointer { ptr -> Int in
-                    guard let base = ptr.baseAddress else { return 0 }
+                    // `chunkSize > 0` (asserted above) so `buffer` is non-empty and `baseAddress`
+                    // is non-nil; `-1` here is truly unreachable and must never read as EOF.
+                    guard let base = ptr.baseAddress else { return -1 }
                     return stream.read(base, maxLength: ptr.count)
                 }
                 let segment: Data
@@ -1827,12 +1830,17 @@ extension SMB2Manager {
                     // EOF: producer exhausted and buffer drained.
                     break readLoop
                 } else {
-                    // result < 0 — classify per the would-block contract (G2/G3).
-                    if stream.streamStatus == .error {
-                        throw stream.streamError ?? POSIXError(.EIO, description: "Stream error.")
+                    // result < 0 — classify per the would-block contract (G2/G3) off a single
+                    // locked snapshot so status and error can't tear across the producer's write.
+                    // A plain (non-`AsyncInputStream`) stream isn't cross-thread-mutated, so its
+                    // direct property reads are equivalent.
+                    let (status, error): (Stream.Status, (any Error)?) =
+                        (stream as? any StreamStatusSnapshotting)?.statusSnapshot()
+                        ?? (stream.streamStatus, stream.streamError)
+                    if status == .error {
+                        throw error ?? POSIXError(.EIO, description: "Stream error.")
                     }
-                    let isWouldBlock = (stream.streamStatus == .open || stream.streamStatus == .reading)
-                        && stream.streamError == nil
+                    let isWouldBlock = (status == .open || status == .reading) && error == nil
                     guard isWouldBlock else {
                         // .closed / .notOpen / .opening: terminal — never retry (would hang).
                         break readLoop

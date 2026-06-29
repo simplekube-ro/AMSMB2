@@ -90,6 +90,15 @@ extension AsyncThrowingStream where Element == Data, Failure == any Error {
     }
 }
 
+/// Erases `AsyncInputStream`'s generic parameter so a consumer holding a base `InputStream` can
+/// take a consistent `(status, error)` snapshot when the concrete stream is an `AsyncInputStream`.
+/// A plain `InputStream` is not cross-thread-mutated, so it has no need to conform.
+protocol StreamStatusSnapshotting {
+    /// Atomically reads `(streamStatus, streamError)` so the pair cannot tear across a concurrent
+    /// producer write.
+    func statusSnapshot() -> (Stream.Status, (any Error)?)
+}
+
 public class AsyncInputStream<Seq>: InputStream, @unchecked Sendable where Seq: AsyncSequence, Seq.Element: DataProtocol, Seq: SendableMetatype, Seq.Element: SendableMetatype, Seq.AsyncIterator: SendableMetatype {
     private var stream: Seq
     private var iterator: Seq.AsyncIterator
@@ -138,6 +147,16 @@ public class AsyncInputStream<Seq>: InputStream, @unchecked Sendable where Seq: 
 
     override public var streamError: (any Error)? {
         _streamError
+    }
+
+    /// Atomically snapshots `_streamStatus` and `_streamError` together under `bufferLock`.
+    ///
+    /// The producer writes both fields under the lock in `prefetchData()`'s catch branch, so a
+    /// consumer classifying a `-1` read must read them as one locked pair — otherwise a torn read
+    /// can see `.error` without the stored error (or vice-versa) and surface a generic fallback
+    /// instead of the producer's real error (G1).
+    func statusSnapshot() -> (Stream.Status, (any Error)?) {
+        bufferLock.withLock { (_streamStatus, _streamError) }
     }
 
     override public func read(_ buffer: UnsafeMutablePointer<UInt8>, maxLength len: Int) -> Int {
@@ -247,3 +266,5 @@ public class AsyncInputStream<Seq>: InputStream, @unchecked Sendable where Seq: 
         }
     }
 }
+
+extension AsyncInputStream: StreamStatusSnapshotting {}
