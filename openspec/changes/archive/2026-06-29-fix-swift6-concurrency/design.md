@@ -183,6 +183,25 @@ matches the file's confinement style.)
 
 **Verdict: GATE_APPROVED — approach as-proposed (`project-architect`, 2026-06-27).**
 
+> **RE-GATE RESOLUTION — `project-architect`, 2026-06-30 (guardrail 4 scope expansions).**
+> Following the `swift-code-reviewer` pass (task 4.1, APPROVED — no blocking findings), the two scope
+> expansions surfaced during implementation were re-gated:
+> - **C2b test-portability fixes (deviation #2): ACCEPT into this change (ruling A).** Acceptance bar
+>   (B) — "`make linuxtest` builds *and* passes" — is part of the gated scope and is unprovable without
+>   a compiling Linux test target. These defects could only surface *after* the five library errors
+>   cleared, so they are causally downstream of this change; splitting them would create a verification
+>   deadlock. Test-only, no library behavior change.
+> - **Agent/Codex scaffolding in `d2c0d18` (deviation #3): out-of-scope, record-only (ruling B).** Not
+>   part of the capability and absent from `spec.md`, so archive does not bless it into `openspec/specs/`.
+>   Already merged + user-retained; no revert/rewrite required — disowned in the artifacts instead.
+> - **Pre-existing `async_await_pdu` indentation:** correctly left untouched; track as a separate
+>   SwiftFormat `chore:`.
+>
+> **Re-gate verdict: APPROVED — CONDITIONAL.** Archive cleared once the artifacts tell the truth about
+> what shipped: (1) `spec.md` confinement scenario corrected to "library-source fix confined to
+> `Context.swift`" (done), (2) `design.md` deviation #3 added for the scaffolding (done), (3) this
+> resolution stamped (done). The engineering is not reopened.
+
 The four verification points were checked against the live source (`Context.swift`,
 `async_await` 849–934, `async_await_pdu` 944–1023, `connectWithBridge` 1153–1161, `queueKey` 107):
 
@@ -252,7 +271,7 @@ The four verification points were checked against the live source (`Context.swif
 
 ## Implementation deviations (recorded honestly; flagged for re-gate)
 
-Two deviations from the approved plan were forced during implementation:
+Three deviations from the approved plan are recorded:
 
 1. **D-3 / `queueKey` — `#if canImport(Darwin)` split (not a bare `nonisolated(unsafe)`).** The Apple
    toolchain treats `DispatchSpecificKey<Bool>` as `Sendable`, so a `nonisolated(unsafe) static let`
@@ -261,13 +280,24 @@ Two deviations from the approved plan were forced during implementation:
    fixes) landed exactly as approved.
 
 2. **Out-of-`Context.swift` test-portability fixes (C2b in `tasks.md`).** Clearing the five library
-   errors let the test target compile on Linux **for the first time**, exposing four pre-existing,
-   unrelated `master` defects (`FoundationNetworking` import, `NSEC_PER_SEC` `Int`/`UInt64`, and two
-   swift-corelibs-foundation `NSKeyedUnarchiver` fatal-abort tests guarded Apple-only). They are not
-   concurrency issues and not in `Context.swift`, but acceptance bar (B) — "`make linuxtest` builds
-   **and** passes" — cannot be met without them. Per guardrail 4 these are flagged for the architect
-   to confirm the scope expansion (or carve C2b into its own change) before archive. Each fix is
+   errors let the test target compile on Linux **for the first time**, exposing pre-existing,
+   unrelated `master` defects: (a) `FoundationNetworking` import for `URLCredential`; (b) `NSEC_PER_SEC`
+   `Int`/`UInt64`; (c) two swift-corelibs-foundation `NSKeyedUnarchiver` fatal-abort tests guarded
+   Apple-only; and (d) `, @unchecked Sendable` on three integration test classes
+   (`SMB2DisconnectTimeoutTests`, `SMB2IntegrationTests`, `SMB2ManagerTests`) — `XCTestCase` is not
+   `Sendable` on swift-corelibs-foundation, so 6.1 strict concurrency rejects the `self`-capturing
+   async test bodies on Linux. None are concurrency regressions or in `Context.swift`, but acceptance
+   bar (B) — "`make linuxtest` builds **and** passes" — cannot be met without them. Each fix is
    minimal, test-only, and mirrors an existing in-repo convention; no library behavior changed.
 
+3. **Unrelated agent/Codex scaffolding bundled in `d2c0d18`.** ~2200 lines of `.agents/`, `.codex/`,
+   `AGENTS.md`, and `.gitignore` tooling were committed alongside the swift6 fix (per request). This is
+   out-of-scope tooling — it resolves no diagnostic, touches no library source, and advances neither
+   acceptance bar. It is **not** represented in `spec.md`, so archiving this change does not bless it
+   into `openspec/specs/`. Retained as tracked tooling per user decision; flagged here for honesty, not
+   reverted (the commit is already merged — a split would be a retroactive history rewrite, which is
+   off the table for a no-behavior-change tooling bundle).
+
 **Verified result:** macOS `swift build`/unit clean + full live seam suite 148 tests / 0 failures;
-Linux `make linuxtest` exit 0, 114 tests / 0 failures.
+Linux `make linuxtest` exit 0, 114 tests / 0 failures. Re-confirmed at re-gate (2026-06-30): macOS
+build exit 0 with zero concurrency/Sendable warnings, unit suite 158 tests / 51 skipped / 0 failures.

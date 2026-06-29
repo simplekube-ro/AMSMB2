@@ -1,5 +1,8 @@
-## ADDED Requirements
+# swift6-strict-concurrency Specification
 
+## Purpose
+TBD - created by archiving change fix-swift6-concurrency. Update Purpose after archive.
+## Requirements
 ### Requirement: Package builds with zero errors under Swift 6.1 strict concurrency on Linux and macOS
 
 The package SHALL compile with **zero errors** under Swift 6.1 strict concurrency on **both** Linux
@@ -33,8 +36,10 @@ non-`Sendable` `UnsafeMutableRawPointer`.
 
 #### Scenario: Each unsafe escape is confined and justified
 
-- **WHEN** a `nonisolated(unsafe)` annotation is used to resolve a diagnostic (the `handler` local in
-  each runner and the `queueKey` static)
+- **WHEN** a `nonisolated(unsafe)` annotation is used to resolve a diagnostic — the `handler` local in
+  each runner (both platforms) and the `queueKey` static (**Linux only**, via the
+  `#if canImport(Darwin)` split: a plain `static let` on Apple, where `DispatchSpecificKey` is already
+  `Sendable` and the annotation would be flagged "unnecessary")
 - **THEN** the annotated value is confined to `eventLoopQueue` (the serial owner of `smb2_context`)
   or is an immutable process-wide constant
 - **AND** each annotation carries a one-line comment justifying its data-race safety
@@ -44,8 +49,12 @@ non-`Sendable` `UnsafeMutableRawPointer`.
 The fix SHALL NOT alter the runtime behavior of operation dispatch, `Unmanaged` retain/release
 lifetime, timeout scheduling, or task cancellation. The `Unmanaged.passRetained(cb)` retain SHALL
 occur exactly once per call, paired 1:1 with its existing release / `takeRetainedValue` sites (no
-use-after-free, no double-free). Edits SHALL be confined to `AMSMB2/Context.swift`; the transport
-seam, bridge, `TCPTransportApple`, and `AsyncInputStream`/`Stream.swift` SHALL be untouched.
+use-after-free, no double-free). The **library-source** fix SHALL be confined to
+`AMSMB2/Context.swift`; the transport seam, bridge, `TCPTransportApple`, and
+`AsyncInputStream`/`Stream.swift` SHALL be untouched. The change additionally includes the `Dockerfile`
+image bump (`swift:6.0` → `swift:6.1`) and minimal, **test-only** Linux-portability fixes in
+`AMSMB2Tests/` required to evaluate the Linux acceptance bar; these introduce no library behavior
+change.
 
 #### Scenario: Full integration suite through the seam stays green on macOS
 
@@ -62,8 +71,11 @@ seam, bridge, `TCPTransportApple`, and `AsyncInputStream`/`Stream.swift` SHALL b
 - **THEN** the `passRetained` on `cb` is balanced by exactly one release or `takeRetainedValue` on
   the corresponding path, identical to the pre-change topology
 
-#### Scenario: Edits confined to Context.swift
+#### Scenario: Library-source fix confined to Context.swift
 
 - **WHEN** the change is diffed against `master`
-- **THEN** only `AMSMB2/Context.swift` (plus the OpenSpec artifacts) is modified
+- **THEN** the only modified **library source** is `AMSMB2/Context.swift`
+- **AND** the remaining modifications are limited to the `Dockerfile` image bump, **test-only**
+  Linux-portability fixes in `AMSMB2Tests/`, and the OpenSpec artifacts
 - **AND** no change appears in the seam, bridge, transport, or stream sources
+

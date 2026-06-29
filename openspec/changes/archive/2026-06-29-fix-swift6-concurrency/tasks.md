@@ -69,11 +69,25 @@ minimal, test-only, and matches an existing in-repo convention (no library behav
   platforms. *Runtime fatal.* Both tests still run and pass on macOS.
 - [x] 2b.4 Confirmed `copy(with:)` (`testNSCopy`/`testCopyPreservesPassword`) does **not** route
   through archiving, so those remain valid on Linux.
+- [x] 2b.5 Added `, @unchecked Sendable` to three integration test classes —
+  `SMB2DisconnectTimeoutTests`, `SMB2IntegrationTests`, `SMB2ManagerTests` (shipped in `d2c0d18`).
+  `XCTestCase` is not `Sendable` on swift-corelibs-foundation, so under swift 6.1 strict concurrency
+  the test closures capturing `self` across `await`/`Task` boundaries fail to compile on Linux. The
+  conformance is sound: each test runs serially on its own instance with no concurrent access to test
+  state. Apple-only; no library behavior change. *Compile error (Linux).* (Enumerated retroactively
+  per the 4.1 review — the conformance shipped but was not listed in 2b.1–2b.4.)
 
-> **Re-gate note (guardrail 4):** these four edits expand the change surface beyond `Context.swift`.
-> They were necessary to *evaluate* acceptance bar (B) at all. They are pre-existing and orthogonal to
-> the concurrency fix. Recommend the architect confirm the scope expansion (or split C2b into its own
-> change) before archive.
+> **Re-gate note (guardrail 4):** these five edits (2b.1–2b.5) expand the change surface beyond
+> `Context.swift`. They were necessary to *evaluate* acceptance bar (B) at all. They are pre-existing
+> and orthogonal to the concurrency fix. Recommend the architect confirm the scope expansion (or split
+> C2b into its own change) before archive.
+>
+> **Additional scope flagged by 4.1 review:** commit `d2c0d18` also bundled ~2200 lines of unrelated
+> Codex/agent scaffolding (`.agents/`, `.codex/`, `AGENTS.md`, `.gitignore`) into the swift6 change.
+> This is tooling, not part of the fix; recommend the architect confirm whether it stays or is split
+> into a separate `chore:` commit. Also deferred: a pre-existing cosmetic indentation defect in
+> `async_await_pdu` (`Context.swift` ~1076–1085, blame `75e4db5`/`925f01f`) — left untouched to avoid
+> compounding scope creep; track as a separate SwiftFormat cleanup.
 
 ## C3 — Dual-platform acceptance (MANDATORY — verify BOTH; grep for `error:` / `failed (`)
 
@@ -113,13 +127,43 @@ Do NOT trust tail-piped exit codes; grep the captured logs.
 
 ## C4 — Review and verification [swift6-strict-concurrency]
 
-- [ ] 4.1 `swift-code-reviewer` review: each `nonisolated(unsafe)` justified and minimal; no dead
-  code; retain/release balance unchanged; edits confined to `Context.swift`; 4-space indent;
-  `POSIXError(.CODE)` convention preserved.
-- [ ] 4.2 Address review findings; re-run the macOS no-regression bar (3.1/3.2) and the Linux bar
-  (3.3).
-- [ ] 4.3 Agent memory: record that `swift:6.1` Linux promotes this module's strict-concurrency
-  *warnings* to *errors*, and the fix pattern (local `cbPtr` construction à la `connectWithBridge`
-  for non-`Sendable` pointer captures; `nonisolated(unsafe)` for the must-cross `handler` closure and
-  the immutable `queueKey` static, justified by `eventLoopQueue` confinement).
-- [ ] 4.4 Do NOT commit until the user requests it.
+- [x] 4.1 `swift-code-reviewer` review: **APPROVED — no blocking findings.** Each
+  `nonisolated(unsafe)` justified and minimal (`queueKey` `#if` split read-only/never reassigned;
+  `confinedHandler` at function scope, sole consumer, invoked once on `eventLoopQueue`); no dead code;
+  retain/release balance provably 1:1 on all four exit paths of both runners (no double-free, no leak;
+  cancel-before-run path correctly omits release per `fix-cbdata-cancel-race-uaf`); fix proper confined
+  to `Context.swift`; 4-space indent and `POSIXError(.CODE)` convention preserved. Three **non-blocking**
+  findings deferred to 4.2 / the architect re-gate (see below).
+- [x] 4.2 **Resolved via documentation only — no code change.** Architect re-gate (2026-06-30):
+  RE-GATE APPROVED (conditional). Finding (a) → added `2b.5` + corrected `spec.md` confinement scenario
+  to "library-source fix confined to `Context.swift`" (the old "only `Context.swift` is modified" claim
+  was false as shipped and would have codified a false contract into `openspec/specs/` on archive).
+  Finding (b) → ruled out-of-scope, record-only: added `design.md` deviation #3 disowning the
+  scaffolding (not reverted — merged + user-retained, absent from `spec.md`). Finding (c) → deferred as
+  a separate SwiftFormat `chore:`. Re-gate resolution stamped in `design.md` → Architect Review Gate.
+  **Bars:** macOS no-regression re-confirmed (3.1) — `swift build` exit 0, zero concurrency/Sendable
+  warnings, unit suite 158 tests / 51 skipped / 0 failures. 3.2 (live seam) and 3.3 (Linux
+  `make linuxtest`) NOT re-run: no library/test code changed in 4.2 (artifacts only), so the prior
+  green results (148/0 seam; 114/0 Linux) remain valid. Findings from 4.1 review (all minor, none
+  code-blocking):
+  - (a) **C2b checklist incomplete:** the `, @unchecked Sendable` conformances added to
+    `SMB2DisconnectTimeoutTests`, `SMB2IntegrationTests`, and `SMB2ManagerTests` (shipped in `d2c0d18`)
+    are not enumerated under C2b — add a `2b.5` so the re-gate sees the full test-target surface.
+  - (b) **Unrelated scaffolding in `d2c0d18`:** ~2200 lines of `.agents/`, `.codex/`, `AGENTS.md`,
+    `.gitignore` Codex tooling were bundled into the swift6 commit — flag for architect; ideally a
+    separate `chore:` commit. Not code-blocking.
+  - (c) **Pre-existing indentation (optional):** `async_await_pdu` `catch`/close-brace cascade
+    (`Context.swift` ~1076–1085) is one level too shallow vs `async_await`; predates this change
+    (blame `75e4db5`/`925f01f`); SwiftFormat would auto-correct.
+- [x] 4.3 Agent memory recorded in
+  `.claude/agent-memory/swift-platform-developer/patterns_swift6_linux_strict_concurrency.md`:
+  `swift:6.1` Linux promotes this module's strict-concurrency *warnings* to *errors* (clean macOS build
+  ≠ Linux compiles); fix patterns (block-local `cbPtr` construction à la `connectWithBridge` for
+  non-`Sendable` pointer captures; function-scope `nonisolated(unsafe)` for the must-cross `handler`
+  closure; `#if canImport(Darwin)` split for the `queueKey` static, all justified by `eventLoopQueue`
+  confinement); Linux test-portability gotchas (incl. the `XCTestCase` `@unchecked Sendable`
+  conformance); and the re-gate scope lesson. Architect context file
+  (`.claude/agent-memory/project-architect/swift6-strict-concurrency-context.md`) also present.
+- [x] 4.4 Commit hold released by the user (2026-06-30): close-out committed on branch
+  `chore/archive-fix-swift6-concurrency` (docs/specs only; library code already shipped in
+  `7f4ba04`/`d2c0d18`) and the change archived via `/opsx:archive`.
