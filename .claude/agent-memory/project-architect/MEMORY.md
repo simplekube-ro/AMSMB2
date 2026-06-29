@@ -6,6 +6,7 @@
 
 ## Concurrency / Swift 6
 - swift6-strict-concurrency-context.md — swift:6.1 Linux hard-errors on @Sendable captures macOS only warns on; local cbPtr construction + nonisolated(unsafe) for must-cross handler & queueKey. FINAL REVIEW 2026-06-27: 5 fixes correct & race-safe (retain/release 1:1, no UAF/double-free); confirmed FIRST-HAND macOS Context.swift recompile clean + make linuxtest exit 0 (114 tests/50 skip/0 fail). C2b test-portability fixes (2 test files) accepted into this change. proposal.md Non-Goal still wrongly says "confined to Context.swift" — must reconcile before archive.
+- regate-fix-swift6-concurrency.md — RE-GATE 2026-06-30: C2b test-portability ACCEPTED (inside acceptance bar B); agent scaffolding out-of-scope (record-only, merged + user-requested, no revert). Archive BLOCKED until spec.md "Edits confined to Context.swift" scenario + design.md deviations are corrected for honesty (false as shipped: test files/Dockerfile/tooling all changed).
 
 ## C interop / lifetime ownership
 - cbdata-ownership-contract.md — exactly-once balance rule: never release the passRetained CBData after a PDU is queued; libsmb2 fires every pending cb at smb2_destroy_context; connect path balances via c_data->cb chain; disconnect() leaks-until-deinit (bounded, not a crash). Basis for fix-cbdata-cancel-race-uaf review.

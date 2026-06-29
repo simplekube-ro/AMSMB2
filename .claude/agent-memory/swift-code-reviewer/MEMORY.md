@@ -171,3 +171,10 @@
   needs `#if !canImport(Darwin) import FoundationNetworking`; `NSEC_PER_SEC` is `Int` on Glibc →
   wrap `UInt64(...)`; `NSKeyedUnarchiver` secure-coding tests SIGTRAP on swift-corelibs-foundation →
   guard `#if canImport(Darwin)` (JSON Codable covers redaction cross-platform).
+- 4.1 REVIEW (working tree clean, committed): Context.swift edits in `7f4ba04`; tests/docs in
+  `d2c0d18`. All 6 acceptance items PASS. Two scope-hygiene notes for the ARCHIVE gate (non-blocking):
+  (a) C2b in tasks.md omits the `, @unchecked Sendable` conformances actually added to 3 test classes
+  (SMB2DisconnectTimeoutTests/SMB2IntegrationTests/SMB2ManagerTests) — C2b list is incomplete vs the
+  committed diff; (b) `d2c0d18` ALSO bundles ~2200 lines of unrelated `.agents/`/`.codex/`/`AGENTS.md`
+  Codex scaffolding into the swift6 commit ("per request") — should have been a separate chore. Flag
+  both for the architect re-gate (guardrail 4) before archive.

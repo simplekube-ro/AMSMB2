@@ -36,9 +36,18 @@ the library errors):
   password) — even when the test sets `.setErrorAndReturn` (a nested decoder uses `.raiseException`).
   Guard such tests `#if canImport(Darwin)`; JSON `Codable` covers the same invariant cross-platform.
   `copy(with:)` that rebuilds directly (no archiving) is Linux-safe.
+- `XCTestCase` is **not `Sendable`** on swift-corelibs-foundation → 6.1 strict concurrency rejects
+  `self`-capturing `async`/`Task` test bodies on Linux. Add `, @unchecked Sendable` to the test class
+  (each test runs serially on its own instance; matches `SMB2ManagerUnitTests` already on `master`).
+  Apple's XCTest doesn't need it.
 
 ## Scope lesson
 Fixing the 5 library concurrency errors let the Linux test target compile for the first time, exposing
-4 pre-existing unrelated test-portability defects. "Confine to Context.swift" collided with the
-"make linuxtest must pass" acceptance bar. Resolution: apply the minimal repo-idiomatic test fixes and
-flag the scope expansion in tasks.md/design.md for architect re-gate — don't hide it.
+pre-existing unrelated test-portability defects (FoundationNetworking, NSEC_PER_SEC, NSKeyedUnarchiver
+abort, AND `XCTestCase` non-Sendable). "Confine to Context.swift" collided with the "make linuxtest
+must pass" acceptance bar. Resolution: apply the minimal repo-idiomatic test fixes and flag the scope
+expansion in tasks.md/design.md for architect re-gate — don't hide it. **Re-gate outcome (2026-06-30):
+architect ACCEPTED the test fixes as inside acceptance bar B** (causally downstream of clearing the
+library errors; splitting would deadlock verification) and ruled unrelated bundled tooling
+out-of-scope/record-only. Lesson confirmed: portability fixes required to *evaluate* a gated
+acceptance bar belong in the change; genuinely unrelated artifacts do not.
