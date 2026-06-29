@@ -77,6 +77,38 @@
 - `mapTransportConnectError` (Context.swift:1141): POSIXError/CancellationError pass through, else
   wrapped `POSIXError(.ECONNREFUSED)` → eager-connect failures always surface as POSIXError.
 
+## CBData ownership contract (fix-cbdata-cancel-race-uaf) — VERIFIED against libsmb2 source
+- `generic_handler` (Context.swift ~861) calls `takeRetainedValue()` BEFORE the `guard !isAbandoned`
+  (line ~862). So it MUST fire EXACTLY ONCE per cbPtr — double-fire over-releases → UAF; a manual
+  `.release()` after the PDU is queued double-balances → UAF.
+- RULE: after `smb2_*_async`/`smb2_queue_pdu` SUCCESS (PDU queued), NEVER `Unmanaged.release()` the
+  cbPtr. libsmb2 owns it and fires generic_handler once: on reply (smb2_service) OR during
+  `smb2_destroy_context` (init.c:323-351 sweeps outqueue/pdu/waitqueue, fires every pdu->cb with
+  SMB2_STATUS_SHUTDOWN). Cancel/timeout/onCancel ABANDON (set isAbandoned + resume) WITHOUT releasing.
+  PRE-queue sites (context==nil guard, the `catch` after a throwing setup call, smb2_set_transport!=0,
+  connectResult<0, legacy connect result<0) MUST still release — libsmb2 never took ownership there.
+- Connect chain (seam): `smb2_connect_share_async(...,generic_handler,cbPtr)` → c_data->cb=generic_handler
+  → `smb2_connect_async` → `ext_connect` (transport-external.c:147) fires internal `connect_cb`
+  SYNCHRONOUSLY (queues NEGOTIATE w/ negotiate_cb→c_data) then NULLS `smb2->connect_cb`. At destroy:
+  outqueue sweep fires negotiate_cb(SHUTDOWN)→c_data->cb=generic_handler ONCE + free_c_data; the later
+  `if(smb2->connect_cb)` is NULL → skipped. No double-fire. So connectWithBridge's abandoned branch
+  correctly KEEPS teardownSeam() and drops the release.
+
+## Deterministic post-queue-cancel test (SMB2CBDataLifetimeTests) — PROVEN non-vacuous
+- Gated actor transport whose `connect` parks on `CheckedContinuation<Void, Never>` (NON-throwing —
+  returns normally even when cancelled). waitUntilConnecting → task.cancel() → openGate. connect
+  returns normally → connectWithBridge enters an ALREADY-cancelled `withTaskCancellationHandler`: the
+  onCancel block enqueues to the serial eventLoopQueue SYNCHRONOUSLY (before the operation block) →
+  sets isAbandoned ahead of the setup block → setup block hits the post-queue abandoned branch.
+- To VERIFY a UAF-regression test: temporarily restore the old `.release()`, run
+  `swift test --disable-sandbox --sanitize=address --filter <test>` → expect
+  `heap-use-after-free ... Context.swift:862 in generic_handler` (signal 6); fixed code passes ASan
+  clean. (Proven in this review: old=crash@862, new=pass.) Without ASan the freed access may not crash.
+- Capture `[client]` BY VALUE in the driving `Task` (Swift 6 forbids capturing a mutable `var` in a
+  @Sendable closure); after `task.value` that copy releases so a later `client = nil` is the last ref
+  → deterministic deinit→smb2_destroy_context. SMB2Client/TransportBridge are @unchecked Sendable;
+  SMBTransport is a `Sendable` protocol (actor conforms cleanly).
+
 ## Conventions confirmed
 - Errors: `POSIXError(.CODE)` only, no custom Error types. 4-space indent, 100/132 width, MIT header.
 - No `NSLock.lock()` in async bodies — wrap in a synchronous helper (e.g. `markPreConnected()`).
@@ -93,9 +125,12 @@
   confinedHandler = handler` at FUNCTION scope (not inside block, else capture isn't laundered),
   call `confinedHandler(...)`; (3) `queueKey` needs `#if canImport(Darwin)` split — bare
   `nonisolated(unsafe)` triggers a NEW "'nonisolated(unsafe)' is unnecessary" warning on Apple.
-- Retain/release stays 1:1: block runs exactly once → one passRetained; 4 mutually-exclusive release
-  sites (context==nil guard, isAbandoned guard, catch, success via takeRetainedValue). onCancel never
-  touches cbPtr. Moving passRetained later only NARROWS the bridge-retain window.
+- Retain/release stays 1:1: block runs exactly once → one passRetained. onCancel never touches
+  cbPtr. Moving passRetained later only NARROWS the bridge-retain window. (UPDATE: the old
+  "isAbandoned guard" release site was REMOVED by fix-cbdata-cancel-race-uaf — see the CBData
+  ownership contract section. Post-queue release sites are now ONLY: context==nil guard + the
+  pre-queue `catch`. The abandoned branch ABANDONS without releasing; success balances via
+  generic_handler's takeRetainedValue.)
 - Pre-existing (NOT introduced): `async_await_pdu`'s `} catch {` brace at ~:1022 is under-indented
   (16 not 24 spaces) — same on HEAD. Don't attribute to the concurrency fix.
 - Linux test-portability gotchas (test target only compiles once lib errors clear): `URLCredential`

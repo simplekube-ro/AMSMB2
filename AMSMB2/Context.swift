@@ -940,7 +940,11 @@ extension SMB2Client {
                         // the continuation (it was nil at the time).
                         guard !cb.isAbandoned else {
                             cb.continuation = nil
-                            Unmanaged<CBData>.fromOpaque(cbPtr).release()
+                            // Do NOT release here: the PDU is already queued, so libsmb2 owns cbPtr
+                            // and will fire generic_handler exactly once (on reply, or during
+                            // smb2_destroy_context's teardown sweep), which performs the single
+                            // balancing takeRetainedValue(). Releasing now would double-balance →
+                            // use-after-free (fix-cbdata-cancel-race-uaf).
                             continuation.resume(throwing: CancellationError())
                             return
                         }
@@ -963,6 +967,10 @@ extension SMB2Client {
                             }
                         }
                     } catch {
+                        // Reachable ONLY before the PDU is queued (the only throwing call above is
+                        // the libsmb2 async/queue call itself, which registers nothing on failure).
+                        // NEVER add a throwing call after smb2_*_async/smb2_queue_pdu success or
+                        // this becomes the same double-free fixed in fix-cbdata-cancel-race-uaf.
                         Unmanaged<CBData>.fromOpaque(cbPtr).release()
                         continuation.resume(throwing: error)
                     }
@@ -1040,7 +1048,11 @@ extension SMB2Client {
                         // the continuation (it was nil at the time).
                         guard !cb.isAbandoned else {
                             cb.continuation = nil
-                            Unmanaged<CBData>.fromOpaque(cbPtr).release()
+                            // Do NOT release here: the PDU is already queued, so libsmb2 owns cbPtr
+                            // and will fire generic_handler exactly once (on reply, or during
+                            // smb2_destroy_context's teardown sweep), which performs the single
+                            // balancing takeRetainedValue(). Releasing now would double-balance →
+                            // use-after-free (fix-cbdata-cancel-race-uaf).
                             continuation.resume(throwing: CancellationError())
                             return
                         }
@@ -1062,6 +1074,10 @@ extension SMB2Client {
                             }
                         }
                 } catch {
+                    // Reachable ONLY before the PDU is queued (the only throwing call above is the
+                    // libsmb2 async/queue call itself, which registers nothing on failure). NEVER
+                    // add a throwing call after smb2_*_async/smb2_queue_pdu success or this
+                    // becomes the same double-free fixed in fix-cbdata-cancel-race-uaf.
                     Unmanaged<CBData>.fromOpaque(cbPtr).release()
                     continuation.resume(throwing: error)
                 }
@@ -1305,7 +1321,12 @@ extension SMB2Client {
                     // Race: onCancel may have fired before the continuation was stored.
                     if cb.isAbandoned {
                         cb.continuation = nil
-                        Unmanaged<CBData>.fromOpaque(cbPtr).release()
+                        // Do NOT release here: smb2_connect_share_async has already queued
+                        // NEGOTIATE, so libsmb2 owns cbPtr and will fire generic_handler exactly
+                        // once — via its internal connect callback chain during
+                        // smb2_destroy_context's teardown sweep — which performs the single
+                        // balancing takeRetainedValue(). Releasing now would double-balance →
+                        // use-after-free (fix-cbdata-cancel-race-uaf).
                         self.teardownSeam()
                         continuation.resume(throwing: CancellationError())
                         return
