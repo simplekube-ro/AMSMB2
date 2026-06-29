@@ -85,6 +85,7 @@ Disconnects from the current share.
 
 - **Parameters:**
   - `gracefully` — If `true`, waits for in-flight operations to complete before disconnecting (default: `false`)
+- **Lifetime note:** disconnecting does not destroy the underlying context; its resources are reclaimed when the `SMB2Manager` is released. For long-lived connection pools, prefer constructing a fresh manager over reusing a disconnected one. See [Client lifetime, cancellation, and pooling](ARCHITECTURE.md#client-lifetime-cancellation-and-pooling-consumer-guidance) and [#49](https://github.com/simplekube-ro/AMSMB2/issues/49).
 
 #### `echo()`
 

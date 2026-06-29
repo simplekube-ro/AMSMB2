@@ -76,6 +76,32 @@ sequenceDiagram
     Server-->>Client: Disconnected
 ```
 
+### Client lifetime, cancellation, and pooling (consumer guidance)
+
+These are consumer-facing contracts for code that holds `SMB2Manager`/`SMB2Client` across
+operations (e.g. a connection pool that leases clients to concurrent readers):
+
+- **Recycling or abandoning a client while reads are in flight is use-after-free-safe.**
+  Cancelling the Swift `Task` of an in-flight operation (e.g. when a streaming/proxy session is
+  torn down mid-read) does **not** unschedule the underlying libsmb2 PDU — the C library still
+  owns the callback data and will invoke the callback exactly once (on the eventual reply, or
+  during context teardown). The library keeps that callback data (and the read buffer) alive for
+  libsmb2 until then, so a late callback always lands on valid memory. (Fixed in 5.99.6; see the
+  archived `fix-cbdata-cancel-race-uaf` change.)
+
+- **`disconnect()` does not destroy the context — it is reclaimed at `deinit`.** `disconnect()`
+  closes the transport and fails pending operations, but the `smb2_context` and the callback data
+  of any still-pending operation are not freed until the client is released and `deinit` runs
+  `smb2_destroy_context`. A client that is `disconnect()`-ed but **retained** therefore pins those
+  resources until it is dropped.
+
+- **For long-lived pools, prefer constructing a fresh client over `disconnect()` + reuse.**
+  Releasing the client (letting it `deinit`) performs the full teardown and drains pending PDUs.
+  Reusing a `disconnect()`-ed instance keeps the leak window above open and risks interaction with
+  PDUs left queued in libsmb2. (Interim guidance — to be made a hard rule if
+  [#49](https://github.com/simplekube-ro/AMSMB2/issues/49) lands the `disconnect()`-destroys-context
+  change, after which a `disconnect()`-ed instance cannot be reused at all.)
+
 ## Async Operation Flow
 
 Every SMB2 operation follows the same pattern: Swift async/await is bridged to libsmb2's C callback-based async API through a serial event loop queue and `DispatchSource`-based socket monitoring.
@@ -216,8 +242,9 @@ Every async operation supports Swift task cancellation. The pattern is consisten
 
 - **Fast-path check**: `Task.checkCancellation()` is called at the start of every `async_await` and `async_await_pdu` call, before submitting the PDU to libsmb2. If the task is already cancelled, `CancellationError` is thrown immediately without touching the network.
 - **`withTaskCancellationHandler`**: Each `async_await` call is wrapped in `withTaskCancellationHandler`. The `onCancel` closure dispatches to `eventLoopQueue` and sets `CBData.isAbandoned = true`, then resumes the `CheckedContinuation` with `CancellationError`. This unblocks the suspended Swift task immediately even if the network is slow.
-- **Buffer safety**: When a read operation is cancelled after a `RawBuffer` has been checked out, the buffer is passed to `abandon()` rather than `checkin()`. This intentional leak ensures the pointer remains valid for the duration of libsmb2's pending callback — after the callback fires, the abandoned buffer's memory is freed by the callback handler.
+- **Buffer safety**: When a read operation is cancelled after a `RawBuffer` has been checked out, the buffer is passed to `abandon()` rather than `checkin()`. This keeps the pointer valid for libsmb2's still-pending callback (which may write into it). Because the eventual `generic_handler` returns early on `isAbandoned` (below), the read's data handler — which is what would `checkin` the buffer — never runs, so an abandoned buffer is an **intentional permanent leak, bounded to one buffer per cancelled read**. Returning it to the pool would corrupt a later operation; deallocating it would be a use-after-free — leaking is the only safe choice.
 - **No double-resume**: `CBData.isAbandoned` ensures that if `generic_handler` fires after the cancellation path has already resumed the continuation, the completion is silently dropped.
+- **Callback-data lifetime**: the `CBData` handed to libsmb2 is kept alive (via `passRetained`) for the full lifetime of the pending PDU and released by exactly one `takeRetainedValue()` inside `generic_handler` — never by a cancellation/timeout path after the PDU has been queued. See [Client lifetime, cancellation, and pooling](#client-lifetime-cancellation-and-pooling-consumer-guidance) for the consumer-facing consequences.
 
 ## Source File Map
 
