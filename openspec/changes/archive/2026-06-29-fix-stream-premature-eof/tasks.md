@@ -109,10 +109,23 @@ through the seam with ZERO failures, AND the streaming test passes repeatedly ac
 
 ## C4 — Review and verification [stream-eof-semantics]
 
-- [ ] 4.1 `swift-code-reviewer` review (correctness + simplification): no dead code, no new
-  warnings, `POSIXError(.CODE)` style, 4-space indent, no lock held across `await`.
-- [ ] 4.2 Address review findings; re-run unit suite + the live FULL-suite + repeated-stream gate.
+- [x] 4.1 `swift-code-reviewer` review (correctness + simplification): no dead code, no new
+  warnings, `POSIXError(.CODE)` style, 4-space indent, no lock held across `await`. (Approved with
+  reservations: 1 should-fix — the consumer classified reads via *unlocked* `streamStatus`/
+  `streamError` accesses, the first genuinely cross-thread-mutable field after the G1 fix, so a torn
+  read could throw the `EIO` fallback instead of the producer's stored error; 1 nice-to-have — the
+  empty-buffer `return 0` sentinel could masquerade as clean EOF.)
+- [x] 4.2 Address review findings; re-run unit suite + the live FULL-suite + repeated-stream gate.
+  (Finding 1: added `AsyncInputStream.statusSnapshot()` reading both fields once under `bufferLock`;
+  consumer now classifies off a single locked snapshot via a `StreamStatusSnapshotting` marker
+  protocol — `bufferLock` released before `await Task.yield()`. Finding 2: `precondition(chunkSize
+  > 0)` + the unreachable defensive branch returns `-1` instead of `0`. New unit test
+  `testStatusSnapshotReturnsStoredErrorOnErrorPath`. `swift-code-reviewer` re-verified: APPROVED.
+  Re-ran live through `SMB_TRANSPORT=seam`: FULL suite 158 executed / 0 failures; stream gate x8 all
+  pass, 6 runs > 5 MiB (up to ~15 MiB), none truncate at `5242880`.)
 - [x] 4.3 Agent memory: record the `AsyncInputStream` premature-EOF root cause, the
   `producerFinished` + would-block-retry fix, and the consumer would-block contract.
   (`.claude/agent-memory/swift-platform-developer/patterns_async_input_stream_eof.md` + MEMORY.md index.)
-- [ ] 4.4 Do NOT commit until the user requests it.
+- [ ] 4.4 Do NOT commit until the user requests it. (Original fix landed as commit `4f89b99`; the
+  4.2 follow-up fixes — `statusSnapshot()`/marker protocol, `precondition`, new unit test — and this
+  archive remain uncommitted in the working tree, awaiting the user's commit request.)

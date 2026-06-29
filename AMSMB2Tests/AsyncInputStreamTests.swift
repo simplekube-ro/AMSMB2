@@ -147,4 +147,20 @@ final class AsyncInputStreamTests: XCTestCase, @unchecked Sendable {
         let result = readOnce(stream, maxLength: 64)
         XCTAssertEqual(result, -1)
     }
+
+    func testStatusSnapshotReturnsStoredErrorOnErrorPath() async throws {
+        let sequence = AsyncThrowingStream<Data, any Error> { continuation in
+            continuation.finish(throwing: StreamTestError.boom)
+        }
+        let stream = AsyncInputStream(stream: sequence)
+        stream.open()
+
+        try await waitForStatus(stream, .error)
+
+        // The snapshot pairs status and error from a single locked read: on the error path it
+        // must carry both `.error` and the producer's stored error together (G1).
+        let (status, error) = stream.statusSnapshot()
+        XCTAssertEqual(status, .error)
+        XCTAssertEqual(error as? StreamTestError, .boom)
+    }
 }

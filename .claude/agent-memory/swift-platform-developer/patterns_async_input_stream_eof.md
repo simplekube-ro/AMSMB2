@@ -39,6 +39,29 @@ it applying to both; use an explicit `let isWouldBlock = (status == .open || sta
 - Live (Docker Samba, `SMB_TRANSPORT=seam`): FULL suite 148 tests / 0 failures; stream test x8 random
   sizes (up to ~14 MB), final `uploaded == size` every run, no `5242880` truncation.
 
+## Review follow-up (task 4.2): single locked snapshot + generic-erasure dispatch
+After G1 made `_streamError` the first genuinely cross-thread-mutable field, the consumer's `-1`
+classification (reading `stream.streamStatus`/`stream.streamError` UNLOCKED, 3+2 separate reads)
+could tear and throw the generic `EIO` fallback. Fixes:
+- `AsyncInputStream.statusSnapshot() -> (Stream.Status, (any Error)?)` = `bufferLock.withLock {
+  (_streamStatus, _streamError) }`. Returns BEFORE any `await` — lock never held across await.
+- Consumer classifies off ONE snapshot: `let (status, error) = …; if status == .error { throw error
+  ?? EIO }; isWouldBlock = (status==.open||.reading) && error==nil`.
+- **Dispatch trap**: `write(client:from stream:InputStream,...)` receives EITHER an `AsyncInputStream`
+  (streaming path, AMSMB2.swift ~line 1210) OR a plain `InputStream(url:)` (upload path, ~line 1347).
+  `statusSnapshot()` is subclass-only and `AsyncInputStream<Seq>` is generic, so `as? AsyncInputStream`
+  won't compile. Solution: marker protocol `StreamStatusSnapshotting` that ONLY `AsyncInputStream`
+  conforms to (empty `extension AsyncInputStream: StreamStatusSnapshotting {}`), then
+  `(stream as? any StreamStatusSnapshotting)?.statusSnapshot() ?? (stream.streamStatus, stream.streamError)`.
+  Plain InputStream isn't cross-thread-mutated → direct reads are an equivalent fallback. Do NOT try a
+  protocol default impl + conform InputStream too: a witness in a base-class extension is statically
+  dispatched and the subclass can't override it (re-declaring conformance = "redundant conformance").
+- **Finding 2**: in `write`, `precondition(chunkSize > 0, ...)` right after `chunkSize` is computed,
+  and the `baseAddress` defensive guard returns `-1` (truly unreachable), NOT `0` — an empty buffer
+  must never masquerade as clean EOF (silent empty-file success).
+- Test added: `testStatusSnapshotReturnsStoredErrorOnErrorPath` asserts the snapshot pairs `.error`
+  with the stored error.
+
 ## zsh env-passing trap (cost ~30 min this run)
 The recipe's `E="…"; env $E swift test` is **bash-only**. zsh (this repo's default shell) does NOT
 word-split unquoted `$E`, so the entire string becomes `SMB_SERVER`'s value → `URL(string:)` is
