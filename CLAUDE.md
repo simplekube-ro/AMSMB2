@@ -169,6 +169,10 @@ Minimise token usage — this directly affects cost and speed:
 - `make integrationtest` / `./scripts/test-integration.sh` runs integration tests with Docker — use `-v` for verbose output
 - `SMB2Client.disconnect()` is async and does not nil the context — can't simulate fully disconnected state in unit tests
 
+## C Interop & Concurrency Gotchas
+
+- Never `Unmanaged<CBData>.fromOpaque(cbPtr).release()` after the PDU is queued (`smb2_*_async`/`smb2_queue_pdu` success). libsmb2 then owns `cbPtr` and fires `generic_handler` exactly once — on reply or during `smb2_destroy_context`'s teardown sweep — which does the single balancing `takeRetainedValue()`. Releasing post-queue double-balances → use-after-free. Cancellation/timeout must abandon (set `isAbandoned`, resume the continuation) WITHOUT releasing, like the `onCancel` path.
+
 ## Commit Convention
 
 Conventional commits: `fix:`, `feat:`, `docs:`, `chore:`, `refactor:`, `test:`

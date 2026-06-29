@@ -7,5 +7,8 @@
 ## Concurrency / Swift 6
 - swift6-strict-concurrency-context.md — swift:6.1 Linux hard-errors on @Sendable captures macOS only warns on; local cbPtr construction + nonisolated(unsafe) for must-cross handler & queueKey. FINAL REVIEW 2026-06-27: 5 fixes correct & race-safe (retain/release 1:1, no UAF/double-free); confirmed FIRST-HAND macOS Context.swift recompile clean + make linuxtest exit 0 (114 tests/50 skip/0 fail). C2b test-portability fixes (2 test files) accepted into this change. proposal.md Non-Goal still wrongly says "confined to Context.swift" — must reconcile before archive.
 
+## C interop / lifetime ownership
+- cbdata-ownership-contract.md — exactly-once balance rule: never release the passRetained CBData after a PDU is queued; libsmb2 fires every pending cb at smb2_destroy_context; connect path balances via c_data->cb chain; disconnect() leaks-until-deinit (bounded, not a crash). Basis for fix-cbdata-cancel-race-uaf review.
+
 ## Stream / upload
 - stream-premature-eof.md — AsyncInputStream 5 MiB upload truncation (`.atEnd` on transient drain). Fix = producerFinished + would-block `-1` + consumer Task.yield retry. Gate guardrails: G1 set `_streamError` (never assigned!), G2 error on `streamStatus==.error`, G3 narrow would-block (.open/.reading only), G4 delete orphaned readData, G5 consumer only sees AsyncInputStream.
