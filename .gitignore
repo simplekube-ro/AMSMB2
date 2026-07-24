@@ -70,5 +70,8 @@ Package.resolved
 # Build/test log artifacts
 *.log
 
+# Repo-local scratch dir (agent report markers, temp files)
+tmp/
+
 # Linux core dumps from make linuxtest (volume-mounted container crashes)
 core

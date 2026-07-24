@@ -1,0 +1,71 @@
+{
+  "_note": "Staged by Claude (port from RandomPlayer). Review, then activate with: mv .claude/settings.json.ported .claude/settings.json",
+  "enabledPlugins": {
+    "code-review@claude-plugins-official": true,
+    "feature-dev@claude-plugins-official": true,
+    "code-simplifier@claude-plugins-official": true,
+    "superpowers@claude-plugins-official": true
+  },
+  "permissions": {
+    "allow": [
+      "Bash(swift build:*)",
+      "Bash(swift test:*)",
+      "Bash(swift package:*)",
+      "Bash(swift:*)",
+      "Bash(openspec:*)",
+      "Bash(./scripts/test-integration.sh:*)",
+      "Bash(make integrationtest:*)",
+      "Bash(make linuxtest:*)",
+      "Bash(docker:*)",
+      "Bash(docker-compose:*)",
+      "Bash(gh:*)",
+      "mcp__codebase-memory-mcp__search_code",
+      "mcp__codebase-memory-mcp__search_graph",
+      "mcp__codebase-memory-mcp__get_code_snippet",
+      "mcp__codebase-memory-mcp__trace_path",
+      "mcp__codebase-memory-mcp__query_graph",
+      "mcp__codebase-memory-mcp__get_architecture",
+      "mcp__codebase-memory-mcp__get_graph_schema",
+      "mcp__codebase-memory-mcp__list_projects",
+      "mcp__codebase-memory-mcp__index_status",
+      "mcp__codebase-memory-mcp__index_repository"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR/.claude/hooks/openspec-review-gate.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "SendMessage",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR/.claude/hooks/record-agent-report.sh\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "TeammateIdle": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR/.claude/hooks/teammate-report-gate.sh\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

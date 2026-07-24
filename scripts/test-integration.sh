@@ -20,6 +20,39 @@ cd "$PROJECT_ROOT"
 SKIP_DOCKER=false
 FILTER=""
 VERBOSITY=0
+KNOWN_FLAKY_FILE="$SCRIPT_DIR/known-flaky.txt"
+
+# --- known-flaky helpers (quarantine lane; see scripts/known-flaky.txt) ---
+# Returns 0 if any known-flaky entry is a substring of the given test name.
+# Note: quarantine classification only applies in summary (non -v) mode.
+is_quarantined() {
+    local name="$1" entry
+    [[ -f "$KNOWN_FLAKY_FILE" ]] || return 1
+    while IFS= read -r entry || [[ -n "$entry" ]]; do
+        entry="${entry%%#*}"
+        # trim surrounding whitespace
+        entry="$(printf '%s' "$entry" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+        [[ -n "$entry" ]] || continue
+        [[ "$name" == *"$entry"* ]] && return 0
+    done < "$KNOWN_FLAKY_FILE"
+    return 1
+}
+
+# Prints known-flaky entries that PASSED this run (removal candidates).
+flag_removal_candidates() {
+    local entry
+    [[ -f "$KNOWN_FLAKY_FILE" ]] || return 0
+    while IFS= read -r entry || [[ -n "$entry" ]]; do
+        entry="${entry%%#*}"
+        entry="$(printf '%s' "$entry" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+        [[ -n "$entry" ]] || continue
+        if echo "$OUTPUT" | grep "' passed " | grep -qF "$entry"; then
+            echo "  ℹ known-flaky entry '$entry' passed this run — removal candidate"
+        fi
+    done < "$KNOWN_FLAKY_FILE"
+    return 0
+}
+# --- end known-flaky helpers ---
 
 # Show help
 show_help() {
@@ -126,11 +159,41 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 if [[ $VERBOSITY -eq 0 ]]; then
     if [[ "$FAILED" -eq 0 && "$PASSED" -gt 0 ]]; then
         echo "✓ $PASSED passed, $SKIPPED skipped"
+        flag_removal_candidates
     elif [[ "$FAILED" -gt 0 ]]; then
-        echo "✗ $PASSED passed, $FAILED failed, $SKIPPED skipped"
-        echo ""
-        echo "Failed tests:"
-        echo "$OUTPUT" | grep "' failed " | sed "s/^[^']*'\([^']*\)'.*/  ✗ \1/" || true
+        # Classify failures against the known-flaky quarantine list.
+        REAL_FAILURES=""
+        QUARANTINED=""
+        REAL_COUNT=0
+        QUAR_COUNT=0
+        while IFS= read -r name; do
+            [[ -n "$name" ]] || continue
+            if is_quarantined "$name"; then
+                QUARANTINED="$QUARANTINED  ⚠ $name"$'\n'
+                QUAR_COUNT=$((QUAR_COUNT + 1))
+            else
+                REAL_FAILURES="$REAL_FAILURES  ✗ $name"$'\n'
+                REAL_COUNT=$((REAL_COUNT + 1))
+            fi
+        done <<EOF
+$(echo "$OUTPUT" | grep "' failed " | sed "s/^[^']*'\([^']*\)'.*/\1/" | sort -u)
+EOF
+        if [[ "$REAL_COUNT" -eq 0 ]]; then
+            echo "✓ $PASSED passed, $SKIPPED skipped"
+            echo "⚠ $QUAR_COUNT quarantined (known flaky):"
+            printf '%s' "$QUARANTINED"
+            TEST_EXIT_CODE=0
+        else
+            echo "✗ $PASSED passed, $FAILED failed, $SKIPPED skipped"
+            echo ""
+            echo "Failed tests:"
+            printf '%s' "$REAL_FAILURES"
+            if [[ "$QUAR_COUNT" -gt 0 ]]; then
+                echo "Quarantined (known flaky, not counted against the run):"
+                printf '%s' "$QUARANTINED"
+            fi
+        fi
+        flag_removal_candidates
     else
         echo "⚠ No test results found"
         echo "$OUTPUT" | tail -5

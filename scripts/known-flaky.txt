@@ -1,0 +1,14 @@
+# Known-flaky integration tests — machine-checkable quarantine list.
+#
+# One entry per line; an entry quarantines any failure whose test name
+# contains it as a substring (e.g. `SMB2ManagerTests testCopy` or just
+# `testMonitorItem`). Lines starting with # and blank lines are ignored.
+#
+# test-integration.sh diffs every run's failures against this list:
+#   - failures matching an entry are reported in a "quarantined (known flaky)"
+#     lane and do NOT fail the run (exit 0 if nothing else failed)
+#   - any unlisted failure still exits 1
+#   - entries whose tests passed are flagged as removal candidates
+#
+# Keep forensics for each entry (why it's flaky, tracking issue) as a trailing
+# comment on the line or in CLAUDE.md / the linked issue.
