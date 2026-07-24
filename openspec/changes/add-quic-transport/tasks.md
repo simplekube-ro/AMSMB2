@@ -191,10 +191,13 @@ TDD applies throughout: each task starts by writing/updating the tests for its s
 
 ## 4. Interop verification (the release gate)
 
-- [ ] 4.1 Stand up the interop rig: Samba 4.23+ with `server smb transports = +quic` in a
-      Lima/UTM VM with a 6.14+ kernel and `quic.ko` (or a Windows Server 2025 target); document
-      the repeatable procedure in `docs/` (quic.ko constraint makes Docker CI infeasible — see
-      design Risks)
+- [ ] 4.1 Interop rig: **stood up and Samba↔Samba-verified 2026-07-24** on
+      `ubuntu-brix.kaveman.intra` — DKMS `quic.ko` (lxin/quic) on the host, Samba 4.23.6 with
+      `server smb transports = +quic` in Docker (image `samba-quic:4.23.6`; rig, lab CA, and
+      README in `~/smb-quic-rig/` on the box; test share `//ubuntu-brix.kaveman.intra/share`,
+      user smbtest). Remaining: port the rig README (incl. the libquic-version, TLS-key-uid,
+      and silent-QUIC-drop traps) into `docs/` as the repeatable interop procedure (WS2025
+      target deferred — see design Risks/Open Questions)
 - [ ] 4.2 First-contact gate: QUIC handshake + NEGOTIATE round-trip; **verify the 4-byte framing
       assumption on the wire** (design D2 must-verify). If framing differs, stop and fix in the
       libsmb2 fork seam before proceeding
@@ -204,7 +207,11 @@ TDD applies throughout: each task starts by writing/updating the tests for its s
       peer-originated graceful EOF (design D8 — NOT a guaranteed-DISCONNECT-delivery check), and
       the live TLS trust matrix from task 2.4: system trust with correct host, invalid/untrusted
       certificate rejected, custom root with correct hostname, custom root with wrong hostname,
-      system-root exclusion under `.customRoots`, insecure mode
+      system-root exclusion under `.customRoots`, insecure mode. Against the 4.1 rig: the
+      custom-root anchor is the rig's lab CA (`~/smb-quic-rig/tls/ca.crt` on ubuntu-brix,
+      DER-converted) — the server cert chains only to it, so it also exercises system-trust
+      rejection; correct hostname = `ubuntu-brix.kaveman.intra` (cert SANs include
+      `ubuntu-brix` and `localhost` for the wrong/alternate-hostname cases)
 - [ ] 4.4 Fold interop findings back: idle-timeout/keepalive tuning only if 4.3 shows premature
       teardown; update design.md with what was actually observed
 
