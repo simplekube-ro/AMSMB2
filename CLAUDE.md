@@ -2,6 +2,16 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Working Rules
+
+1. **Think before coding** — No silent assumptions. State what you're assuming, surface tradeoffs, ask before guessing. Push back when a simpler approach exists.
+2. **Simplicity first** — Minimum code that solves the problem. No speculative features, no abstractions for single-use code.
+3. **Surgical changes** — Touch only what you must. Don't "improve" adjacent code, comments, or formatting. Don't refactor what isn't broken.
+4. **Surface conflicts, don't average them** — If two existing patterns in the codebase contradict, don't blend them. Pick one (the more recent / more tested), explain why, and flag the other for cleanup.
+5. **Read before you write** — Before adding code in a file, read the file's public surface, the immediate caller, and any obvious shared utilities. If you don't understand why existing code is structured the way it is, ask before adding to it.
+6. **Tests verify intent, not just behavior** — Every test must encode WHY the behavior matters. If you can't write a test that would fail when the logic changes, the test is wrong.
+7. **Fail loud** — "Tests pass" is wrong if you skipped any. "Feature works" is wrong if you didn't verify the edge case asked about. Default to surfacing uncertainty, not hiding it.
+
 ## Project Overview
 
 AMSMB2 is a Swift library that wraps [libsmb2](https://github.com/simplekube-ro/libsmb2) (fork of [sahlberg/libsmb2](https://github.com/sahlberg/libsmb2) with pluggable external-transport API; `Dependencies/libsmb2` submodule points here) to provide SMB2/3 file operations for Apple platforms (iOS 13+, macOS 10.15+, tvOS 14+, watchOS 6+, visionOS 1+) and Linux.
@@ -95,12 +105,16 @@ Use the `/opsx:` slash commands to drive the workflow:
 | `/opsx:propose` | Create a new change with all artifacts (proposal, design, specs, tasks) |
 | `/opsx:apply` | Implement tasks from a change |
 | `/opsx:explore` | Think through ideas before proposing |
+| `/opsx:verify` | Verify implementation matches change artifacts before archiving |
 | `/opsx:archive` | Archive a completed change |
+
+Additional commands for finer-grained workflows: `/opsx:new`, `/opsx:continue`, `/opsx:ff`, `/opsx:sync`, `/opsx:bulk-archive`, `/opsx:onboard`.
 
 ### Guidelines
 
 - **MANDATORY**: All features, bug fixes, and non-trivial changes MUST go through the OpenSpec process (`/opsx:propose` → `/opsx:apply` → `/opsx:archive`). Do not skip proposal/design/specs for any change that touches more than a single file or introduces new behavior. Quick typo fixes and config tweaks are exempt.
-- **Review gate**: Every proposal MUST be reviewed by the `project-architect` agent before moving to `/opsx:apply`.
+- **Review gate**: Every proposal MUST be reviewed by the `project-architect` agent before moving to `/opsx:apply`, with the verdict (`APPROVED` / `APPROVED WITH CONDITIONS` / `NEEDS REVISION`) recorded in a `## Review` section of proposal.md. This is enforced deterministically: a PreToolUse hook (`.claude/hooks/openspec-review-gate.py`) blocks `openspec instructions apply` until proposal.md carries an APPROVED verdict.
+- **Pre-archive verification**: Run `/opsx:verify` before `/opsx:archive` to confirm the implementation matches the specs/tasks/design.
 - **Artifacts must reflect implementation**: If the approach changes during implementation, update the proposal, design, and specs to match what was actually shipped.
 - **Verify before implementing**: Design docs may contain incorrect analysis. Verify claims about existing code behavior (especially "this is wrong/inverted") before changing working code.
 - **Specs are testable**: Each requirement has scenarios in WHEN/THEN format.
@@ -167,6 +181,7 @@ Minimise token usage — this directly affects cost and speed:
 - C library functions (`smb2_*`) require `import SMB2` in test files; not re-exported via `@testable import AMSMB2`
 - `SMB2Manager` has multiple `contents(atPath:)` overloads — in async test context, compiler picks `async throws -> Data` over `AsyncThrowingStream`. Use explicit type: `let stream: AsyncThrowingStream<Data, any Error> = smb.contents(atPath:)`
 - `make integrationtest` / `./scripts/test-integration.sh` runs integration tests with Docker — use `-v` for verbose output
+- **Known-flaky quarantine**: [`scripts/known-flaky.txt`](scripts/known-flaky.txt) lists known-flaky integration tests; `test-integration.sh` (summary mode) reports matching failures in a `⚠ quarantined (known flaky)` lane (exit 0 if nothing else failed), still fails on unlisted failures, and flags quarantined entries that passed as removal candidates. Re-run a suspect test in isolation before adding it to the list.
 - `SMB2Client.disconnect()` is async and does not nil the context — can't simulate fully disconnected state in unit tests
 
 ## C Interop & Concurrency Gotchas
