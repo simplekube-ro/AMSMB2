@@ -706,10 +706,20 @@ gains the same guarantee.
 - [Framing assumption wrong over QUIC] → Verified as first interop gate (D2); contingency is a
   seam-level fix in the libsmb2 fork, transport unchanged. Until interop passes, the feature is
   unreleased-opt-in, so blast radius is zero.
-- [No CI-able QUIC server: Samba needs `quic.ko` (~6.14 kernel) — Docker Desktop's LinuxKit VM
-  can't load it] → Interop is a documented manual procedure (Lima/UTM VM with a 6.14+ kernel, or
-  a WS2025 target); CI keeps MockTransport-based unit coverage. Tracked as an explicit task, not
-  silently dropped.
+- [No CI-able QUIC server: Samba needs `quic.ko` — no distro kernel ships it (not mainlined as
+  of Linux 7.0), and GitHub macOS runners cannot reach a module-capable Linux host] → CI keeps
+  MockTransport-based unit coverage. Interop runs against the standing lab rig, verified
+  2026-07-24 on `ubuntu-brix.kaveman.intra` (Ubuntu 26.04, kernel 7.0): `quic.ko` built
+  out-of-tree from lxin/quic via DKMS (builds against kernels ≥ 6.1; verified on 7.0, newer
+  than Samba's tested 6.14), Samba 4.23.6 + libquic in Docker (image `samba-quic:4.23.6`, rig
+  in `~/smb-quic-rig/` with README). Samba↔Samba smbclient QUIC transfers verified over the
+  published UDP/443 by DNS hostname with lab-CA TLS (tcpdump-confirmed QUIC). Known rig traps,
+  documented in the rig README: Samba requires `libquic >= 1.1` but upstream's `.pc` says 1.0
+  (build the `samba` branch and patch the installed `.pc`, else configure silently disables
+  QUIC); a TLS key not uid-0/0600 makes smbd drop the QUIC listener with only a warning and
+  serve TCP; `ss` cannot list `IPPROTO_QUIC` sockets — health-check with a client connect.
+  Note the rig verifies the server side only; the D2 must-verify framing gate still runs at
+  first contact with our client (task 4.2).
 - [`NWProtocolQUIC` behavioral unknowns (idle timeout, keepalive, stream-data limits) under
   long-lived SMB sessions] → Start with system defaults; `maxIdleTimeout`/keepalive only get
   surfaced if interop shows premature idle teardown. The existing timer-driven servicing loop
@@ -731,8 +741,10 @@ Rollback = don't set `.quic` (default path untouched). RandomPlayer #347 adopts 
 
 ## Open Questions
 
-- Exact `quic.ko` interop rig (Lima VM with mainline 6.14 kernel vs. cloud WS2025 instance) —
-  resolved during the interop task; does not block implementation.
+- ~~Exact `quic.ko` interop rig (Lima VM with mainline 6.14 kernel vs. cloud WS2025 instance)~~ —
+  **resolved 2026-07-24**: external Ubuntu 26.04 box (`ubuntu-brix.kaveman.intra`) with DKMS
+  `quic.ko` and Samba 4.23.6 in Docker, stood up and verified Samba↔Samba (see Risks).
+  WS2025 deferred until a Windows target is available.
 - Whether `.automatic` should ever try QUIC (e.g. after a successful QUIC connection is cached)
   — deferred; revisit post-interop with RandomPlayer #347 experience.
 - NTLM-over-QUIC vs Kerberos: libsmb2 does NTLMSSP; WS2025 workgroup/NTLM path is the realistic
