@@ -7,7 +7,9 @@
 The library SHALL provide a public `QUICTransportApple` class conforming to `SMBTransport`,
 backed directly by `NWConnection` with `NWProtocolQUIC` (no NIO, no third-party QUIC stack),
 compiled only where `Network` is available and availability-gated to
-iOS 15 / macOS 12 / tvOS 15 / watchOS 8 / visionOS 1 or later.
+iOS 15 / macOS 12 / macCatalyst 15 / tvOS 15 / watchOS 8 / visionOS 1 or later (the macCatalyst
+floor SHALL be spelled out explicitly in the `@available` annotation — Package.swift declares
+`.macCatalyst(.v13)`, so Catalyst is a supported destination whose floor must not be implicit).
 
 #### Scenario: Conformer is a pure byte pipe
 
@@ -20,6 +22,14 @@ iOS 15 / macOS 12 / tvOS 15 / watchOS 8 / visionOS 1 or later.
 - **WHEN** the library is built for a deployment target older than the QUIC availability floor
 - **THEN** the package still compiles (package platform minimums are unchanged) and
   `QUICTransportApple` is only usable behind an `@available` check
+
+#### Scenario: macCatalyst floor is explicit and buildable
+
+- **WHEN** the library is built for the macCatalyst destination (package floor macCatalyst 13)
+- **THEN** the build succeeds and every QUIC availability annotation names `macCatalyst 15`
+  explicitly
+- **NOTE** verified by a macCatalyst build check plus annotation inspection in the pre-archive
+  sweep (task 5.3)
 
 ### Requirement: QUIC handshake uses ALPN "smb", TLS 1.3, and SNI
 
@@ -41,6 +51,101 @@ the Microsoft/Samba SMB-over-QUIC interop behavior.
 - **THEN** `connect` throws a `POSIXError` (never a raw Network.framework error), preserving
   `CancellationError` when the task was cancelled
 
+### Requirement: connect claims its outcome atomically — selection and side effects in one transition
+
+`connect(host:port:)` SHALL be a self-contained lifecycle that does not depend on libsmb2's
+cancellation/timeout machinery (which is not installed during the eager transport connect). It
+SHALL guard the connect outcome with a lock-protected state transition through which every
+completion path — ready, failure, task cancellation, `close()`, deadline expiry — atomically
+claims the outcome **before** performing any cancellation or cleanup: exactly one path wins the
+claim, and only the winner performs side effects. If `.ready` wins, the transport SHALL retain
+the connection for `send`/`receive` (the connection reference SHALL NOT be cleared on
+successful connect), and every later losing path SHALL perform no cancellation and no
+destructive cleanup (in particular, a losing task-cancellation handler SHALL NOT cancel the
+`NWConnection`). If task cancellation, deadline expiry, failure, or `close()` wins before
+readiness, the winner SHALL cancel and release the connection exactly once (clearing the stored
+reference and state handler) and resume the continuation with the mapped error. It SHALL handle
+every `NWConnection` state explicitly — `.setup`/`.preparing` (progress), `.waiting`
+(non-terminal; record the error and keep waiting), `.ready` (success), `.failed` (mapped
+`POSIXError`), `.cancelled` (terminal acknowledgment of a requested cancel) — and SHALL enforce
+a deterministic, always-armed connect deadline from the validated `connectTimeout` supplied at
+construction (sourced from `SMBQUICConfiguration.connectTimeout`, design D10 — never from
+`SMB2Manager.timeout`). Once `.ready` has won, a later `.failed`/`.cancelled` state event SHALL
+route to the established-connection lifecycle (design D8), which discriminates recorded causes
+— a `.cancelled` whose local-close cause was recorded by `close()` is the local-close teardown
+signal, while an unsolicited event is abnormal transport loss — and SHALL NOT re-enter connect
+completion. Error contract: task cancellation → `CancellationError`; `close()` while
+connecting → `POSIXError(.ECONNABORTED)`; deadline expiry → `POSIXError(.ETIMEDOUT)`; `.failed`
+→ mapped `POSIXError` (design D7).
+
+#### Scenario: Cancellation before start
+
+- **WHEN** the task is already cancelled when `connect(host:port:)` is called
+- **THEN** it throws `CancellationError` before any `NWConnection` is created
+
+#### Scenario: Cancellation while waiting
+
+- **WHEN** the injected driver holds the connection in `.waiting` and the task is cancelled
+- **THEN** the cancellation claims the outcome, exactly one `cancel()` is issued to the
+  connection, and `connect` throws `CancellationError`
+
+#### Scenario: Ready-versus-cancel race — winner owns the connection
+
+- **WHEN** `.ready` and a cancellation request race
+- **THEN** exactly one outcome wins the atomic claim: `connect` either returns success or
+  throws `CancellationError`, and the continuation is resumed exactly once
+- **AND** if `.ready` wins, the losing cancellation performs no `cancel()` and no destructive
+  cleanup — the established connection remains retained and usable for `send`/`receive`
+- **AND** if cancellation wins, exactly one `cancel()` is issued and the connection reference
+  is released
+
+#### Scenario: Failure-versus-cancel race
+
+- **WHEN** `.failed` and a cancellation request race
+- **THEN** the continuation is resumed exactly once with either the mapped `POSIXError` or
+  `CancellationError`, never both, never neither, and the connection is cancelled and released
+  exactly once
+
+#### Scenario: Close while connecting
+
+- **WHEN** `close()` is called while `connect` is in flight and wins the claim
+- **THEN** the `NWConnection` is cancelled and released exactly once and `connect` throws
+  `POSIXError(.ECONNABORTED)`
+
+#### Scenario: Deadline expiry
+
+- **WHEN** the connection has not reached `.ready` when the deadline scheduler fires
+  `connectTimeout`
+- **THEN** the `NWConnection` is cancelled exactly once and `connect` throws
+  `POSIXError(.ETIMEDOUT)` (the description includes the last `.waiting` error when one was
+  observed)
+- **AND** a deadline that fires after `.ready` has won the claim is a side-effect-free no-op
+
+#### Scenario: Successful connect keeps the connection
+
+- **WHEN** `connect` completes successfully
+- **THEN** the connection reference is retained for subsequent `send`/`receive` (it is not
+  cleared or cancelled by connect-phase cleanup) and the deadline timer is cancelled
+
+#### Scenario: Post-ready failure routes to the receive path
+
+- **WHEN** the connection fails after `.ready` has already won the connect claim
+- **THEN** the failure surfaces through `receive()` as abnormal transport loss
+  (`POSIXError`, design D8) and does not touch connect completion
+
+#### Scenario: No double resume or leaked continuation
+
+- **WHEN** any combination of ready, failure, task cancellation, `close()`, and deadline expiry
+  occurs, in any order
+- **THEN** the connect continuation is resumed exactly once, the winning path alone performs
+  cleanup, and no losing path performs any side effect
+- **NOTE** all race and state scenarios are unit-tested deterministically through the injected
+  connection driver and deadline scheduler seams (design D7): the driver scripts `.waiting`/
+  `.ready`/`.failed`/`.cancelled` in any interleaving, records `cancel()` requests to prove
+  side-effect ownership, and the scheduler advances the deadline without wall-clock waiting.
+  TEST-NET endpoints are optional, non-gating integration/smoke coverage only — never required
+  deterministic unit coverage (tasks 2.3)
+
 ### Requirement: Single bidirectional stream carries the SMB session
 
 The transport SHALL use one QUIC connection with a single bidirectional stream for the entire
@@ -55,10 +160,20 @@ the single stream exactly as over TCP.
 ### Requirement: receive honors the seam's chunk and EOF conventions
 
 `receive()` SHALL return the next available inbound chunk as `Data`, buffering incrementally
-when data arrives faster than it is consumed, and SHALL return empty `Data` exactly when the
-peer closes the stream gracefully. Abnormal connection loss SHALL throw a `POSIXError`.
+when data arrives faster than it is consumed. After `.ready`, the transport SHALL track a
+lock-guarded established-connection lifecycle with recorded causes (design D8):
+`ready → localClosing → closed`, or `ready → failed(error)`. The three teardown shapes are:
+**peer-originated graceful EOF** (server closes the stream) → `receive()` returns empty
+`Data`; **local close** — `close()` SHALL atomically record the local-close cause **before**
+calling `NWConnection.cancel()`, so the resulting `.cancelled` state event is never converted
+into abnormal loss, and a parked or later `receive()` observes empty `Data`, identically to
+`TCPTransportApple`; **abnormal transport loss** — an unsolicited post-ready `.failed`, or a
+`.cancelled` with **no** recorded local-close cause → `receive()` throws a `POSIXError`.
+Teardown races SHALL have one deterministic winner: the first lock-protected transition out of
+`ready` claims the outcome, the parked waiter is resumed exactly once, and a later event SHALL
+NOT overwrite an already-recorded local-close result.
 
-#### Scenario: Graceful EOF
+#### Scenario: Peer-originated graceful EOF
 
 - **WHEN** the server closes the QUIC stream/connection gracefully
 - **THEN** a pending or subsequent `receive()` returns empty `Data`
@@ -68,19 +183,60 @@ peer closes the stream gracefully. Abnormal connection loss SHALL throw a `POSIX
 - **WHEN** the QUIC connection fails (network loss, reset)
 - **THEN** a pending or subsequent `receive()` throws a `POSIXError`
 
+#### Scenario: Local close followed by .cancelled is not abnormal loss
+
+- **WHEN** `close()` runs (recording the local-close cause before `NWConnection.cancel()`) and
+  the connection then delivers the resulting `.cancelled` state event
+- **THEN** the parked or next `receive()` observes empty `Data` (the local-close signal), no
+  `POSIXError` is produced, and the `.cancelled` event is a no-op on the recorded result
+
+#### Scenario: .cancelled racing local close has one deterministic winner
+
+- **WHEN** a post-ready `.cancelled` state event races `close()`'s lock-protected cause
+  recording
+- **THEN** exactly one transition out of `ready` wins under the lock, the parked waiter is
+  resumed exactly once, and an already-recorded local-close result is never overwritten by
+  the racing event
+
+#### Scenario: Unsolicited post-ready .failed is abnormal loss
+
+- **WHEN** the connection delivers `.failed` after `.ready` with no local `close()` recorded
+- **THEN** the parked or next `receive()` throws the mapped `POSIXError`
+
+#### Scenario: Unsolicited .cancelled without a recorded local close is abnormal loss
+
+- **WHEN** the connection delivers `.cancelled` after `.ready` and no local-close cause was
+  recorded
+- **THEN** the parked or next `receive()` throws a `POSIXError` (abnormal transport loss)
+
+#### Scenario: Exactly-once waiter resumption across teardown races
+
+- **WHEN** any combination of local `close()`, post-ready `.failed`, and post-ready
+  `.cancelled` occurs in any order while a `receive()` is parked
+- **THEN** the parked continuation is resumed exactly once (empty `Data` if local close won
+  the claim; `POSIXError` if abnormal loss won), resources are released exactly once, and
+  subsequent `receive()` behavior matches the recorded terminal state
+- **NOTE** deterministic through the injected connection driver, which delivers post-ready
+  state events on demand (design D7 seams; tasks 2.5)
+
 ### Requirement: close is idempotent and releases resources
 
-`close()` SHALL cancel the QUIC connection, resume any parked `receive()` waiter with empty
-`Data` (graceful EOF — matching `TCPTransportApple` so the `TransportBridge` sees the identical
-teardown signal on both conformers), release all resources, and SHALL be safe to call multiple
-times and concurrently with in-flight operations. `receive()` after `close()` SHALL return
+`close()` SHALL atomically record the local-close cause (design D8) **before** cancelling the
+QUIC connection, then cancel the connection, resume any parked `receive()` waiter with empty
+`Data` (the local-close EOF signal — an empty-`Data` bridge teardown signal, not a
+peer-originated graceful EOF — matching `TCPTransportApple` so the `TransportBridge` sees the
+identical teardown signal on both conformers), release all resources, and SHALL be safe to call multiple
+times and concurrently with in-flight operations. Because the cause is recorded first, the
+`.cancelled` state event produced by `close()`'s own `NWConnection.cancel()` SHALL never be
+treated as abnormal transport loss. `receive()` after `close()` SHALL return
 empty `Data`; `POSIXError(.ENOTCONN)` is reserved for `receive()`/`send(_:)` on a
 never-connected transport.
 
 #### Scenario: Close with a parked receiver
 
 - **WHEN** `close()` is called while a `receive()` continuation is parked
-- **THEN** the parked call completes with empty `Data` (graceful EOF) and no continuation leaks
+- **THEN** the parked call completes with empty `Data` (the local-close EOF signal) and no
+  continuation leaks
 
 #### Scenario: Receive after close
 
@@ -97,25 +253,95 @@ never-connected transport.
 - **WHEN** `close()` is called twice
 - **THEN** the second call is a no-op and no crash or double-release occurs
 
-### Requirement: TLS trust is secure by default with explicit opt-in overrides
+### Requirement: TLS trust is a mutually exclusive policy, secure by default
 
-The transport SHALL use system certificate-chain evaluation and hostname verification by
-default. A public `SMBQUICConfiguration` type SHALL allow explicit opt-in overrides (custom
-trusted roots; an insecure-trust escape hatch that defaults to off). The library SHALL NOT
-install any custom verify logic unless the caller explicitly set an override.
+The public `SMBQUICConfiguration` type SHALL be platform-neutral (no Security.framework types;
+trust anchors are DER-encoded `[Data]`) and SHALL represent trust as a mutually exclusive
+`TrustPolicy`: `.system` (default), `.customRoots([Data])`, or `.insecureNoVerification` —
+conflicting configuration (custom roots plus insecure) SHALL be unrepresentable. Under
+`.system`, the transport SHALL install no custom verify logic at all. Under
+`.insecureNoVerification`, chain validation and hostname verification are disabled while
+TLS 1.3 encryption and the ALPN `"smb"` requirement remain active.
+
+Under `.customRoots`, the transport SHALL implement this exact fail-closed sequence
+(design D5):
+
+1. Convert every DER value with `SecCertificateCreateWithData` **before** creating the
+   `NWConnection`; any invalid DER value, and the empty anchor set `.customRoots([])`, SHALL
+   fail `connect` with `POSIXError(.EINVAL)` before any network activity.
+2. In the verify block, obtain the `SecTrust` from the callback's `sec_trust_t` using
+   `sec_trust_copy_ref` (NOT `sec_protocol_metadata_copy_sec_trust`).
+3. Create the hostname policy with `SecPolicyCreateSSL(true, host)` and apply it with
+   `SecTrustSetPolicies` — hostname verification SHALL remain enforced; custom roots never
+   disable it.
+4. Install the anchors with `SecTrustSetAnchorCertificates` and require only those anchors
+   with `SecTrustSetAnchorCertificatesOnly(true)` — anchors REPLACE system roots; a
+   self-signed leaf MAY be supplied as its own anchor.
+5. Check every `OSStatus`; any failure SHALL reject verification (fail closed).
+6. Evaluate with `SecTrustEvaluateWithError`.
+7. Invoke the verify completion exactly once on every path — success, evaluation failure, and
+   every `OSStatus` early-out.
+
+#### Scenario: Default system trust with correct host (interop-verified)
+
+- **WHEN** no configuration (or `.system`) is used against a server whose certificate chains to
+  a system root and matches the hostname
+- **THEN** no verify block is installed, the system default verification path runs, and the
+  handshake succeeds
+- **NOTE** live-handshake half verified at the manual interop gate; the no-verify-block-installed
+  half is unit-verified
 
 #### Scenario: Default trust rejects invalid certificates
 
 - **WHEN** the server presents a certificate that fails system trust or hostname verification
-  and no override was configured
-- **THEN** the handshake fails and `connect` throws
+  and the policy is `.system`
+- **THEN** the handshake fails and `connect` throws a `POSIXError`
 
-#### Scenario: Custom roots opt-in
+#### Scenario: Custom root with correct hostname
 
-- **WHEN** the caller sets `trustedRoots` in `SMBQUICConfiguration`
-- **THEN** chain evaluation anchors to those roots (hostname verification still enforced)
+- **WHEN** the policy is `.customRoots` with a private CA (or self-signed leaf) anchor and the
+  server presents a matching certificate for the connected hostname
+- **THEN** chain evaluation anchors to the supplied certificates and the handshake succeeds
+
+#### Scenario: Custom root with wrong hostname
+
+- **WHEN** the policy is `.customRoots` and the server's certificate chains to a supplied anchor
+  but does not match the target hostname
+- **THEN** verification fails — custom roots never disable hostname verification
+
+#### Scenario: System roots are excluded under customRoots
+
+- **WHEN** the policy is `.customRoots` and the server's chain validates against a system root
+  but not against any supplied anchor
+- **THEN** verification fails (anchors replace system roots; they do not augment them)
+
+#### Scenario: Conflicting trust configuration is unrepresentable
+
+- **WHEN** the `SMBQUICConfiguration` API surface is inspected
+- **THEN** no combination of values expresses both custom roots and insecure trust
+  simultaneously (`TrustPolicy` is a single enum value)
+
+#### Scenario: Insecure mode scope
+
+- **WHEN** the policy is `.insecureNoVerification`
+- **THEN** the handshake succeeds regardless of chain or hostname validity, while TLS 1.3
+  encryption and ALPN `"smb"` are still required
+
+#### Scenario: Security API / conversion failure fails closed
+
+- **WHEN** a supplied anchor is not valid DER (`SecCertificateCreateWithData` returns nil)
+- **THEN** `connect` throws `POSIXError(.EINVAL)` before creating the `NWConnection`
+- **WHEN** a Security API call (`SecTrustSetPolicies`, `SecTrustSetAnchorCertificates`,
+  `SecTrustSetAnchorCertificatesOnly`) returns a non-success `OSStatus` inside the verify block
+- **THEN** the verify completion is invoked exactly once with failure and the handshake fails
+
+#### Scenario: Empty custom-roots anchor set is rejected
+
+- **WHEN** the policy is `.customRoots([])`
+- **THEN** `connect` throws `POSIXError(.EINVAL)` before creating the `NWConnection` and before
+  any network activity (an empty anchor set can never validate any chain)
 
 #### Scenario: Insecure trust is never the default
 
 - **WHEN** an `SMBQUICConfiguration` is created without arguments
-- **THEN** `allowsInsecureTrust` is `false` and system verification applies
+- **THEN** `trustPolicy` is `.system` and system verification applies
