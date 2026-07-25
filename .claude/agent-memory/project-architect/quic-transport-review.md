@@ -1,43 +1,82 @@
 ---
 name: quic-transport-review
-description: add-quic-transport review-gate history; two prior approvals withdrawn; fresh re-review after the fourth (D12 eager-reconciliation / pointer-ordering) repair round returned APPROVED, no conditions (2026-07-24)
+description: add-quic-transport gate history + first-hand verified code facts; 9th review 2026-07-25 = APPROVED (sole should-fix condition cleared) after the state-machine ownership repair
 metadata:
   type: project
 ---
 
-add-quic-transport (AMSMB2 #29 / RandomPlayer #346): SMB-over-QUIC via Network.framework `NWProtocolQUIC`, Apple-only seam conformer beside `TCPTransportApple`. Slots into the existing seam with no libsmb2/TransportBridge changes.
+# add-quic-transport — review gate history and verified code facts
 
-**Current verdict: APPROVED, no conditions** (fresh project-architect re-review after the fourth repair round, 2026-07-24; recorded in full in proposal.md `## Review`). No blocking artifact defects remain. One non-blocking editorial advisory only: reconciliation row C's condition column ("cancellation-shaped failure") could be widened to "failure (any error)" to match rule E's state-keyed decision — the `(cancelled, non-cancellation-shaped failure)` behavior is already fully specified by the reconciliation-inputs sentence, rule E, and the race-E scenario/test, so this is not a gap and not a condition.
+**Current verdict: APPROVED** (ninth review, 2026-07-25, live unstaged worktree on
+`feat/add-quic-transport`, HEAD `a2f8078` + unstaged; issued as APPROVED WITH CONDITIONS with a
+single should-fix — `SMBTransport.connect`'s "Conformers document…" over-claimed for
+`TCPTransportApple` — cleared the same day by softening to "Conformers **should** document…" and
+re-verified first-hand: source diffstat unchanged, build clean, QUIC suite 41/0). The fifth
+remediation pass (tasks 8.1–8.6) fixed all four defects the round-8 APPROVED verdict had waived —
+that verdict is correctly marked SUPERSEDED in proposal.md.
 
-**Review history:**
-- Pre-apply review: approve-with-changes (2026-07-24).
-- Two adversarial repair rounds (8 findings each). Round 2 fixed: atomic connect claim (D7), TLS accessor `sec_trust_copy_ref` + fail-closed sequence (D5), dedicated `SMBQUICConfiguration.connectTimeout` (D10), Linux routing under `#if canImport(Network)` (D6), injected test seams (D7), EOF terminology, Swift-only ObjC (D11), "non-numeric hostnames only".
-- A recorded "APPROVED WITH CONDITIONS / zero artifact defects" verdict was **withdrawn as unsupported** — three artifact defects remained when it was recorded: (a) the ready-wins-but-task-cancelled ownership gap in `connectWithBridge` (live bridge owned by neither the D7 machine nor `teardownSeam()`), left as an implementation-time condition instead of a resolved design; (b) D7 treated every post-ready `.cancelled` as abnormal loss while D8's local `close()` intentionally calls `NWConnection.cancel()` — a direct contradiction; (c) a condition permitting the numeric-host rejection table to be weakened, justified by a FALSE fail-closed claim (see the correction below).
-- Third repair round (2026-07-24): D12 lock-protected bridge-ownership handoff + `transport-servicing` ADDED requirement + task 1.5; D8 recorded-cause established lifecycle (`ready → localClosing → closed` | `failed`) reconciling D7/D8 + spec scenarios + tasks 2.2/2.3/2.5; numeric-host table made acceptance criteria with deterministic classifier supplement, independent of TLS trust policy (D4, spec, task 1.1).
-- The fresh re-review after the third round returned APPROVED WITH CONDITIONS with a "no further artifact defects" finding. That verdict was **withdrawn** — D12 still contradicted the TCP cancellation contract and the pointer-creation ordering:
-  - D12's `eagerConnecting` rule claimed cancellation makes `bridge.connect` throw `CancellationError` and assigned no close duty for the eager phase, while `TCPTransportApple.connect` actually maps task cancellation to `POSIXError(.ECANCELED)` (`TCPTransportApple.swift:169-170`), `TransportBridge.connect` rethrows unchanged, and the `transport-servicing` requirement simultaneously demanded exactly one `bridge.close()` plus caller-visible `CancellationError` on every pre-installation cancellation win. Ordinary eager `bridge.connect` failure had no D12 transition or cleanup duty at all.
-  - D12 called the `localOwned → installing` claim the install block's first action, yet its failed-claim branch released a `cbPtr` that current code creates at the top of the install block, before any claim (`Context.swift:1240`).
-  - Its condition (1) asserted Darwin "will very likely reject" the legacy numeric forms / that the classifier supplement is empirically required on Darwin — unsupported; see the probe result under verified facts.
-- Fresh re-review after the fourth round (2026-07-24): **APPROVED, no conditions** — reconciliation table complete/total (state × success/failure × cancellation-won, not error shape); rule E deterministic by lock commit order; normalization correctly scoped (spontaneous `ECANCELED` in `eagerConnecting` → row D, rethrown unmapped to `CancellationError`); claim-before-creation ordering has no double-release/leak; no residual TCP-throws-`CancellationError` or Darwin-supplement-required wording in normative text; D7/D8/D12 mutually consistent. All code anchors re-verified first-hand.
-- Fourth repair round (2026-07-24): D12 gained an operation-side **eager-completion reconciliation** — a single lock-protected transition combining handoff state × connect result × whether cancellation won, assigning the one close/error duty (success+eagerConnecting → localOwned; success+cancelled → consume, close once, throw `CancellationError`; cancellation-shaped failure+cancelled → consume, close once, normalize to `CancellationError`; ordinary failure+eagerConnecting → finished, close once, rethrow mapped error; cancellation-vs-failure race decided by whichever transition commits first). The install-block ordering was corrected: claim first; a failed claim creates no `cbPtr`, no `passRetained(cb)`, no `makeExternalTransport()`, no `ext.userdata` retain, calls no libsmb2 API, and releases nothing. Darwin classifier wording made platform-neutral. Matching updates in the `transport-servicing` delta and task 1.5.
+## What the fifth pass changed (all verified first-hand, all correct)
 
-**Correction (previously misstated here):** an unrejected numeric QUIC target is NOT "fail-closed through SNI/certificate validation at handshake" — `.insecureNoVerification` disables chain and hostname verification entirely, so no later layer catches a numeric target. Numeric-host rejection must itself be fail-closed, before trust policy applies; the spec table may never be weakened to match a platform classifier miss (supplement the classifier instead).
+1. **One-shot connect reservation** — `connectState .idle → .reserved` under `lock` **before**
+   trust resolution / driver construction; rejections `EALREADY`(reserved/connecting/failed) /
+   `EISCONN`(ready) / `ECONNABORTED`(close, checked first). Retry after failure unsupported.
+2. **Close lifecycle `open → closing → closed`** — first caller owns teardown on
+   `teardownQueue`, then waits on `connectWorkInFlight`, then publishes `.closed` and drains
+   `closeWaiters`. Replaces the old `isClosed`/`teardownPending` pair. Only a post-`.closed`
+   call is a prompt no-op.
+3. **Late-armed deadline** — post-`schedule` claim re-check (`guard mayStart` else
+   `deadline.cancel(); finishConnectWork()`). Covers both the synchronous-self-fire and the
+   gated-arming shapes. The "benign bounded self-expiry" scoping is retracted.
+4. **`connectWorkInFlight`** spans store → arming → commit → `start()` → handoff; cleared only
+   by `finishConnectWork()`. Covers ready-mid-start (close cancels the ready driver at once but
+   still waits for the tail). The "ready-mid-start needs no wait" scoping is retracted.
 
-**Verified code facts (reusable for future transport reviews):**
-- `TCPTransportApple.connect` maps task cancellation to `POSIXError(.ECANCELED)` on every cancellation path (`TCPTransportApple.swift:163-179`) — it never surfaces `CancellationError`. `TransportBridge.connect` (`TransportBridge.swift:257-261`) rethrows the transport error unchanged; `mapTransportConnectError` (`Context.swift:1190-1193`) passes `POSIXError` and `CancellationError` through untouched. Any design claiming the TCP eager connect throws `CancellationError` is FALSE; normalization must happen in `connectWithBridge`.
-- `TransportBridge.close()` (`TransportBridge.swift:153-182`) is thread-safe and idempotent, and fires `transport.close()` (itself idempotent) — closing the bridge after the transport already cancelled its own channel/connection is safe.
-- `cbPtr = Unmanaged.passRetained(cb).toOpaque()` is currently the FIRST statement of the eventLoopQueue install block (`Context.swift:1240`), before the context guard; `makeExternalTransport()` (the `ext.userdata` `passRetained`) runs at `:1255`. Any "claim-first" design must move the claim ahead of both creations or account for releasing them.
-- `TCPTransportApple.close()`/`signalClosed()` resumes a parked `receive()` with empty `Data()` (local-close EOF signal), sets isEOF; receive-after-close returns empty `Data()`; `ENOTCONN` only for never-connected. Any "mirror TCP: close fails waiter with ENOTCONN" claim is FALSE.
-- `parseSeamEndpoint(_ server:)` is `static`, hardcodes 445, called INSIDE `connectWithBridge` which does NOT receive the kind. Kind only known in `connect(...transportKind:)` (Context.swift ~1120). Per-kind port/IP-rejection needs parse hoisted or kind threaded. (D4 does exactly this.)
-- Eager `bridge.connect` (Context.swift:1222) runs BEFORE the `withTaskCancellationHandler` at :1235; `transportBridge` is only assigned inside the eventLoopQueue install block (:1299); `teardownSeam()` (:1514) closes only via `transportBridge`. This is the ownership gap D12 closes.
-- `SMBTransportKind` (SMBTransport.swift:62) has NO raw value → string mapping needed for coding (D6 uses private mapping, no public RawRepresentable).
-- Legacy `connect(server:share:user:)` is `#if !canImport(Network)` (Context.swift:601) → Linux-only; the config-aware Apple signature being `#if canImport(Network)` + manager-side Linux routing (D6) is architecturally consistent.
-- `smb2_set_timeout` fires only when `self.timeout > 0` (Context.swift:1282) — confirms D10 independence.
-- `SMB2Manager` is NOT `@objcMembers` (line 20); ObjCCompat uses explicit `@objc(...)` — confirms D11 Swift-only-by-non-representability.
-- **D9 verified FIRST-HAND** (`Dependencies/libsmb2/lib/init.c:733-775`): `SMB2_TRANSPORT_QUIC`(1) and `SMB2_TRANSPORT_AUTO`(2)-with-ext bind identical `smb2_external_transport_ops`, differ only in recorded `transport_type`; QUIC strictly requires non-NULL connect/send/recv/close; `smb2_transport_is_connected` uses `ext_connected` for both. QUIC-vs-AUTO selector is behaviorally safe.
-- **Darwin classifier probe (2026-07-24, single dev machine):** a live `getaddrinfo(AF_UNSPEC, SOCK_STREAM, AI_NUMERICHOST)` probe classified ALL currently required forms — `127.1`, `2130706433`, `0x7f000001`, `0177.0.0.1`, `fe80::1%en0` — as numeric (returned 0). This is one machine's observation, not a guarantee for every Darwin or libc version: platform tests determine whether any deterministic supplement is required; no advance assumption in either direction.
+## Structural invariants that make it correct (re-derive these if the code moves)
 
-**Carry-forward implementation notes for /opsx:apply (non-blocking, NOT artifact changes):**
-1. 4-byte framing over QUIC = explicit first interop gate (task 4.2); contingency is fork seam fix, not Swift.
-2. Minor: `SMBQUICConfiguration` (platform-neutral) planned in `QUICTransportApple.swift` (partly `#if canImport(Network)`); prefer a platform-neutral filename.
-3. Minor: `QUICTransportApple(configuration:connectTimeout:)` gets connectTimeout twice (raw in config + normalized param); transport MUST use the normalized param.
+- Every check-then-act pair is one critical section: the store's `guard closeState == .open`
+  makes it impossible for `connectWorkInFlight` to be set after close reached `.closing`; the
+  waiter parks re-check `closeState == .closing` / `connectWorkInFlight` under the lock, so no
+  waiter can be stranded after the owner took its snapshot.
+- Exactly one path claims `.connecting`; `consumeLossClaimLocked` assigns the teardown duty
+  (`.notStarted`→forbid, `.starting`→park for the handoff, `.started`→self-serve), so each
+  driver is cancelled at most once and each continuation resumed exactly once.
+- No injected collaborator (`driverFactory`, `driver.start/cancel/send`, `deadline.*`) and no
+  continuation resume happens under the lock — except `receive()`'s own immediate resume, which
+  is the safe "resume before suspending" idiom.
+- No lock is held across any gated park in the test doubles ⇒ no cooperative-pool deadlock;
+  `LIBDISPATCH_COOPERATIVE_POOL_STRICT=1` green is corroborating, not the proof.
+
+## Known residuals — CORRECTED 2026-07-25: the TCP ones were NOT all benign
+
+- `TransportBridge.close()` fire-and-forgets `transport.close()`, so the strengthened
+  released-on-return promise is not propagated to libsmb2's close trampoline.
+- `NWConnectionQUICDriver.armReceive` re-arms even when `onReceive` is nil (bounded: a cancelled
+  NWConnection completes with error/isComplete).
+- `receiveWaiter` is overwritten if two `receive()` calls park concurrently (bridge is
+  single-consumer).
+- ~~`TCPTransportApple.connect` has the same latent repeated-connect overwrite the QUIC pass
+  just fixed; out of scope for this change.~~ **CORRECTION**: the repeated-connect overwrite
+  was fixed by `fix-tcp-one-shot-connect`, but the old `TCPTransportApple` was still NOT
+  sound against the strengthened seam contract: (1) a close/cancel racing the window between
+  the post-`get()` cancellation re-check and the publication lock let connect install a
+  closed channel, overwrite terminal state with `.connected`, and repopulate `_channel` after
+  `close()` returned; (2) `close()` had no owned lifecycle — a concurrent caller could return
+  before the owner's teardown completed (independent `shutdownGracefully()`, error swallowed
+  by `try?`). Both graded merge-blocking by adversarial review; remediation tracked in
+  `fix-tcp-one-shot-connect` §3 (atomic publication claim + `open → closing → closed`
+  owner/waiter lifecycle mirroring the QUIC conformer). Do not cite the pre-remediation TCP
+  close/connect implementation as a sound reference. **Remediation reviewed 2026-07-25:
+  APPROVED WITH CONDITIONS (two Low doc/bookkeeping conditions, addressed same day);
+  mutation-tested with clean attribution — both in-tree conformers now implement the same
+  one-shot-connect + owned-close contract. See [[tcp-one-shot-connect-review]] for the
+  verified NIOTS dependency facts (double group shutdown fails fast; bootstrap self-closes
+  failed connects).**
+
+## Earlier gate history (condensed)
+
+Rounds 1–2: eight + eight adversarial defects (D5/D6/D7/D10/D11). Round 3: three (ready-after-
+cancel → D12; post-ready `.cancelled` → recorded-cause lifecycle). Round 4: APPROVED, superseded.
+Round 5: NEEDS REVISION (three). Round 6: NEEDS REVISION (two repeats). Round 7: APPROVED WITH
+CONDITIONS → cleared by 6.7. Round 8: APPROVED, later SUPERSEDED for waiving the four defects
+above. **Recurring failure mode: absolute invariants asserted without re-deriving them against
+every claim path, and public-API defects narrowed away as "unreachable via `SMB2Client`".**

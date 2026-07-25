@@ -26,10 +26,10 @@ final class SMB2SeamConnectOrderingTests: XCTestCase, @unchecked Sendable {
     /// THEN host/port match libsmb2's `ext_connect` parser byte-for-byte.
     func testParseSeamEndpointTable() throws {
         func assertParse(
-            _ server: String, host: String, port: Int,
+            _ server: String, defaultPort: Int = 445, host: String, port: Int,
             line: UInt = #line
         ) throws {
-            let parsed = try SMB2Client.parseSeamEndpoint(server)
+            let parsed = try SMB2Client.parseSeamEndpoint(server, defaultPort: defaultPort)
             XCTAssertEqual(parsed.host, host, "host for \(server)", line: line)
             XCTAssertEqual(parsed.port, port, "port for \(server)", line: line)
         }
@@ -40,12 +40,41 @@ final class SMB2SeamConnectOrderingTests: XCTestCase, @unchecked Sendable {
         try assertParse("[::1]:1445", host: "::1", port: 1445)
         try assertParse("127.0.0.1:445", host: "127.0.0.1", port: 445)
         try assertParse("127.0.0.1", host: "127.0.0.1", port: 445)
+
+        // Per-kind default port (design D4): 443 is used for `.quic` when no port is present,
+        // while an explicit port still wins regardless of the default.
+        try assertParse("host", defaultPort: 443, host: "host", port: 443)
+        try assertParse("[::1]", defaultPort: 443, host: "::1", port: 443)
+        try assertParse("host:1445", defaultPort: 443, host: "host", port: 1445)
+    }
+
+    /// WHEN an explicit port is oversized — from one digit above the range up to hundreds of
+    /// digits — THEN parsing never traps (P2 regression: unchecked `port * 10 + value`
+    /// overflowed `Int`): accumulation stops once the value is already out of the valid
+    /// 1...65535 port range (further digits cannot make it valid), so the result stays
+    /// out-of-range for downstream `EINVAL` rejection, while in-range boundaries are
+    /// preserved exactly.
+    func testParseSeamEndpointOversizedPortDoesNotTrap() throws {
+        let nines = String(repeating: "9", count: 300)
+
+        let parsed = try SMB2Client.parseSeamEndpoint("fs.example.com:\(nines)", defaultPort: 445)
+        XCTAssertEqual(parsed.host, "fs.example.com")
+        XCTAssertGreaterThan(parsed.port, 65535, "oversized port must classify as out-of-range")
+
+        let bracketed = try SMB2Client.parseSeamEndpoint("[::1]:\(nines)", defaultPort: 445)
+        XCTAssertEqual(bracketed.host, "::1")
+        XCTAssertGreaterThan(bracketed.port, 65535, "bracketed form takes the same parser path")
+
+        // Boundary behavior: both valid extremes and the first invalid value are exact.
+        XCTAssertEqual(try SMB2Client.parseSeamEndpoint("h:1", defaultPort: 445).port, 1)
+        XCTAssertEqual(try SMB2Client.parseSeamEndpoint("h:65535", defaultPort: 445).port, 65535)
+        XCTAssertEqual(try SMB2Client.parseSeamEndpoint("h:65536", defaultPort: 445).port, 65536)
     }
 
     /// WHEN an IPv6 literal is missing its closing `]`
     /// THEN parsing throws `POSIXError(.EINVAL)` (mirrors the C error path).
     func testParseSeamEndpointMissingBracketThrows() {
-        XCTAssertThrowsError(try SMB2Client.parseSeamEndpoint("[bad")) { error in
+        XCTAssertThrowsError(try SMB2Client.parseSeamEndpoint("[bad", defaultPort: 445)) { error in
             guard let posix = error as? POSIXError else {
                 return XCTFail("expected POSIXError, got \(error)")
             }
@@ -65,7 +94,9 @@ final class SMB2SeamConnectOrderingTests: XCTestCase, @unchecked Sendable {
 
         do {
             try await client.connectWithBridge(
-                server: "127.0.0.1", share: "share", user: "user", bridge: bridge
+                server: "127.0.0.1", share: "share", user: "user",
+                host: "127.0.0.1", port: 445,
+                bridge: bridge, selector: SMB2Client.seamSelector(for: .automatic)
             )
             XCTFail("connectWithBridge must throw when the transport connect fails")
         } catch let posix as POSIXError {

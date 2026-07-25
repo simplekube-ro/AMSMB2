@@ -184,7 +184,8 @@ final class SMB2ServicingLoopTests: XCTestCase, @unchecked Sendable {
         do {
             try await client.connectWithBridge(
                 server: "testserver", share: "testshare", user: "testuser",
-                bridge: bridge
+                host: "testserver", port: 445,
+                bridge: bridge, selector: SMB2_TRANSPORT_AUTO
             )
             XCTFail("Expected connect to fail (mock transport does not speak SMB2)")
         } catch {
@@ -217,7 +218,8 @@ final class SMB2ServicingLoopTests: XCTestCase, @unchecked Sendable {
         do {
             try await client.connectWithBridge(
                 server: "testserver", share: "testshare", user: "testuser",
-                bridge: bridge
+                host: "testserver", port: 445,
+                bridge: bridge, selector: SMB2_TRANSPORT_AUTO
             )
             XCTFail("Expected connect to time out")
         } catch let posix as POSIXError {
@@ -257,7 +259,8 @@ final class SMB2ServicingLoopTests: XCTestCase, @unchecked Sendable {
         let connectTask = Task {
             try await client.connectWithBridge(
                 server: "testserver", share: "testshare", user: "testuser",
-                bridge: bridge
+                host: "testserver", port: 445,
+                bridge: bridge, selector: SMB2_TRANSPORT_AUTO
             )
         }
 
@@ -284,24 +287,27 @@ final class SMB2ServicingLoopTests: XCTestCase, @unchecked Sendable {
             "a cancelled connect must not leave the client seam-connected")
     }
 
-    // MARK: - connect(transportKind:) opt-in surface (AC6)
+    // MARK: - connect(transportKind:) opt-in surface
 
-    /// WHEN `connect(transportKind: .quic)` is called
-    /// THEN it throws POSIXError(.ENOTSUP) immediately, before reaching the seam.
+    /// WHEN `connect(transportKind: .quic)` targets a numeric host
+    /// THEN it throws `POSIXError(.EINVAL)` from the policy validation step — before any transport
+    /// is constructed or any network activity — deterministically, with no live connect.
     ///
-    /// Also provides a call site for `connect(server:share:user:transportKind:)` so the
-    /// method satisfies the CLAUDE.md "every new symbol needs a call site" rule (T6 task 6.2).
-    func testConnectWithQuicKindThrowsENOTSUP() async throws {
+    /// Also provides a call site for `connect(server:share:user:transportKind:quicConfiguration:)`
+    /// so the method satisfies the CLAUDE.md "every new symbol needs a call site" rule. (Since
+    /// Batch B, `.quic` to a non-numeric host constructs a real `QUICTransportApple` and attempts
+    /// a live connect — covered deterministically by `QUICTransportAppleTests` via the seams.)
+    func testConnectWithQuicNumericHostThrowsEINVAL() async throws {
         let client = try SMB2Client(timeout: 5)
         do {
             try await client.connect(
-                server: "testserver", share: "testshare", user: "testuser",
+                server: "10.0.0.5", share: "testshare", user: "testuser",
                 transportKind: .quic
             )
-            XCTFail("Expected POSIXError(.ENOTSUP) for QUIC transportKind")
+            XCTFail("Expected POSIXError(.EINVAL) for a numeric QUIC host")
         } catch let posixError as POSIXError {
-            XCTAssertEqual(posixError.code, .ENOTSUP,
-                "QUIC transport not yet implemented; must throw ENOTSUP immediately")
+            XCTAssertEqual(posixError.code, .EINVAL,
+                "QUIC rejects numeric hosts in validation, before any transport is constructed")
         }
     }
 
@@ -325,7 +331,9 @@ final class SMB2ServicingLoopTests: XCTestCase, @unchecked Sendable {
         do {
             // 127.0.0.1:1 has no listener; the connect either refuses or times out within 1 s.
             try await client.connectWithBridge(
-                server: "127.0.0.1:1", share: "testshare", user: "testuser", bridge: bridge
+                server: "127.0.0.1:1", share: "testshare", user: "testuser",
+                host: "127.0.0.1", port: 1,
+                bridge: bridge, selector: SMB2_TRANSPORT_AUTO
             )
             XCTFail("Expected failure: connecting to a dead endpoint must throw")
         } catch let posixError as POSIXError {

@@ -15,7 +15,7 @@ import Foundation
 /// A conforming type is responsible for carrying raw SMB2 bytes over the
 /// network. The protocol is intentionally free of SwiftNIO and libsmb2
 /// dependencies so that conformers can be unit-tested in isolation and
-/// reused by both the TCP and a future QUIC transport.
+/// reused by both the TCP and QUIC transports.
 ///
 /// **Buffer type:** `send(_:)` and `receive()` use `Foundation.Data`
 /// (design decision D2). Concrete transports convert to/from NIO
@@ -33,6 +33,15 @@ public protocol SMBTransport: Sendable {
     /// Establishes a connection to `host` on `port`.
     ///
     /// Throws `POSIXError` on failure (e.g. `.ECONNREFUSED`).
+    ///
+    /// An instance represents a single connection lifetime: callers create a
+    /// fresh transport per connection (as `SMB2Client` does) rather than
+    /// reusing one across connects. Both in-tree conformers are strictly
+    /// one-shot and reject every call after the first deterministically:
+    /// `EALREADY` while an attempt is in flight or after a failed attempt,
+    /// `EISCONN` once connected, and — deliberately keeping each conformer's
+    /// pre-existing closed contract — `ECONNABORTED` after `close()` on
+    /// `QUICTransportApple` versus `ENOTCONN` on `TCPTransportApple`.
     func connect(host: String, port: Int) async throws
 
     /// Sends `bytes` to the remote peer.
@@ -45,6 +54,12 @@ public protocol SMBTransport: Sendable {
     func receive() async throws -> Data
 
     /// Closes the connection and releases all resources.
+    ///
+    /// When `close()` returns, the connection's resources are released — for
+    /// every caller: repeated and concurrent calls are safe, and a call made
+    /// while another close is still tearing down returns only after that
+    /// teardown has completed. Only a call made after a prior close fully
+    /// completed may return immediately as a no-op.
     func close() async
 }
 
@@ -55,8 +70,11 @@ public protocol SMBTransport: Sendable {
 /// - `tcp`: Explicit TCP transport. On Apple platforms this routes through
 ///   `NIOTransportServices` (Network.framework); on Linux it falls back to
 ///   libsmb2's built-in BSD socket.
-/// - `quic`: SMB-over-QUIC transport (reserved for a future milestone;
-///   not yet implemented).
+/// - `quic`: SMB-over-QUIC transport (`QUICTransportApple`, backed by
+///   Network.framework). Explicit opt-in: non-numeric hostnames only,
+///   UDP/443 default, no silent TCP fallback. Requires iOS 15 / macOS 12 /
+///   macCatalyst 15 / tvOS 15 / watchOS 8 / visionOS 1; below that floor,
+///   and on Linux, selecting it throws `POSIXError(.ENOTSUP)`.
 /// - `automatic`: Let the library choose the best transport available on
 ///   the current platform.
 public enum SMBTransportKind: Sendable, Equatable, Hashable {

@@ -571,6 +571,13 @@ extension SMB2Client {
     var pendingSeamOperationCount: Int {
         syncOnEventLoop { pendingOperations.count }
     }
+
+    /// Whether a seam `TransportBridge` is currently installed (read on the serialized
+    /// event-loop queue). Used by the D12 bridge-ownership tests to assert that a cancellation
+    /// or eager-failure win leaves no installed bridge (`transportBridge == nil`).
+    var hasInstalledSeamBridge: Bool {
+        syncOnEventLoop { transportBridge != nil }
+    }
     #endif
 
     var error: String? {
@@ -1106,6 +1113,145 @@ extension SMB2Client {
 
 #if canImport(Network)
 
+// MARK: - Bridge-ownership handoff (design D12)
+
+/// Lock-protected bridge-ownership handoff for `connectWithBridge` (design D12).
+///
+/// Records exactly one bridge owner at every instant across the interval from before the eager
+/// `bridge.connect` through seam installation:
+/// `eagerConnecting → localOwned → installing → installed`, plus the terminal states `cancelled`
+/// (cancellation won the claim, awaiting consumption by the eager-completion reconciliation or a
+/// failed install claim) and `finished` (ownership consumed). Every transition is atomic, and —
+/// mirroring D7's `resolveConnect` — the party that wins a transition performs the
+/// associated close/cleanup duty *outside* the lock. The bridge therefore closes exactly once on
+/// every path, and cancellation racing installation has a single lock-protected winner
+/// (cancelled-first → local close, no libsmb2 call; installed-first → installed-seam teardown).
+///
+/// `@unchecked Sendable`: all mutable state is a single `State` guarded by `NSLock`; lock
+/// sections never contain `await` (CLAUDE.md).
+final class BridgeOwnershipHandoff: @unchecked Sendable {
+
+    /// The bridge-ownership state (design D12).
+    enum State: Equatable {
+        case eagerConnecting
+        case localOwned
+        case installing
+        case installed
+        case cancelled
+        case finished
+    }
+
+    /// Outcome of the eager-completion reconciliation (design D12 rows A–D + race E).
+    enum ReconcileOutcome: Equatable {
+        /// Row A — success while `eagerConnecting`: proceed toward installation, no close.
+        case proceed
+        /// Rows B/C (and race E cancellation-first): cancellation committed first — close the
+        /// still-local bridge once and surface `CancellationError`.
+        case cancellationWon
+        /// Row D (and race E failure-first): ordinary eager failure — close once and rethrow the
+        /// mapped original transport error.
+        case eagerFailed
+    }
+
+    /// Duty assigned to the outer `onCancel` by `cancel()` (design D12).
+    enum CancelDuty: Equatable {
+        /// `eagerConnecting` (the reconciliation closes) or a terminal state (nothing to do).
+        case noClose
+        /// `localOwned`: close the still-local, not-yet-installed bridge exactly once.
+        case closeLocalBridge
+        /// `installing`/`installed`: route through the installed-ownership `teardownSeam()`.
+        case installedTeardown
+    }
+
+    private let lock = NSLock()
+    private var state: State = .eagerConnecting
+
+    /// Test-only read of the current state — never used by production control flow.
+    var currentState: State {
+        lock.lock()
+        defer { lock.unlock() }
+        return state
+    }
+
+    /// `onCancel`: transitions the state and returns the close duty for the caller to perform
+    /// outside the lock (design D12).
+    func cancel() -> CancelDuty {
+        lock.lock()
+        defer { lock.unlock() }
+        switch state {
+        case .eagerConnecting:
+            state = .cancelled
+            return .noClose
+        case .localOwned:
+            state = .cancelled
+            return .closeLocalBridge
+        case .installing, .installed:
+            return .installedTeardown
+        case .cancelled, .finished:
+            return .noClose
+        }
+    }
+
+    /// Eager-completion reconciliation: one lock-protected transition combining the handoff state
+    /// and the connect result (design D12). Called exactly once, immediately after
+    /// `bridge.connect` returns or throws.
+    ///
+    /// Precedence (race E): if cancellation already committed its `eagerConnecting → cancelled`
+    /// transition before this claim, cancellation is caller-visible regardless of the connect
+    /// result (rows B/C); otherwise the connect result decides (rows A/D).
+    func reconcile(connectFailed: Bool) -> ReconcileOutcome {
+        lock.lock()
+        defer { lock.unlock() }
+        switch state {
+        case .cancelled:
+            state = .finished
+            return .cancellationWon
+        case .eagerConnecting:
+            if connectFailed {
+                state = .finished
+                return .eagerFailed
+            }
+            state = .localOwned
+            return .proceed
+        case .localOwned, .installing, .installed, .finished:
+            // Unreachable: reconcile is invoked exactly once, only from
+            // `eagerConnecting`/`cancelled`. Surface a double-call/invalid-state regression in
+            // debug builds; fall back to "proceed" (no duty) in release.
+            assertionFailure("reconcile called twice or from invalid state \(state)")
+            return .proceed
+        }
+    }
+
+    /// The install block's first step: claim `localOwned → installing`. Returns `false` when
+    /// cancellation already won (state `cancelled`), in which case the caller must create nothing
+    /// and resume `CancellationError` (design D12).
+    func claimInstalling() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if state == .localOwned {
+            state = .installing
+            return true
+        }
+        // Only `cancelled` is reachable here (onCancel won at `localOwned`).
+        return false
+    }
+
+    /// Install succeeded up to ownership transfer into `transportBridge`: `installing → installed`.
+    func markInstalled() {
+        lock.lock()
+        defer { lock.unlock() }
+        if state == .installing { state = .installed }
+    }
+
+    /// An install-block failure path consumed ownership before ownership transfer:
+    /// `installing → finished`, making any late `onCancel` a no-op on the bridge.
+    func markFinished() {
+        lock.lock()
+        defer { lock.unlock() }
+        if state == .installing { state = .finished }
+    }
+}
+
 extension SMB2Client {
 
     // MARK: Opt-in connect via transport kind
@@ -1116,20 +1262,65 @@ extension SMB2Client {
     /// the bridge via `smb2_set_transport(AUTO, ext)` before `smb2_connect_share_async`,
     /// and drives the handshake through the no-fd servicing loop rather than `pollUntilComplete`.
     ///
-    /// The `tcp`/`automatic` conformer is `TCPTransportApple` (NIOTransportServices).
+    /// The `tcp`/`automatic` conformer is `TCPTransportApple` (NIOTransportServices); `.quic`
+    /// is validated here (design D4/D10) and then constructs `QUICTransportApple`, or throws
+    /// `ENOTSUP` below the QUIC availability floor (design D1).
+    ///
+    /// Endpoint parsing and — for `.quic` — host and connect-timeout validation are hoisted here
+    /// (design D4) so they run **before** transport construction and before any network activity,
+    /// and so `parseSeamEndpoint` is invoked exactly once. `quicConfiguration` is the immutable
+    /// snapshot the manager took under `connectLock` (design D6); it defaults to `nil`, which
+    /// means "all `SMBQUICConfiguration` defaults".
     func connect(
         server: String, share: String, user: String,
-        transportKind: SMBTransportKind
+        transportKind: SMBTransportKind,
+        quicConfiguration: SMBQUICConfiguration? = nil
     ) async throws {
+        // Parse the endpoint exactly once, with the per-kind default port (design D4).
+        let endpoint = try Self.parseSeamEndpoint(
+            server, defaultPort: Self.seamDefaultPort(for: transportKind))
+
         let transport: any SMBTransport
         switch transportKind {
         case .tcp, .automatic:
             transport = TCPTransportApple()
         case .quic:
-            throw POSIXError(.ENOTSUP, description: "QUIC transport not yet implemented")
+            // Policy validation runs before any transport object exists or any network activity
+            // occurs (design D4). Numeric-host rejection is independent of the TLS trust policy —
+            // `.insecureNoVerification` never bypasses it.
+            guard !Self.isNumericHost(endpoint.host) else {
+                throw POSIXError(.EINVAL,
+                    description: "SMB over QUIC requires a hostname, not an IP address")
+            }
+            // Explicit-port range validation (design D4): only 1...65535 is valid, rejected
+            // here so an out-of-range port never constructs a transport or reaches the
+            // NWConnection driver factory (the driver independently re-rejects out-of-range
+            // ports for directly constructed transports).
+            guard (1...65535).contains(endpoint.port) else {
+                throw POSIXError(.EINVAL,
+                    description: "SMB over QUIC: invalid port \(endpoint.port)")
+            }
+            // Dedicated, finite, always-armed connect deadline (design D10) — independent of
+            // `self.timeout`. Validated here, before transport construction and before the
+            // availability check; the transport initializer independently normalizes the same
+            // value from the configuration, so direct construction cannot bypass the contract.
+            _ = try Self.normalizedQUICConnectTimeout(quicConfiguration?.connectTimeout ?? 30)
+            if #available(iOS 15, macOS 12, macCatalyst 15, tvOS 15, watchOS 8, visionOS 1, *) {
+                transport = try QUICTransportApple(
+                    configuration: quicConfiguration ?? SMBQUICConfiguration())
+            } else {
+                // Below the QUIC availability floor (design D1). Unreachable on CI hosts, which
+                // always satisfy the floor; verified by code inspection, scenario marked manual.
+                throw POSIXError(.ENOTSUP,
+                    description: "SMB over QUIC requires iOS 15 / macOS 12 or later")
+            }
         }
+
         let bridge = TransportBridge(transport: transport)
-        try await connectWithBridge(server: server, share: share, user: user, bridge: bridge)
+        try await connectWithBridge(
+            server: server, share: share, user: user,
+            host: endpoint.host, port: endpoint.port,
+            bridge: bridge, selector: Self.seamSelector(for: transportKind))
     }
 
     // MARK: Seam endpoint parsing (mirrors libsmb2 ext_connect)
@@ -1141,8 +1332,11 @@ extension SMB2Client {
     ///   throws `POSIXError(.EINVAL)`.
     /// - After the optional `]`, the **first** `:` separates host from port; the remainder is the
     ///   port (leading decimal digits, à la `strtol(..., 10)`; `0` when absent/non-numeric).
-    /// - No `:` → default port `445`. No DNS resolution — the host is handed over verbatim.
-    static func parseSeamEndpoint(_ server: String) throws -> (host: String, port: Int) {
+    /// - No `:` → `defaultPort` (445 for `.tcp`/`.automatic`, 443 for `.quic`; design D4). No DNS
+    ///   resolution — the host is handed over verbatim.
+    static func parseSeamEndpoint(
+        _ server: String, defaultPort: Int
+    ) throws -> (host: String, port: Int) {
         if server.first == "[" {
             // IPv6 literal in `[...]` form.
             let afterBracket = server.dropFirst()
@@ -1155,7 +1349,7 @@ extension SMB2Client {
             if let colonIndex = rest.firstIndex(of: ":") {
                 return (host, parseLeadingPort(rest[rest.index(after: colonIndex)...]))
             }
-            return (host, 445)
+            return (host, defaultPort)
         }
 
         // Non-IPv6: split host at the first `:`.
@@ -1164,11 +1358,44 @@ extension SMB2Client {
             return (host, parseLeadingPort(server[server.index(after: colonIndex)...]))
         }
 
-        return (server, 445)
+        return (server, defaultPort)
+    }
+
+    // MARK: Per-kind seam endpoint defaults and selector (design D4/D9)
+
+    /// The default port for a transport kind when the server string carries no explicit port:
+    /// 445 for `.tcp`/`.automatic`, 443 (UDP) for `.quic` (design D4). Factored so the mapping
+    /// is table-testable in one place.
+    static func seamDefaultPort(for kind: SMBTransportKind) -> Int {
+        switch kind {
+        case .tcp, .automatic:
+            return 445
+        case .quic:
+            return 443
+        }
+    }
+
+    /// The exact `smb2_set_transport` selector for a transport kind (design D9): `.tcp`/
+    /// `.automatic` install `SMB2_TRANSPORT_AUTO` (unchanged shipped behavior), `.quic` installs
+    /// `SMB2_TRANSPORT_QUIC`. Never `SMB2_TRANSPORT_TCP` — that selects libsmb2's built-in socket
+    /// and ignores `ext` (the D1 naming trap). `.automatic` never yields QUIC.
+    static func seamSelector(for kind: SMBTransportKind) -> Int32 {
+        switch kind {
+        case .tcp, .automatic:
+            return SMB2_TRANSPORT_AUTO
+        case .quic:
+            return SMB2_TRANSPORT_QUIC
+        }
     }
 
     /// Parses leading decimal digits from `text`, mirroring C `strtol(text, NULL, 10)`:
-    /// returns `0` when no leading digit is present.
+    /// returns `0` when no leading digit is present. Overflow-safe by construction: digits stop
+    /// accumulating once the value already exceeds 65535 — it is out of the valid port range and
+    /// no further digit can bring it back, so an arbitrarily long digit string never traps and
+    /// the result stays out-of-range for the caller's `EINVAL` rejection (the accumulated value
+    /// is bounded by 655,359). Shared with the TCP path, whose behavior is unchanged for every
+    /// in-range port; out-of-range values remain out-of-range (only their exact magnitude is
+    /// clamped) and fail downstream identically.
     private static func parseLeadingPort(_ text: Substring) -> Int {
         var port = 0
         var sawDigit = false
@@ -1176,8 +1403,9 @@ extension SMB2Client {
             guard let value = character.wholeNumberValue,
                   character.isASCII, value >= 0, value <= 9
             else { break }
-            port = port * 10 + value
             sawDigit = true
+            guard port <= 65535 else { break }
+            port = port * 10 + value
         }
         return sawDigit ? port : 0
     }
@@ -1199,78 +1427,113 @@ extension SMB2Client {
     ///
     /// Exposed as `internal` so tests can inject a `MockTransport`-backed bridge directly,
     /// bypassing the `TCPTransportApple` kind dispatch. Production code calls
-    /// `connect(server:share:user:transportKind:)` instead.
+    /// `connect(server:share:user:transportKind:quicConfiguration:)`, which resolves the
+    /// endpoint (`host`, `port`) and the kind's `selector` and passes them here.
     ///
-    /// **Naming trap** (design D1): `SMB2_TRANSPORT_AUTO` is used, not `SMB2_TRANSPORT_TCP`.
-    /// `TCP == 0` selects libsmb2's built-in socket (and ignores `ext`); `AUTO == 2` routes
-    /// our external bridge through the seam. After `smb2_set_transport(AUTO, ext)`, calling
+    /// **Naming trap** (design D1/D9): `selector` is `SMB2_TRANSPORT_AUTO` (`.tcp`/`.automatic`)
+    /// or `SMB2_TRANSPORT_QUIC` (`.quic`), never `SMB2_TRANSPORT_TCP` — `TCP == 0` selects
+    /// libsmb2's built-in socket and ignores `ext`. After `smb2_set_transport(selector, ext)`,
     /// `smb2_get_fd(context)` returns -1 — no native socket fd exists.
+    ///
+    /// **Cancellation-safe bridge-ownership handoff** (design D12): a single outer
+    /// `withTaskCancellationHandler` covers the whole interval — from before the eager
+    /// `bridge.connect` through seam installation. A lock-protected `BridgeOwnershipHandoff`
+    /// records exactly one bridge owner at every instant, so the bridge closes exactly once on
+    /// every path and no cancellation interleaving leaves a connected-but-unowned bridge, an
+    /// unmanaged retain, a continuation, or a registered libsmb2 operation.
     func connectWithBridge(
         server: String, share: String, user: String,
-        bridge: TransportBridge
+        host: String, port: Int,
+        bridge: TransportBridge,
+        selector: Int32
     ) async throws {
-        try Task.checkCancellation()
-
-        // Eager connect (fix-seam-connect-ordering): establish the transport BEFORE libsmb2
-        // begins the handshake. `ext_connect` fires NEGOTIATE synchronously on a `>= 0` return,
-        // so the channel must be live first or the first send()/receive() fails with ENOTCONN.
-        // This `await` runs on the caller's task — never on `eventLoopQueue` — so it blocks no
-        // serialized work. A connect failure surfaces here as a thrown `POSIXError`, with no
-        // libsmb2 operation registered and the bridge/transport never installed.
-        let endpoint = try Self.parseSeamEndpoint(server)
-        do {
-            try await bridge.connect(host: endpoint.host, port: endpoint.port)
-        } catch {
-            throw Self.mapTransportConnectError(error)
-        }
-
-        // `cbPtr` (UnsafeMutableRawPointer) is constructed INSIDE the eventLoopQueue.async
-        // block — a local variable rather than a captured binding — so it does not trigger the
-        // Swift 6 @SendableClosureCaptures warning that affects the legacy async_await functions.
-        // `cb` and `cbId` are Sendable (CBData is @unchecked Sendable, ObjectIdentifier is Sendable)
-        // and are safe to capture across the isolation boundary.
+        // `cb`/`cbId` are Sendable (CBData is @unchecked Sendable, ObjectIdentifier is Sendable)
+        // and safe to capture across the isolation boundary. `cbPtr` is built INSIDE the install
+        // block (a local, not a capture) to avoid the Swift 6 @Sendable-capture warning.
         let cb = CBData()
         let cbId = ObjectIdentifier(cb)
+        let handoff = BridgeOwnershipHandoff()
 
         try await withTaskCancellationHandler {
+            // Cancellation before start: nothing is connected yet, so nothing to close.
+            try Task.checkCancellation()
+
+            // Eager connect (fix-seam-connect-ordering): establish the transport BEFORE libsmb2
+            // begins the handshake. `ext_connect` fires NEGOTIATE synchronously on a `>= 0`
+            // return, so the channel must be live first or the first send()/receive() fails with
+            // ENOTCONN. This `await` runs on the caller's task — never on `eventLoopQueue`.
+            let eagerFailure: (any Error)?
+            do {
+                try await bridge.connect(host: host, port: port)
+                eagerFailure = nil
+            } catch {
+                eagerFailure = error
+            }
+
+            // Eager-completion reconciliation (design D12, rows A–D + race E): ONE lock-protected
+            // transition combines the handoff state (did cancellation win?) with the connect
+            // result and assigns the single close/error duty.
+            switch handoff.reconcile(connectFailed: eagerFailure != nil) {
+            case .proceed:
+                break  // row A: eagerConnecting → localOwned; proceed toward installation.
+            case .cancellationWon:
+                // rows B/C: cancellation committed first (success-after-cancel or a
+                // cancellation-shaped failure alike). Close the still-local bridge exactly once
+                // and normalize to CancellationError — never a raw ECANCELED, never a libsmb2 call.
+                bridge.close()
+                throw CancellationError()
+            case .eagerFailed:
+                // row D: ordinary eager failure, cancellation did not win. Close exactly once and
+                // rethrow the mapped original transport error (never CancellationError).
+                bridge.close()
+                throw Self.mapTransportConnectError(eagerFailure!)
+            }
+
+            // Installation, serialized on `eventLoopQueue`.
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
                 self.eventLoopQueue.async { [self] in
-                    // Construct the opaque pointer locally to avoid capturing a non-Sendable
-                    // UnsafeMutableRawPointer across the @Sendable closure boundary.
+                    // FIRST step, before ANY resource is created: claim installation. A failed
+                    // claim means cancellation already won at `localOwned` (onCancel closed the
+                    // bridge). Create nothing — no `cbPtr`, no `Unmanaged.passRetained(cb)`, no
+                    // `makeExternalTransport()`, no libsmb2 call — and resume CancellationError.
+                    guard handoff.claimInstalling() else {
+                        continuation.resume(throwing: CancellationError())
+                        return
+                    }
+
+                    // Only after a successful claim: construct the opaque pointer locally to
+                    // avoid capturing a non-Sendable UnsafeMutableRawPointer across the boundary.
                     let cbPtr = Unmanaged.passRetained(cb).toOpaque()
 
                     guard let context = self.context else {
-                        // The transport was already connected eagerly above; close it so the
-                        // live channel does not leak (the C close trampoline is not wired yet —
-                        // makeExternalTransport() has not run).
+                        // Context gone. makeExternalTransport() has NOT run, so no ext.userdata
+                        // retain exists — release only cbPtr and close the eagerly-connected
+                        // bridge (its C close trampoline is not wired yet).
                         bridge.close()
                         Unmanaged<CBData>.fromOpaque(cbPtr).release()
+                        handoff.markFinished()
                         continuation.resume(throwing: POSIXError(.ENOTCONN))
                         return
                     }
 
-                    // Install the bridge as the external transport.
-                    // NAMING TRAP: use AUTO (== 2), not TCP (== 0).
-                    // TCP selects libsmb2's built-in socket and ignores `ext`.
+                    // Install the bridge as the external transport with the kind's exact selector
+                    // (design D9). NAMING TRAP: AUTO/QUIC route `ext`; TCP (== 0) would ignore it.
                     var ext = bridge.makeExternalTransport()
-                    let transportResult = smb2_set_transport(
-                        context, SMB2_TRANSPORT_AUTO, &ext
-                    )
+                    let transportResult = smb2_set_transport(context, selector, &ext)
                     guard transportResult == 0 else {
-                        // smb2_set_transport failed: libsmb2 did NOT install our ext struct,
-                        // so the C close trampoline will never fire. Manually balance the
-                        // passRetained that makeExternalTransport() performed on the bridge,
-                        // and close the eagerly-connected transport so the channel does not leak.
-                        // bridge.close() touches only the transport/pumps — no double-release of
-                        // the Unmanaged below.
+                        // smb2_set_transport failed: libsmb2 did NOT install our ext struct, so
+                        // the C close trampoline will never fire. Balance the passRetained that
+                        // makeExternalTransport() performed, close the transport, release cbPtr.
+                        // bridge.close() touches only the transport/pumps — no double-release.
                         bridge.close()
                         Unmanaged<TransportBridge>.fromOpaque(ext.userdata!).release()
                         Unmanaged<CBData>.fromOpaque(cbPtr).release()
+                        handoff.markFinished()
                         continuation.resume(throwing: POSIXError(.EINVAL,
                             description: "smb2_set_transport failed: \(transportResult)"))
                         return
                     }
-                    // Assert the naming trap: after AUTO install, fd must be -1.
+                    // Assert the naming trap: after AUTO/QUIC install, fd must be -1.
                     assert(smb2_get_fd(context) == -1,
                         "seam transport must not own a native socket fd")
 
@@ -1297,6 +1560,9 @@ extension SMB2Client {
                         }
                     }
                     self.transportBridge = bridge
+                    // Ownership now belongs to transportBridge/teardownSeam(); a late onCancel
+                    // routes through the installed teardown (design D12).
+                    handoff.markInstalled()
 
                     // Register the connect operation.
                     let connectResult = smb2_connect_share_async(
@@ -1369,14 +1635,29 @@ extension SMB2Client {
                 }
             }
         } onCancel: {
-            self.eventLoopQueue.async { [self] in
-                guard !cb.isAbandoned else { return }
-                cb.isAbandoned = true
-                self.pendingOperations.removeValue(forKey: cbId)
-                self.teardownSeam()
-                if let cont = cb.continuation {
-                    cb.continuation = nil
-                    cont.resume(throwing: CancellationError())
+            // Ownership-aware cancellation (design D12): the handoff assigns the single duty.
+            switch handoff.cancel() {
+            case .noClose:
+                // eagerConnecting → cancelled: the eager-completion reconciliation performs the
+                // single bridge.close(); terminal states have nothing to do.
+                break
+            case .closeLocalBridge:
+                // localOwned → cancelled: the connected bridge is locally owned and not yet
+                // installed; close it exactly once here.
+                bridge.close()
+            case .installedTeardown:
+                // installing/installed: route through the installed-ownership teardown. Queue
+                // serialization guarantees the install block completes first, so teardownSeam()
+                // closes the installed seam exactly once and the continuation resumes once.
+                self.eventLoopQueue.async { [self] in
+                    guard !cb.isAbandoned else { return }
+                    cb.isAbandoned = true
+                    self.pendingOperations.removeValue(forKey: cbId)
+                    self.teardownSeam()
+                    if let cont = cb.continuation {
+                        cb.continuation = nil
+                        cont.resume(throwing: CancellationError())
+                    }
                 }
             }
         }

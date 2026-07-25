@@ -100,8 +100,12 @@ signal, *not* a peer-originated graceful EOF; implemented via the D8 recorded-ca
 which records the local-close cause *before* `NWConnection.cancel()` so the resulting
 `.cancelled` event is never misread as abnormal loss), exactly like `TCPTransportApple.close()` → `signalClosed()`,
 `TCPTransportApple.swift:429-437` — so `TransportBridge.inboundPump()` sees the identical
-`setInboundEOF()` teardown signal from both conformers; `ENOTCONN` is reserved for the
-never-connected case, matching `TCPTransportApple.receive()`'s `_channel == nil` guard).
+`setInboundEOF()` teardown signal from both conformers; `ENOTCONN` is the transport's
+"no usable connection" error — `send(_:)` throws it whenever no connection is usable, including
+after `close()`, and `receive()` throws it only when the transport was never connected, since
+`receive()` after a local `close()` is exempted by the empty-`Data` teardown convention. Both
+conformers behave identically here: `TCPTransportApple.send` guards on `_channel == nil`, which
+`close()` nils).
 `NWConnection.receive` re-arms itself and appends to the FIFO on the connection's private
 `DispatchQueue`. Rationale: the seam + bridge were validated against this exact concurrency
 shape; introducing an actor here would add a second pattern for no benefit. Alternative (actor)
@@ -138,10 +142,11 @@ rejected for consistency and because `NWConnection` callbacks would hop executor
   `connect(...)` calls `parseSeamEndpoint(server, defaultPort:)`, runs host validation (below)
   and — for `.quic` — connect-timeout validation/normalization (D10), and only then constructs
   the transport — `TCPTransportApple()` for `.tcp`/`.automatic`, or
-  `QUICTransportApple(configuration:connectTimeout:)` for `.quic`, receiving the configuration
-  snapshot and the **validated, normalized** QUIC connect timeout (D10 — sourced from
-  `SMBQUICConfiguration.connectTimeout`, never from `SMB2Client.timeout`) at construction —
-  wraps it in the bridge, and calls
+  `QUICTransportApple(configuration:)` for `.quic`, receiving the configuration snapshot at
+  construction; the initializer derives the **validated, normalized** QUIC connect timeout
+  from `SMBQUICConfiguration.connectTimeout` via the same normalization helper (D10 — never
+  from `SMB2Client.timeout`), so direct construction cannot bypass the contract — wraps it in
+  the bridge, and calls
   `connectWithBridge`. Parsing happens exactly once, and validation precedes both transport
   construction and `bridge.connect()` (the eager-connect ordering). The transport never reads
   configuration from the manager or client after construction, so later settings changes cannot
@@ -182,7 +187,49 @@ rejected for consistency and because `NWConnection` callbacks would hop executor
   validation layer** that would reject a numeric target under an insecure trust policy, which
   is exactly why the rejection must be fail-closed here.
 - **Port defaulting**: `parseSeamEndpoint` gains the `defaultPort:` parameter described above.
-  Explicit ports are honored unchanged.
+  A server string with no explicit port yields UDP/443 for `.quic` (445 for `.tcp`/
+  `.automatic`); an explicit valid port is preserved and honored unchanged.
+- **Port range validation — layered, fail-closed at both ends**: the accepted port range is
+  exactly `1...65535`. Every other value — `0`, negatives, anything above `65535`, and
+  oversized digit strings of any length — surfaces `POSIXError(.EINVAL)`; on the client path no
+  transport is constructed, and in every case **no `NWConnection` is created**. Two layers
+  enforce this:
+
+  1. **Hoisted endpoint validation in `SMB2Client` (before transport construction)**: after
+     `parseSeamEndpoint`, the `.quic` branch rejects any explicit port outside `1...65535`
+     with `EINVAL`, so an invalid port never reaches the transport or the `NWConnection`
+     driver factory. This is also where **parsing overflow** is rejected: `parseLeadingPort`
+     is overflow-safe by construction — digit accumulation stops once the value already
+     exceeds 65535, because no further digit can bring it back into range (bounding the
+     intermediate at 655,359) — so an arbitrarily long digit string parses to an out-of-range
+     value instead of trapping, and this guard rejects it. The parser is shared with the TCP
+     path, whose behavior is unchanged for every in-range port; out-of-range values remain
+     out-of-range (only their exact magnitude is clamped) and fail downstream identically.
+  2. **`NWConnectionQUICDriver.init` (the Network.framework boundary)**: expressed as
+     `UInt16(exactly: port)` plus an explicit `> 0` guard — `NWEndpoint.Port` is
+     `UInt16`-based, so a bare truncating conversion would let `65536` silently become UDP/0
+     and `0` become a wildcard port; `UInt16(exactly:)` rejects negatives and out-of-range
+     values by construction, and the `> 0` guard rejects port 0. On rejection the driver
+     stores `connection = nil` and `initError = POSIXError(.EINVAL, ...)` instead of
+     constructing an `NWConnection`.
+
+  **Why both layers exist.** The hoisted check makes the normative contract — `EINVAL` with no
+  transport constructed and no network factory reached — hold for the client connect path, and
+  it is the natural home for the overflow rejection because the out-of-range value originates
+  in endpoint parsing. The driver check remains the fail-closed authority for a
+  **directly-constructed** `QUICTransportApple`, whose `connect(host:port:)` is `Int`-typed
+  and bypasses client-side validation entirely. The driver placement is *architecturally
+  notable* because it is the only `.quic` validation that runs after transport construction,
+  and it therefore reaches the caller by a different route than the hoisted checks: the driver
+  is constructed successfully (holding only `initError`), and `start()` **synchronously**
+  emits `.failed(EINVAL)`. That emission lands inside the D7 commit-to-start window
+  (`startPhase == .starting`), so the losing outcome is *parked* and delivered by the starting
+  path's post-`start()` handoff (D7) rather than by the winner directly. This is safe precisely
+  because the handoff is defined for a synchronous state emission: the lock is never held
+  across `start()`, `driver.cancel()` runs only after `start()` has returned, and the
+  continuation resumes exactly once with `EINVAL`. No network activity occurs on this path —
+  there is no `NWConnection` to start — so "no `NWConnection` for an invalid port" and "the
+  error surfaces as `EINVAL` from `connect`" hold simultaneously.
 - **Opt-in**: only `transportKind == .quic` builds the QUIC transport. `.automatic` remains
   `TCPTransportApple` this milestone (re-evaluate after interop maturity).
 - **No silent fallback**: QUIC connect errors map through `mapTransportConnectError` and
@@ -292,7 +339,7 @@ Set-before-connect, like `timeout`.
    signature exists only under `#if canImport(Network)`) and never read again from the manager.
    On platforms without `Network` (Linux), the **manager** routes on the same snapshot (see
    the Linux paragraph below); the configuration-aware client signature does not exist there.
-4. `SMB2Client` hands the configuration to `QUICTransportApple(configuration:connectTimeout:)`
+4. `SMB2Client` hands the configuration to `QUICTransportApple(configuration:)`
    **at construction**; the transport copies the value and never reaches back to the client or
    manager.
 
@@ -332,6 +379,10 @@ and does **not** exist on Linux. The routing there is:
 - If the snapshot kind is `.quic`, the manager throws `POSIXError(.ENOTSUP)` **before**
   constructing any transport, touching the client connect path, or attempting any network
   activity — never a silent downgrade (the no-silent-fallback rule applies to platforms too).
+  Implementation note: `POSIXErrorCode` has no `.ENOTSUP` case on Linux
+  (swift-corelibs-foundation), so the rejection bridges the C `ENOTSUP` errno through the numeric
+  `POSIXErrorCode(_ code: Int32)` initializer; on Linux that surfaces as the `EOPNOTSUPP` alias
+  of `ENOTSUP` (same errno 95), which is the Linux spelling of the same "not supported" result.
 - If the snapshot kind is `.tcp` or `.automatic`, the manager invokes the existing legacy
   client connect path (`connect(server:share:user:)`, the libsmb2-owned socket) **unchanged**.
 - No QUIC-only type that requires Network or Security frameworks leaks into Linux compilation:
@@ -350,16 +401,38 @@ libsmb2's cancellation and timeout machinery is installed, so the transport cann
 "Mirror `TCPTransportApple`" is also not sufficient — the TCP conformer delegates connect
 establishment to NIOTS, while QUIC drives `NWConnection` directly. The binding requirements:
 
-- **Atomic outcome claim — selection AND side effects are one transition**: the connect attempt
-  holds an `NSLock`-guarded state (`connecting(continuation)` → `ready` | `failed(cause)`),
+- **One-shot connect ownership — the attempt is reserved atomically before any work**:
+  `QUICTransportApple` is public, so repeated/concurrent `connect` calls are reachable by any
+  consumer and must be rejected, not merely documented away. The first call atomically
+  transitions the lock-guarded connect state `.idle → .reserved` **before** trust resolution
+  or driver construction; exactly one call ever owns the attempt. Every other call observes
+  the state and fails promptly without constructing a driver, arming a timer, or touching the
+  owning attempt's continuation/driver/deadline/lifecycle: `.reserved`/`.connecting` →
+  `POSIXError(.EALREADY)`; `.ready` → `POSIXError(.EISCONN)`; `.failed` →
+  `POSIXError(.EALREADY)` (**retry after a failed attempt is unsupported** — one instance per
+  connection lifetime, matching how `SMB2Client` builds a fresh transport per connect); after
+  `close()` → `POSIXError(.ECONNABORTED)` (the existing closed-transport contract, checked
+  first). An accepted attempt that fails eager validation (D5 trust `EINVAL`) also consumes
+  the one shot. Close or task cancellation racing the reservation/preparation phase (between
+  `.reserved` and the continuation store) cannot strand the reservation: the store re-checks
+  the close lifecycle and a `cancelRequested` flag set by `onCancel` under the same lock, and
+  aborts with `ECONNABORTED`/`CancellationError` (consuming the attempt) before any deadline
+  is armed or driver started — the only post-`close()` remnant is that resolution itself,
+  which touches no resource.
+- **Atomic outcome claim — selection AND duty assignment are one transition**: the connect
+  attempt holds an `NSLock`-guarded state (`connecting(continuation)` → `ready` | `failed`),
   and every completion path funnels through a single internal
-  `claimConnectOutcome(_ outcome: ConnectOutcome) -> ClaimedDuty?` that, **under the lock**,
-  atomically (a) decides whether this path wins (the state is still `connecting`) and
-  (b) takes the continuation and transitions the state. The winner receives back the duty it —
-  and only it — must perform *outside* the lock; a loser receives `nil` and performs **no**
-  side effects at all. This closes the gap where a one-shot gate protected resumption but not
-  side effects (a losing `onCancel` could still `NWConnection.cancel()` a connection that
-  `.ready` had just successfully returned):
+  `resolveConnect(_ outcome: ConnectOutcome)`. **Under the lock** it atomically (a) decides
+  whether this path wins (the state is still `connecting`), (b) takes the continuation and
+  transitions the state, and (c) *assigns* the resulting duty — for a losing outcome via the
+  lock-held helper `consumeLossClaimLocked(_:error:) -> LossDuty?`, which returns the duty to
+  perform or `nil` when the loss is parked for the starting path (see the start handoff below).
+  The **effects** — `deadline.cancel()`, `driver.cancel()`, and `continuation.resume(...)` —
+  are deliberately performed *outside* the lock, by whichever party the assignment named; only
+  the selection and the assignment are atomic. A loser of the claim receives nothing and
+  performs **no** side effects at all. This closes the gap where a one-shot gate protected
+  resumption but not side effects (a losing `onCancel` could still `NWConnection.cancel()` a
+  connection that `.ready` had just successfully returned):
   - If **`.ready` wins**: the transport transitions to the established state, **retains the
     connection reference for `send`/`receive`** (the reference is *not* cleared on successful
     connect), cancels the deadline timer, and resumes the continuation with success. Any later
@@ -373,9 +446,18 @@ establishment to NIOTS, while QUIC drives `NWConnection` directly. The binding r
     `CancellationError` — the live connection is never destroyed by the losing
     connect-claim path itself, and it never leaks.
   - If **task cancellation, deadline expiry, `.failed`, or `close()` wins** before readiness:
-    the winning path — exactly once — cancels the deadline timer, cancels and releases the
-    `NWConnection` (clears the stored reference and its `stateUpdateHandler` so no callback
-    retains the transport past teardown), and resumes the continuation with the mapped error.
+    the connection is — exactly once — cancelled and released (the stored reference and its
+    `stateUpdateHandler` cleared so no callback retains the transport past teardown), the
+    deadline timer cancelled, and the continuation resumed with the mapped error. **Who**
+    performs that duty follows the atomic start handoff: the setup body commits toward
+    `NWConnection.start()` in the same critical section that re-checks the claim, so a loser
+    that wins *before* the commit records the start as forbidden — `start()` is never invoked
+    and there is nothing to cancel; a loser that wins *after* the commit but before `start()`
+    returns parks its outcome instead of cancelling (never cancelling a connection whose start
+    side effect has not happened, and never holding the lock across `start()`, which may
+    synchronously emit a state), and the starting path finishes the parked loss after `start()`
+    returns — cancel exactly once, then resume — so no connection activity begins after a
+    losing resume; a loser that wins after `start()` has returned performs the duty itself.
     All other racing paths lose the claim and are side-effect-free no-ops.
 - **`NWConnection.stateUpdateHandler`, every state handled explicitly**:
   - `.setup`, `.preparing` — progress; no action.
@@ -396,28 +478,118 @@ establishment to NIOTS, while QUIC drives `NWConnection` directly. The binding r
   recorded local-close cause, is abnormal transport loss — the parked or next `receive()`
   throws the mapped `POSIXError`. Neither ever touches the (already consumed) connect claim.
 - **Task cancellation**: `connect` wraps the continuation in `withTaskCancellationHandler`;
-  `onCancel` calls `claimConnectOutcome(.taskCancelled)` and performs the cancel/release duty
-  **only if it wins the claim**; if `.ready` already won, `onCancel` is a side-effect-free
-  no-op. Cancellation *before* start is handled by an explicit `try Task.checkCancellation()`
+  `onCancel` calls `resolveConnect(.taskCancelled)`, which performs (or parks, per the start
+  handoff above) the cancel/release duty **only if it wins the claim**; if `.ready` already
+  won, `onCancel` is a side-effect-free no-op. Cancellation *before* start is handled by an explicit `try Task.checkCancellation()`
   before the `NWConnection` is created.
 - **Deterministic deadline**: a single timer is armed (through the injectable deadline
   scheduler, below) when connect begins, with the validated `connectTimeout` passed at
   construction (sourced from `SMBQUICConfiguration.connectTimeout` per D10 — **independent of
   `SMB2Client.timeout` and of the value later propagated to `smb2_set_timeout`**). On expiry it
-  attempts the claim; a winning claim cancels the connection → connect throws
-  `POSIXError(.ETIMEDOUT)` (description includes the last `.waiting` error, if any). First of
-  ready/failed/cancel/deadline wins via the atomic claim; the timer is cancelled by whichever
-  path wins.
+  attempts the claim; a winning claim causes the connection to be cancelled — directly or via
+  the parked handoff below — and connect throws `POSIXError(.ETIMEDOUT)` (description includes
+  the last `.waiting` error, if any). First of ready/failed/cancel/deadline wins via the atomic
+  claim; the timer is then cancelled by the party the claim assigned the duty to (the winner
+  itself, except in the parked commit-to-start case, where the starting path cancels it).
+  **Late-armed timers are cancelled too**: a loser can win the claim and call
+  `deadline.cancel()` in the store-to-schedule window, *before* `schedule` has recorded a
+  timer (a scheduler may even fire synchronously inside `schedule` before recording itself as
+  armed). The connect attempt therefore re-checks the claim after `schedule` returns: if the
+  claim was consumed, it calls `deadline.cancel()` again (idempotent — a second cancel of an
+  already-cancelled or never-armed timer is a no-op) before finishing. No timer remains armed
+  after a terminal connect outcome or a completed `close()`; there is no benign "bounded
+  self-expiry" tail.
 - **Error contract**: task cancellation → `CancellationError` (passes through
   `mapTransportConnectError` unchanged); `close()` while connecting →
   `POSIXError(.ECONNABORTED)`; deadline expiry → `POSIXError(.ETIMEDOUT)`; `.failed` →
   `POSIXError` mapped from the `NWError` (POSIX errno preserved where available, otherwise
   `.ECONNREFUSED` with a description) — never a raw Network.framework error.
-- **Cleanup is the winner's duty**: the winning claim performs all cleanup exactly once — the
-  continuation is consumed inside the claim, the deadline timer is cancelled by the winner, and
-  only a *losing-outcome* winner (cancel/deadline/failure/close) cancels the `NWConnection` and
-  clears the stored reference and `stateUpdateHandler`. A successful connect keeps the
-  connection reference and hands the state machine over to the D3 receive/close shape.
+- **Cleanup duty is assigned by the claim, and the start handoff decides who executes it**: the
+  continuation is consumed inside the claim, and every effect then runs exactly once, outside
+  the lock, by the assigned party. The claim assigns, it does not always execute:
+  - **`.ready` wins** — the *ready path* cancels the deadline timer and **retains** the driver
+    for `send`/`receive`; nothing is cancelled. The state machine hands over to the D3/D8
+    receive/close shape.
+  - **Losing outcome, pre-commit (`startPhase == .notStarted`)** — the winner marks the start
+    `forbidden` (the setup body must never start the driver now), releases the stored
+    reference, cancels the deadline timer, and resumes with the mapped error. There is **no
+    driver to cancel**, because `start()` was never invoked.
+  - **Losing outcome, commit-to-start window (`startPhase == .starting`)** — the winner
+    performs **no** effects at all: it parks `(continuation, error)` in `pendingLoss`, releases
+    the stored reference, and returns. After `driver.start()` returns, the *starting path*
+    consumes the parked loss and performs the whole duty exactly once — `deadline.cancel()`,
+    then `driver.cancel()`, then `continuation.resume(throwing:)`, then completing any
+    `close()` callers parked on the pending teardown. This ordering is
+    load-bearing: cancelling before `start()` returns would cancel a connection whose start
+    side effect has not happened, resuming before the cancel would let connection activity
+    begin after the caller already observed the failure, and completing close waiters any
+    earlier would let `close()` return while a driver start or cancel was still outstanding.
+  - **Losing outcome, post-start (`startPhase == .started`, and the defensive `forbidden`
+    case)** — the winner itself cancels the deadline timer, cancels the started driver, clears
+    the stored reference and `stateUpdateHandler` (so no callback retains the transport past
+    teardown), and resumes with the mapped error.
+
+  In every case the deadline timer is cancelled exactly once and the `NWConnection` is
+  cancelled at most once, but **it is not universally the winner that does it** — a maintainer
+  moving the cancel unconditionally back into the winning claim would reintroduce the
+  cancel-before-start-side-effect defect this handoff exists to prevent.
+
+  **Close lifecycle — every `close()` caller observes completed teardown**:
+  `SMBTransport.close()` promises that all resources are released when it returns — for
+  *every* caller, in *every* teardown phase, not only the parked commit-to-start path. The
+  transport tracks an explicit close lifecycle under the lock: `.open → .closing → .closed`.
+  The first `close()` caller atomically becomes the **teardown owner** (`.open → .closing`);
+  in the same critical section it takes its duties (win the connect claim with `ECONNABORTED`,
+  or capture the established driver and parked receive waiter, recording the local-close cause
+  before any cancel per D8). It performs the resource teardown — deadline cancel, driver
+  cancel, connect-continuation/receive-waiter resumption — on a dedicated serial teardown
+  queue (`org.amsmb2.quic.teardown`) and awaits its completion; then it awaits any in-flight
+  connect work (below); only then does it publish `.closed` and resume every waiter parked in
+  `closeWaiters`. A `close()` arriving while the state is `.closing` parks a continuation in
+  `closeWaiters` and returns only after the owner's fully-completed teardown; a `close()`
+  after `.closed` returns immediately (the terminal no-op — *distinct from* a concurrent
+  close, which always waits). Because `close()` is `async`, all waiting parks continuations —
+  no thread blocks, and no lock is held across an await, a driver/deadline call, or any
+  continuation resumption. Each owned resource is cancelled and resumed exactly once (the
+  owner or the starting path's handoff, never both — the claim assignment decides).
+
+  **In-flight connect work — close waits for the whole attempt tail**: once the continuation
+  store succeeds, a `connectWorkInFlight` flag (set in the same critical section as the store)
+  spans the *entire* remaining attempt: deadline arming (including the late-armed re-check),
+  the commit, `driver.start()`, and the complete post-start handoff. The close owner, after
+  its own resource teardown, parks on `connectWorkWaiters` until the attempt clears the flag
+  at the end of its `startQueue` block. This covers uniformly: a loss parked in the
+  commit-to-start window (by this close, or earlier by cancellation/deadline — the handoff
+  cancels the started driver exactly once and resumes the connect continuation before the flag
+  clears); **ready-mid-start** — `.ready` resolving the claim while `start()` has not yet
+  returned, where `close()` cancels the ready driver immediately through the established
+  branch but still waits for the in-flight `start()` tail to finish; and the deadline-arming
+  tail. Consequently, after any `close()` returns, no start, receive-arm, parked teardown, or
+  armed timer remains outstanding — released-on-return is unqualified again, with one
+  resolution-only exception: a `connect()` racing `close()` between its attempt reservation
+  and its continuation store aborts itself with `ECONNABORTED` when the store runs; it arms
+  nothing and starts nothing. Task cancellation and deadline expiry keep their existing rule —
+  the connect continuation is not resumed until the committed driver has been cancelled — but
+  only `close()` additionally waits for the full tail, because only `close()` carries the
+  released-on-return promise.
+
+  **The attempt runs on a dedicated queue**: after the reservation and driver construction,
+  the whole connect attempt — continuation store, deadline arming, commit, `driver.start()`,
+  post-start handoff — runs on a private serial `DispatchQueue` (`org.amsmb2.quic.start`),
+  never on a Swift cooperative-pool thread; the close owner's resource teardown likewise runs
+  on `org.amsmb2.quic.teardown`. Production cost is one queue hop per connect and per close;
+  the payoff is that the deterministic race tests can park inside `start()`, `cancel()`, or
+  `schedule()` (holding the commit-to-start window, an established teardown, or the
+  store-to-schedule window open) while occupying only a GCD worker — the connect task itself
+  is suspended on its continuation — so the gated tests cannot starve the cooperative pool
+  regardless of its width (structurally: every blocking wait sits on a GCD worker; the suite
+  also runs green with cooperative-pool overcommit disabled via
+  `LIBDISPATCH_COOPERATIVE_POOL_STRICT=1`, as corroborating evidence), and their bounded
+  in-double waits turn broken coordination into a visible failure instead of a hang. Because
+  the store runs outside the task context, task cancellation is bridged by the
+  `cancelRequested` flag: `onCancel` sets the flag first (so a store that has not run yet
+  aborts) and then attempts the claim (so a stored continuation resolves) — exactly one of the
+  two acts.
 
 **Deterministic testability — injected seams, no wall-clock, no TEST-NET dependence** (unit
 tests must not depend on how the local network stack treats unroutable addresses — routing,
@@ -427,8 +599,12 @@ a lingering `.waiting`):
 - **Injected connection driver**: the transport talks to `NWConnection` through an internal
   `QUICConnectionDriver` seam (start/cancel + state-event delivery + send/receive primitives).
   The production implementation is a thin `NWConnection` wrapper; tests inject a scripted
-  driver via an internal initializer (`QUICTransportApple(configuration:connectTimeout:driver:)`;
-  the public path uses the production driver). The test driver can deliver `.waiting`,
+  driver factory and an on-demand deadline scheduler via the internal initializer
+  (`QUICTransportApple(configuration:connectTimeout:driverFactory:deadline:)` — taking the
+  already-normalized connect timeout directly; the public throwing
+  `QUICTransportApple(configuration:)` derives, validates, and normalizes that timeout from
+  `configuration.connectTimeout` and supplies the production `NWConnectionQUICDriver` factory
+  and `DispatchSourceTimer`-based scheduler). The test driver can deliver `.waiting`,
   `.ready`, `.failed`, and `.cancelled` deterministically, in any order and interleaving —
   including *post-ready* delivery, so the D8 established-connection lifecycle (local close vs
   unsolicited `.failed`/`.cancelled`) is deterministically testable too.
@@ -442,6 +618,17 @@ a lingering `.waiting`):
   connection remains usable; when a losing outcome wins, exactly one `cancel()` was recorded.
 - TEST-NET-1 endpoints remain only as **optional integration/smoke coverage** (non-gating);
   they are not part of the required deterministic unit suite. See tasks 2.3.
+- **Coverage note (as shipped)**: the injected seams make the transport's own behavior fully
+  deterministic, but the two Context-level `.quic` *wiring* lines — constructing
+  `QUICTransportApple(configuration:)` under the `#available` gate after the hoisted timeout
+  validation — are not exercised by a deterministic unit test, because a validated
+  non-numeric `.quic` target proceeds to a real `NWConnection` connect (there is no
+  transport-factory seam at the `SMB2Client.connect` layer). Both *halves* are independently
+  unit-covered — the policy/validation path (`isNumericHost`, `normalizedQUICConnectTimeout`, the
+  selector) and the transport behavior (via the D7 seams) — so only the literal construction call
+  rests on the interop gate (tasks 4.x). A transport-factory injection point on `SMB2Client`
+  could close this if it is ever judged necessary; it was not added to avoid widening the client
+  surface for a single construction line.
 
 ### D8: Disconnect semantics — best-effort local, honestly scoped (option B)
 
@@ -460,9 +647,9 @@ wire. That is the existing, accepted contract for the TCP seam, and QUIC inherit
   `TCPTransportApple` — but because local `close()` itself calls `NWConnection.cancel()`
   (which then delivers a `.cancelled` state event), the distinction is implemented as an
   explicit, `NSLock`-guarded **established-connection lifecycle with recorded causes**:
-  `ready → localClosing → closed`, or `ready → failed(error)`. Normative semantics:
-  - **Local close**: `close()` atomically records the local-close cause (`localClosing`, then
-    `closed`) under the lock **before** calling `NWConnection.cancel()`, resumes a parked
+  `ready → closed`, or `ready → failed(error)`. Normative semantics:
+  - **Local close**: the close owner atomically records the local-close cause (`closed`)
+    under the lock **before** calling `NWConnection.cancel()`, resumes a parked
     `receive()` with empty `Data` (the bridge teardown signal), and releases resources. The
     `.cancelled` state event that its own `NWConnection.cancel()` subsequently delivers
     observes the recorded cause and is a **no-op acknowledgment** — it is never converted into
@@ -515,7 +702,9 @@ existing public contract. So the connect deadline gets its own knob:
 - **Validation and normalization** happen in `SMB2Client.connect`'s hoisted validation step
   (D4), before transport construction and before any network activity, via an internal
   table-testable helper `static func normalizedQUICConnectTimeout(_ value: TimeInterval) throws
-  -> TimeInterval`:
+  -> TimeInterval`; the public `QUICTransportApple(configuration:)` initializer applies the
+  same helper to `configuration.connectTimeout`, so a directly constructed transport can never
+  hold an invalid, unnormalized deadline:
   - `NaN`, `+/-infinity`, `0`, and negative values → `POSIXError(.EINVAL)` (fail loud — a
     non-finite or non-positive connect deadline is a configuration error, never "disabled";
     the QUIC connect deadline cannot be disabled).
@@ -587,7 +776,7 @@ close this — any check leaves an unprotected gap after it. Normative design:
   the eager-completion reconciliation on a failure or cancellation outcome, or by an
   install-block failure path). Every transition is atomic; the party that wins a transition —
   and only that party — performs the associated close/cleanup duty *outside* the lock (the
-  same claim-assigns-duty shape as D7's `claimConnectOutcome`). The bridge therefore closes
+  same claim-assigns-duty shape as D7's `resolveConnect`). The bridge therefore closes
   exactly once on every path.
 - **Transitions and duties**:
   - **`eagerConnecting`** (before/during `bridge.connect`): `onCancel` transitions
@@ -655,15 +844,19 @@ close this — any check leaves an unprotected gap after it. Normative design:
   - **Install-block failure paths** (context gone, `smb2_set_transport` failure,
     `smb2_connect_share_async < 0` — all reachable only *after* a successful `installing`
     claim, since a failed claim returns before anything is created): the block owns the bridge
-    (it won `installing`), performs today's cleanup, and transitions to `finished`, making any
-    late `onCancel` a side-effect-free no-op on the bridge. Cleanup releases **only the
-    resources actually created at the point of failure**, in claim-then-create order:
-    context-gone (checked after the claim and `cbPtr` construction) closes the bridge and
-    releases `cbPtr` — no `ext.userdata` retain exists yet because `makeExternalTransport()`
-    has not run; `smb2_set_transport` failure additionally balances the `ext.userdata`
-    `Unmanaged` retain; `smb2_connect_share_async < 0` releases `cbPtr` and tears down via
-    `teardownSeam()` (by then `transportBridge` is set and libsmb2 owns the `ext.userdata`
-    retain through the C close trampoline).
+    (it won `installing`) and performs today's cleanup, releasing **only the resources actually
+    created at the point of failure**, in claim-then-create order. The two **pre-install**
+    failures — before `transportBridge` is assigned — transition to `finished`, making any late
+    `onCancel` a side-effect-free no-op on the bridge: context-gone (checked after the claim and
+    `cbPtr` construction) closes the bridge and releases `cbPtr` — no `ext.userdata` retain
+    exists yet because `makeExternalTransport()` has not run; `smb2_set_transport` failure
+    additionally balances the `ext.userdata` `Unmanaged` retain. The **post-install**
+    `smb2_connect_share_async < 0` path runs *after* `transportBridge` is assigned (state
+    `installed`), so ownership stays with `transportBridge`/`teardownSeam()` and the state is
+    **not** moved to `finished`: it releases `cbPtr` and tears down via `teardownSeam()` (by then
+    `transportBridge` is set and libsmb2 owns the `ext.userdata` retain through the C close
+    trampoline), and a late `onCancel` routes through the idempotent installed-teardown path
+    rather than the bridge no-op.
 - **No leaks, provably**: at every instant exactly one party is responsible for closing — the
   eager-completion reconciliation (every cancellation or failure outcome of `bridge.connect`:
   rows B/C/D and the race rule E), `onCancel` (`localOwned`), the install block (`installing`
@@ -676,7 +869,7 @@ close this — any check leaves an unprotected gap after it. Normative design:
   and is never created at all on a failed install claim — and no connected-but-unowned bridge
   or registered libsmb2 operation survives any interleaving.
 - **Deterministic testability**: the handoff is factored as an internal lock-protected type
-  (transition table in, assigned duty out — mirroring D7's `claimConnectOutcome`) so every
+  (transition table in, assigned duty out — mirroring D7's `resolveConnect`) so every
   transition and race above — including all reconciliation rows A–D and both commit orders of
   race E — is unit-tested directly, without real task-cancellation timing.
   MockTransport-backed `connectWithBridge` tests then cover the wired paths:
@@ -701,11 +894,53 @@ connect and installation) rejected: every check leaves a gap after it; only an a
 claim/handoff makes the ownership total. This applies to both conformers — the TCP seam path
 gains the same guarantee.
 
+## Interop observations (2026-07-24, live against the standing rig)
+
+First-contact and the full interop matrix were run live (macOS `NWProtocolQUIC` client ↔
+Samba 4.23.6 + lxin/quic on `ubuntu-brix.kaveman.intra`). Headline findings:
+
+- **Framing (D2): CONFIRMED.** NEGOTIATE, tree-connect, directory enumeration, and multi-MB
+  reads/writes all parse cleanly through libsmb2's direct-transport byte-stream reader over the
+  QUIC stream — the 4-byte length prefix is present; no fork-seam frame-stripping is needed. The
+  contingency below did not fire.
+- **Headline interop finding — Apple ↔ lxin/quic `active_connection_id_limit` incompatibility
+  (server-side patch required until upstreamed).** Apple's `NWProtocolQUIC` advertises the QUIC
+  transport parameter `active_connection_id_limit = 64`; lxin/quic (through at least HEAD
+  `03a9c7c`) rejects any value `> 8` with `-EINVAL`, closing the handshake with
+  `CONNECTION_CLOSE(TRANSPORT_PARAMETER_ERROR)` before any ServerHello. This violates
+  RFC 9000 §18.2 (the value is the peer's storage willingness; only `< 2` is invalid — larger
+  values MUST be accepted). Confirmed by a three-stack discriminator: OpenSSL 3.5.5's QUIC client
+  (advertises `2`) and Samba's own client interoperate; Apple (advertises `64`) does not. There is
+  **no client-side remedy** (`NWProtocolQUIC` does not expose the parameter). Remediation is a
+  one-line RFC-correct clamp in the kernel module (`value > QUIC_CONN_ID_LIMIT` → clamp, not
+  reject); with it, first-contact and the full matrix pass. **Fixed upstream 2026-07-25** in
+  lxin/quic master `47ca73f` — our PR [lxin/quic#78](https://github.com/lxin/quic/pull/78) for
+  issue [#77](https://github.com/lxin/quic/issues/77) (fork `simplekube-ro/quic`, commit
+  `08dbf11`). Rigs built from ≥ `47ca73f` need no local patch; this rig was moved to pure upstream
+  master on 2026-07-25 and re-verified 14/14 (26 s). See docs/INTEROP-QUIC.md trap #4.
+- **No premature idle teardown / keepalive tuning needed.** Multi-MB transfers and interleaved
+  connect/op/disconnect cycles complete within `NWProtocolQUIC` defaults; the risk below did not
+  materialize.
+- **Best-effort disconnect + server-close behavior (D8), observed.** After a best-effort local
+  `disconnect()`, the server reaped the session ≈ 2.2 s later (observed via `smbstatus`) — a
+  best-effort teardown, not guaranteed DISCONNECT delivery. A server-initiated close mid-session
+  surfaces to our client as `POSIXError(.ENOTCONN)` ("SMB2 server not connected") on the next
+  operation — prompt and clean, no hang. See docs/INTEROP-QUIC.md.
+- **Rig test-infra caveat, resolved (not an SMB/QUIC fault).** The rig originally published QUIC
+  via docker's userland UDP proxy (`-p 443:443/udp`), which wedged for new LAN flows under a
+  sustained connect/disconnect burst (the whole 14-test suite back-to-back). Switching the rig to
+  `--network host` (QUIC binds host UDP/443 directly, no userland proxy) fixed it: the full 14-test
+  suite now runs stably in a single 40 s pass. See docs/INTEROP-QUIC.md trap #5.
+
+WS2025 (Microsoft-native MsQuic server) remains the other conformant target, deferred until a
+Windows host is available — it may accept Apple's ClientHello where lxin/quic needs the patch.
+
 ## Risks / Trade-offs
 
 - [Framing assumption wrong over QUIC] → Verified as first interop gate (D2); contingency is a
   seam-level fix in the libsmb2 fork, transport unchanged. Until interop passes, the feature is
-  unreleased-opt-in, so blast radius is zero.
+  unreleased-opt-in, so blast radius is zero. **Resolved 2026-07-24: framing confirmed on the
+  wire (see Interop observations above); contingency not needed.**
 - [No CI-able QUIC server: Samba needs `quic.ko` — no distro kernel ships it (not mainlined as
   of Linux 7.0), and GitHub macOS runners cannot reach a module-capable Linux host] → CI keeps
   MockTransport-based unit coverage. Interop runs against the standing lab rig, verified

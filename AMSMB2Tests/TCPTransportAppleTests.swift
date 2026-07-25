@@ -22,11 +22,78 @@
 
 #if canImport(Network)
 
+import Network
 import XCTest
 
 @testable import AMSMB2
 
+// MARK: - AsyncGate
+
+/// A latching async gate for deterministic race tests (design D8): `wait()` parks until
+/// `open()`; once opened, later waits return immediately (so a stray extra entry can never
+/// hang the suite — it is caught by the `entryCount` assertion instead). Entry counting is
+/// the single-ownership assertion: exactly one production path may reach a gated point.
+final class AsyncGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var opened = false
+    private var entries = 0
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    /// Number of times `wait()` has been entered (open or parked).
+    var entryCount: Int {
+        lock.withLock { entries }
+    }
+
+    var hasEntered: Bool {
+        entryCount > 0
+    }
+
+    func wait() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            let parked: Bool = lock.withLock {
+                entries += 1
+                guard !opened else { return false }
+                waiters.append(continuation)
+                return true
+            }
+            if !parked {
+                continuation.resume(returning: ())
+            }
+        }
+    }
+
+    func open() {
+        let toResume: [CheckedContinuation<Void, Never>] = lock.withLock {
+            opened = true
+            let parked = waiters
+            waiters = []
+            return parked
+        }
+        for waiter in toResume {
+            waiter.resume(returning: ())
+        }
+    }
+}
+
 final class TCPTransportAppleTests: XCTestCase, @unchecked Sendable {
+
+    // MARK: - Helpers (deterministic race tests)
+
+    /// Polls `predicate` (state guarded by the doubles' locks) until true or the bound
+    /// elapses — synchronization on observable state, never a wall-clock proof (mirrors
+    /// `QUICTransportAppleTests.waitUntil`).
+    private func waitUntil(
+        _ predicate: @escaping () -> Bool, _ message: String,
+        file: StaticString = #filePath, line: UInt = #line
+    ) async {
+        for _ in 0..<2000 {
+            if predicate() {
+                return
+            }
+            try? await Task.sleep(nanoseconds: 1_000_000) // 1 ms
+        }
+        XCTFail("timed out waiting: \(message)", file: file, line: line)
+    }
 
     // MARK: - Compile-time conformance
 
@@ -235,6 +302,344 @@ final class TCPTransportAppleTests: XCTestCase, @unchecked Sendable {
         } catch {
             XCTFail("Expected CancellationError, got \(type(of: error)): \(error)")
         }
+    }
+
+    // MARK: - One-shot connect ownership (mirrors QUICTransportApple)
+
+    /// Starts a real TCP listener on an ephemeral 127.0.0.1 port and retains accepted
+    /// connections so the transport's channel stays alive for the duration of a test.
+    /// Bounded: if the listener never becomes ready within 5 s the continuation throws.
+    private func startLocalListener() async throws -> (NWListener, LockedBox<[NWConnection]>, Int) {
+        let listener = try NWListener(using: .tcp, on: .any)
+        let retained = LockedBox<[NWConnection]>([])
+        listener.newConnectionHandler = { connection in
+            retained.mutate { $0.append(connection) }
+            connection.start(queue: DispatchQueue(label: "test.tcp.listener.connection"))
+        }
+        let queue = DispatchQueue(label: "test.tcp.listener")
+        let port: Int = try await withCheckedThrowingContinuation { continuation in
+            let resumed = LockedBox<Bool>(false)
+            let resumeOnce: @Sendable (Result<Int, any Error>) -> Void = { result in
+                var first = false
+                resumed.mutate { alreadyResumed in
+                    if !alreadyResumed {
+                        alreadyResumed = true
+                        first = true
+                    }
+                }
+                guard first else { return }
+                continuation.resume(with: result)
+            }
+            listener.stateUpdateHandler = { state in
+                switch state {
+                case .ready:
+                    resumeOnce(.success(Int(listener.port?.rawValue ?? 0)))
+                case .failed(let error):
+                    resumeOnce(.failure(error))
+                default:
+                    break
+                }
+            }
+            queue.asyncAfter(deadline: .now() + 5) {
+                resumeOnce(.failure(POSIXError(.ETIMEDOUT, description: "listener never became ready")))
+            }
+            listener.start(queue: queue)
+        }
+        XCTAssertNotEqual(port, 0, "listener must report a real ephemeral port")
+        return (listener, retained, port)
+    }
+
+    /// WHEN a second connect() races a first call whose attempt is still in flight
+    /// THEN the second call fails promptly with EALREADY (no second bootstrap, bounded well
+    /// under the connect timeout) and the owning attempt proceeds unaffected.
+    ///
+    /// The first connect targets TEST-NET-1 (the file's established pending-connect pattern).
+    /// On hosts that fast-fail the reserved address, the first attempt has already consumed
+    /// the one shot as `.failed` — which also maps to EALREADY, so the assertion holds in
+    /// both environments (which is why in-flight and after-failure share an error code).
+    func testSecondConnectWhileAttemptInFlightThrowsEALREADYPromptly() async {
+        let transport = TCPTransportApple(connectTimeoutSeconds: 3)
+        defer { Task { await transport.close() } }
+
+        let firstTask: Task<Void, any Error> = Task {
+            try await transport.connect(host: "192.0.2.1", port: 445)
+        }
+        // Let the first connect take the reservation and get in flight.
+        try? await Task.sleep(nanoseconds: 150_000_000) // 150 ms
+
+        let start = Date()
+        do {
+            try await transport.connect(host: "192.0.2.1", port: 445)
+            XCTFail("second connect must be rejected, not attempted")
+        } catch let posix as POSIXError {
+            XCTAssertEqual(posix.code, .EALREADY, "second connect must fail with EALREADY")
+        } catch {
+            XCTFail("expected POSIXError(.EALREADY), got \(type(of: error)): \(error)")
+        }
+        XCTAssertLessThan(
+            Date().timeIntervalSince(start), 1.5,
+            "the rejection must be prompt — a slow failure means a second bootstrap ran"
+        )
+
+        firstTask.cancel()
+        do {
+            try await firstTask.value
+            XCTFail("first connect to a black-holed endpoint must throw")
+        } catch {
+            // Any error is fine (ECANCELED, or a fast-fail network error) — the point is the
+            // owning attempt completed on its own terms, unaffected by the rejected call.
+        }
+    }
+
+    /// WHEN connect() is called after a previous call connected successfully
+    /// THEN it fails promptly with EISCONN and the established channel remains installed and
+    /// usable for send() — the rejected call must not replace or leak the live channel.
+    func testConnectAfterConnectedThrowsEISCONNAndKeepsChannelUsable() async throws {
+        let (listener, retained, port) = try await startLocalListener()
+        defer {
+            listener.cancel()
+            retained.value.forEach { $0.cancel() }
+        }
+
+        let transport = TCPTransportApple(connectTimeoutSeconds: 5)
+        defer { Task { await transport.close() } }
+        try await transport.connect(host: "127.0.0.1", port: port)
+
+        do {
+            try await transport.connect(host: "127.0.0.1", port: port)
+            XCTFail("connect after an established connection must be rejected")
+        } catch let posix as POSIXError {
+            XCTAssertEqual(posix.code, .EISCONN, "connect after connected must fail with EISCONN")
+        } catch {
+            XCTFail("expected POSIXError(.EISCONN), got \(type(of: error)): \(error)")
+        }
+
+        // The original channel must still be usable — the rejected call touched nothing.
+        try await transport.send(Data("still-usable".utf8))
+    }
+
+    /// WHEN the first connect attempt failed and connect() is called again
+    /// THEN the call fails promptly with EALREADY — retry after failure is unsupported
+    /// (one instance per connection lifetime; build a fresh transport instead). The
+    /// elapsed-time bound proves no second network attempt ran.
+    func testConnectAfterFailedAttemptThrowsEALREADYPromptly() async {
+        let transport = TCPTransportApple(connectTimeoutSeconds: 2)
+        defer { Task { await transport.close() } }
+
+        do {
+            try await transport.connect(host: "127.0.0.1", port: 1) // refused-port pattern.
+            XCTFail("connect to a refused port must throw")
+        } catch {
+            // Expected — any network-layer failure consumes the one-shot attempt.
+        }
+
+        let start = Date()
+        do {
+            try await transport.connect(host: "127.0.0.1", port: 1)
+            XCTFail("retry after a failed attempt must be rejected")
+        } catch let posix as POSIXError {
+            XCTAssertEqual(posix.code, .EALREADY, "retry after failure must fail with EALREADY")
+        } catch {
+            XCTFail("expected POSIXError(.EALREADY), got \(type(of: error)): \(error)")
+        }
+        XCTAssertLessThan(
+            Date().timeIntervalSince(start), 1.0,
+            "the rejection must be prompt — a slow failure means a second bootstrap ran"
+        )
+    }
+
+    /// WHEN connect() is called after close(), even when an attempt had already failed
+    /// THEN it throws ENOTCONN — the conformer's existing closed-transport contract takes
+    /// precedence over the one-shot attempt state. (Contract-preservation guard: this
+    /// passes before and after the one-shot change; it pins the error-precedence order.)
+    func testConnectAfterCloseThrowsENOTCONNEvenAfterFailedAttempt() async {
+        let transport = TCPTransportApple(connectTimeoutSeconds: 2)
+        do {
+            try await transport.connect(host: "127.0.0.1", port: 1)
+            XCTFail("connect to a refused port must throw")
+        } catch {
+            // Expected.
+        }
+        await transport.close()
+
+        do {
+            try await transport.connect(host: "127.0.0.1", port: 445)
+            XCTFail("connect after close must throw")
+        } catch let posix as POSIXError {
+            XCTAssertEqual(
+                posix.code, .ENOTCONN,
+                "closed contract wins over attempt state: expected ENOTCONN, got \(posix.code)"
+            )
+        } catch {
+            XCTFail("expected POSIXError(.ENOTCONN), got \(type(of: error)): \(error)")
+        }
+    }
+
+    // MARK: - Publication race and owned close lifecycle (design D5–D8)
+
+    /// Finding 1 + finding 2, close flavor: a successful bootstrap is held at exactly the
+    /// pre-publication point (D8 gate) and `close()` wins the race.
+    ///
+    /// WHEN `close()` completes its claim while the connect is gated immediately before the
+    /// publication critical section
+    /// THEN `connect` must NOT return success (it throws the closed contract's `ENOTCONN`),
+    /// the channel must not be (or remain) installed, the never-published channel is closed
+    /// exactly once, and `close()` returns only after the gated connect tail has fully
+    /// drained — proven by the close caller staying parked while the gate holds.
+    func testCloseWinningPrePublicationRaceAbortsConnectAndCloseWaitsForConnectTail() async throws {
+        let (listener, retained, port) = try await startLocalListener()
+        defer {
+            listener.cancel()
+            retained.value.forEach { $0.cancel() }
+        }
+
+        let transport = TCPTransportApple(connectTimeoutSeconds: 5)
+        let gate = AsyncGate()
+        transport.connectPublicationGate = { await gate.wait() }
+
+        let connectTask: Task<Void, any Error> = Task {
+            try await transport.connect(host: "127.0.0.1", port: port)
+        }
+        await waitUntil({ gate.hasEntered }, "connect parked immediately before publication")
+
+        let closeDone = TestFlag()
+        let closeTask: Task<Void, Never> = Task {
+            await transport.close()
+            closeDone.set()
+        }
+        // The owned close lifecycle must park the owner on the still-gated connect tail —
+        // returning here would mean close() finished while the tail could still publish.
+        await waitUntil(
+            { transport.pendingCloseWaiterCount == 1 },
+            "close parked awaiting the gated connect tail"
+        )
+        XCTAssertFalse(
+            closeDone.isSet,
+            "close() must not return while the pre-publication connect tail is still gated"
+        )
+
+        gate.open()
+        do {
+            try await connectTask.value
+            XCTFail("connect must not return success after close won the pre-publication race")
+        } catch let posix as POSIXError {
+            XCTAssertEqual(
+                posix.code, .ENOTCONN,
+                "a close-won publication must surface the conformer's closed contract"
+            )
+        } catch {
+            XCTFail("expected POSIXError(.ENOTCONN), got \(type(of: error)): \(error)")
+        }
+        await closeTask.value
+        XCTAssertFalse(
+            transport.hasInstalledChannel,
+            "the closed channel must never be installed after close() returned"
+        )
+        XCTAssertEqual(
+            transport.abortedConnectChannelCloseCount, 1,
+            "the never-published channel must be closed exactly once"
+        )
+    }
+
+    /// Finding 1, cancellation flavor: the bootstrap succeeded, the cancellation handler has
+    /// already exited, and the task is cancelled while the connect is gated immediately
+    /// before publication — the pure post-handler cancellation window.
+    ///
+    /// WHEN task cancellation wins the race immediately before channel publication
+    /// THEN `connect` throws `POSIXError(.ECANCELED)`, no channel remains installed, and the
+    /// never-published channel's teardown occurs exactly once.
+    func testCancellationWinningPrePublicationRaceThrowsECANCELEDWithoutInstalling() async throws {
+        let (listener, retained, port) = try await startLocalListener()
+        defer {
+            listener.cancel()
+            retained.value.forEach { $0.cancel() }
+        }
+
+        let transport = TCPTransportApple(connectTimeoutSeconds: 5)
+        let gate = AsyncGate()
+        transport.connectPublicationGate = { await gate.wait() }
+
+        let connectTask: Task<Void, any Error> = Task {
+            try await transport.connect(host: "127.0.0.1", port: port)
+        }
+        await waitUntil({ gate.hasEntered }, "connect parked immediately before publication")
+
+        // cancel() marks the task synchronously, so the cancellation is deterministically
+        // observable by the publication claim before the gate releases it.
+        connectTask.cancel()
+        gate.open()
+
+        do {
+            try await connectTask.value
+            XCTFail("connect must not return success after cancellation won the pre-publication race")
+        } catch let posix as POSIXError {
+            XCTAssertEqual(posix.code, .ECANCELED, "cancellation-won publication must throw ECANCELED")
+        } catch {
+            XCTFail("expected POSIXError(.ECANCELED), got \(type(of: error)): \(error)")
+        }
+        XCTAssertFalse(
+            transport.hasInstalledChannel,
+            "no channel may remain installed after a cancelled connect"
+        )
+        XCTAssertEqual(
+            transport.abortedConnectChannelCloseCount, 1,
+            "teardown of the never-published channel must occur exactly once"
+        )
+
+        await transport.close()
+    }
+
+    /// Finding 2: the owned close lifecycle `open → closing(waiters) → closed`.
+    ///
+    /// WHEN two `close()` calls race while the owner's teardown is held at the D8 gate
+    /// THEN both callers remain suspended while the gate holds, exactly one caller entered
+    /// the teardown, releasing the gate completes that single teardown and resumes both, and
+    /// a later close after full completion returns without a second teardown entry.
+    func testConcurrentClosesShareOneOwnedTeardownAndLaterCloseIsTerminalNoOp() async throws {
+        let (listener, retained, port) = try await startLocalListener()
+        defer {
+            listener.cancel()
+            retained.value.forEach { $0.cancel() }
+        }
+
+        let transport = TCPTransportApple(connectTimeoutSeconds: 5)
+        try await transport.connect(host: "127.0.0.1", port: port)
+
+        let gate = AsyncGate()
+        transport.closeTeardownGate = { await gate.wait() }
+
+        let firstDone = TestFlag()
+        let secondDone = TestFlag()
+        let firstClose: Task<Void, Never> = Task {
+            await transport.close()
+            firstDone.set()
+        }
+        let secondClose: Task<Void, Never> = Task {
+            await transport.close()
+            secondDone.set()
+        }
+
+        await waitUntil({ gate.hasEntered }, "the owning close reached the gated teardown")
+        await waitUntil(
+            { transport.pendingCloseWaiterCount == 1 },
+            "the concurrent close parked behind the owner"
+        )
+        XCTAssertEqual(gate.entryCount, 1, "teardown must be entered by exactly one owner")
+        XCTAssertFalse(firstDone.isSet, "the owning close must not return while teardown is gated")
+        XCTAssertFalse(secondDone.isSet, "the concurrent close must not return before teardown completes")
+
+        gate.open()
+        await firstClose.value
+        await secondClose.value
+        XCTAssertTrue(firstDone.isSet && secondDone.isSet, "both callers complete after the teardown")
+        XCTAssertEqual(gate.entryCount, 1, "one owned teardown serves both close callers")
+
+        await transport.close() // after full completion — the terminal no-op.
+        XCTAssertEqual(
+            gate.entryCount, 1,
+            "a close after a fully-completed close must not run a second teardown"
+        )
+        XCTAssertFalse(transport.hasInstalledChannel)
     }
 
     // MARK: - Sendable

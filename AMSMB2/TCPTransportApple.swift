@@ -14,7 +14,7 @@
 //  live *inside* this file so the protocol stays NIO-free.
 //
 //  **Design D3**: `@unchecked Sendable` is justified because all mutable state
-//  (`_channel`, `_isClosed`) is guarded by `NSLock`. The `InboundBufferingHandler`
+//  (`_channel`, `_closeState`, `_connectAttempt`, …) is guarded by `NSLock`. The `InboundBufferingHandler`
 //  also guards its own mutable state with a separate `NSLock`; it runs on the NIO
 //  event loop for NIO callbacks and under the lock for async `receive()` callers.
 //
@@ -33,7 +33,13 @@ import NIOTransportServices
 
 /// An `SMBTransport` backed by NIOTransportServices (Network.framework) on Apple platforms.
 ///
-/// One instance maps to one TCP connection lifetime. After `close()` the instance is
+/// One instance maps to one TCP connection lifetime, and `connect(host:port:)` is strictly
+/// **one-shot**: the first call atomically reserves the instance's single connect attempt,
+/// and every other call is rejected deterministically without creating a bootstrap or any
+/// network activity — `POSIXError(.EALREADY)` while the attempt is in flight or after it
+/// failed (retry after a failed attempt is NOT supported; build a fresh transport, as
+/// `SMB2Client` does), `POSIXError(.EISCONN)` once connected, and the existing
+/// `POSIXError(.ENOTCONN)` after `close()` (checked first). After `close()` the instance is
 /// unusable; create a fresh one to reconnect.
 ///
 /// Thread-safety: all mutable state is guarded by `NSLock`. Conforms to `Sendable`
@@ -52,13 +58,111 @@ public final class TCPTransportApple: SMBTransport, @unchecked Sendable {
     private var _connectingChannel: (any Channel)?
     /// Set when the in-flight connect is cancelled. If `onCancel` fires before the
     /// `channelInitializer` has run, the initializer observes this and closes the channel
-    /// immediately. Guarded by `lock`.
+    /// immediately. Never reset — it latches for the lifetime of the instance's single
+    /// one-shot attempt. Guarded by `lock`.
     private var _connectCancelled = false
-    /// Set by `close()` to prevent re-use after teardown. Guarded by `lock`.
-    private var _isClosed = false
+    /// Close lifecycle (design D6): the first `close()` caller atomically becomes the
+    /// teardown **owner** (`.open → .closing`); callers arriving during `.closing` park in
+    /// `closeWaiters` and are resumed exactly once, only after the owner has fully finished
+    /// (channel closed, receiver unblocked, connect tail drained, group shut down) and
+    /// published `.closed`. Only a call made after `.closed` returns immediately as the
+    /// terminal no-op. Guarded by `lock`.
+    private enum CloseState {
+        case open
+        case closing
+        case closed
+    }
+
+    private var _closeState: CloseState = .open
+    /// `close()` callers parked while another caller owns the teardown. Guarded by `lock`.
+    private var closeWaiters: [CheckedContinuation<Void, Never>] = []
+    /// `true` from the one-shot reservation until the owning `connect` call's tail has fully
+    /// finished (design D7). While set, the close owner parks in `connectWorkWaiters` before
+    /// the group shutdown and the `.closed` publication, so a returned `close()` proves the
+    /// connect tail can no longer create or retain resources. Guarded by `lock`.
+    private var connectWorkInFlight = false
+    /// Close owner parked until the in-flight connect work completes. Guarded by `lock`.
+    private var connectWorkWaiters: [CheckedContinuation<Void, Never>] = []
+    /// One-shot connect attempt state (mirrors `QUICTransportApple`'s reservation): `connect`
+    /// may only transition `.idle → .inFlight`, so exactly one call ever owns the attempt;
+    /// every other call is rejected by the state it observes (`.inFlight`/`.failed` →
+    /// `EALREADY`, `.connected` → `EISCONN`) without creating a bootstrap or touching the
+    /// owning attempt's channel. Guarded by `lock`.
+    private enum ConnectAttempt {
+        case idle
+        case inFlight
+        case connected
+        case failed
+    }
+
+    private var _connectAttempt: ConnectAttempt = .idle
     private let lock = NSLock()
     /// Accumulates inbound bytes from the NIO channel for async `receive()` calls.
     private let inboundHandler = InboundBufferingHandler()
+
+    // MARK: - Test seams (design D8; internal, inert in production)
+
+    /// Awaited (when set) immediately before the success-publication critical section, so a
+    /// deterministic test can hold a successful bootstrap at exactly the racy point. Guarded
+    /// by `lock`; always `nil` in production.
+    private var _connectPublicationGate: (@Sendable () async -> Void)?
+    /// Awaited (when set) by the close teardown before the event-loop-group shutdown, so a
+    /// deterministic test can hold the teardown mid-way. Guarded by `lock`; always `nil` in
+    /// production.
+    private var _closeTeardownGate: (@Sendable () async -> Void)?
+    /// How many times a never-published connect channel was closed (test observability for
+    /// the exactly-once teardown assertion). Guarded by `lock`.
+    private var _abortedConnectChannelCloseCount = 0
+
+    var connectPublicationGate: (@Sendable () async -> Void)? {
+        get { lock.withLock { _connectPublicationGate } }
+        set { lock.withLock { _connectPublicationGate = newValue } }
+    }
+
+    var closeTeardownGate: (@Sendable () async -> Void)? {
+        get { lock.withLock { _closeTeardownGate } }
+        set { lock.withLock { _closeTeardownGate = newValue } }
+    }
+
+    var abortedConnectChannelCloseCount: Int {
+        lock.withLock { _abortedConnectChannelCloseCount }
+    }
+
+    /// Whether a successfully-published channel is currently installed.
+    var hasInstalledChannel: Bool {
+        lock.withLock { _channel != nil }
+    }
+
+    /// How many `close()` callers are currently parked — the owner awaiting the connect
+    /// tail plus concurrent callers awaiting the owner (mirrors `QUICTransportApple`).
+    var pendingCloseWaiterCount: Int {
+        lock.withLock { closeWaiters.count + connectWorkWaiters.count }
+    }
+
+    /// Takes ownership of the connecting channel — the caller MUST close the returned
+    /// channel exactly once — and counts the aborted-connect closure (design D7 ownership
+    /// transfer: whoever takes `_connectingChannel` out of the state closes it; `nil` means
+    /// another path already took it, or none exists). MUST be called while holding `lock`.
+    private func takeConnectingChannelLocked() -> (any Channel)? {
+        guard let channel = _connectingChannel else { return nil }
+        _connectingChannel = nil
+        _abortedConnectChannelCloseCount += 1
+        return channel
+    }
+
+    /// Marks the connect attempt's tail finished and resumes a close owner parked on it
+    /// (design D7). Runs via `defer` on every exit path of the owning `connect` call.
+    private func finishConnectWork() {
+        let waiters: [CheckedContinuation<Void, Never>] = lock.withLock {
+            connectWorkInFlight = false
+            let waiters = connectWorkWaiters
+            connectWorkWaiters = []
+            return waiters
+        }
+        for waiter in waiters {
+            waiter.resume(returning: ())
+        }
+    }
 
     // MARK: - Init / deinit
 
@@ -90,16 +194,36 @@ public final class TCPTransportApple: SMBTransport, @unchecked Sendable {
     /// NIO bootstrap is still connecting, the underlying NWConnection is closed as
     /// soon as it becomes available and `POSIXError(.ECANCELED)` is thrown.
     public func connect(host: String, port: Int) async throws {
-        // Guard: re-use after close() is not supported. Reset the per-attempt cancel state so a
-        // fresh connect never inherits a latched flag from a prior cancelled attempt (which would
-        // otherwise make this attempt's channelInitializer close the channel immediately).
-        let isClosed: Bool = lock.withLock {
-            if !_isClosed { _connectCancelled = false }
-            return _isClosed
+        // One-shot attempt reservation (atomic; before any bootstrap work). The closed guard
+        // keeps its existing contract and precedence. In `.idle` on an open transport,
+        // `_connectCancelled` cannot be set (its only writers are an in-flight attempt's
+        // onCancel — which requires the reservation — and `close()`, which leaves
+        // `.open` forever), so no per-attempt reset is needed.
+        try lock.withLock {
+            guard _closeState == .open else {
+                throw POSIXError(.ENOTCONN, description: "TCPTransportApple: transport is closed")
+            }
+            switch _connectAttempt {
+            case .idle:
+                _connectAttempt = .inFlight
+                connectWorkInFlight = true
+            case .inFlight:
+                throw POSIXError(.EALREADY, description: "TCPTransportApple: connect already in progress")
+            case .connected:
+                throw POSIXError(.EISCONN, description: "TCPTransportApple: already connected")
+            case .failed:
+                throw POSIXError(
+                    .EALREADY,
+                    description: "TCPTransportApple: one-shot connect attempt already consumed"
+                )
+            }
         }
-        guard !isClosed else {
-            throw POSIXError(.ENOTCONN, description: "TCPTransportApple: transport is closed")
-        }
+
+        // The reserved attempt's entire tail counts as in-flight connect work (design D7);
+        // finish it on every exit path. Declared first so it runs LAST of the defers —
+        // after all other state cleanup — which is what lets a parked close owner treat
+        // its resumption as "the tail can no longer create or retain resources".
+        defer { finishConnectWork() }
 
         let bootstrap = NIOTSConnectionBootstrap(group: group)
             .connectTimeout(.seconds(Int64(connectTimeoutSeconds)))
@@ -120,7 +244,10 @@ public final class TCPTransportApple: SMBTransport, @unchecked Sendable {
                 // before we got here, close immediately.
                 if let self {
                     let cancelNow: Bool = self.lock.withLock {
-                        guard !self._connectCancelled else { return true }
+                        guard !self._connectCancelled else {
+                            self._abortedConnectChannelCloseCount += 1
+                            return true
+                        }
                         self._connectingChannel = channel
                         return false
                     }
@@ -152,25 +279,66 @@ public final class TCPTransportApple: SMBTransport, @unchecked Sendable {
                     guard let self else { return }
                     let channelToClose: (any Channel)? = self.lock.withLock {
                         self._connectCancelled = true
-                        return self._connectingChannel
+                        return self.takeConnectingChannelLocked()
                     }
                     channelToClose?.close(promise: nil)
                 }
             )
 
-            // Re-check after get() returns: if we were cancelled while the future was completing
-            // we might have a valid channel that we must not keep.
-            if Task.isCancelled {
-                channel.close(promise: nil)
-                throw POSIXError(.ECANCELED)
+            // Test seam (D8): hold a successful bootstrap at exactly the pre-publication point.
+            if let gate = connectPublicationGate {
+                await gate()
             }
 
-            lock.withLock { _channel = channel }
-        } catch is CancellationError {
-            throw POSIXError(.ECANCELED)
-        } catch let posix as POSIXError {
-            throw posix
+            // Publication claim (design D5): one critical section decides success-versus-
+            // terminal-events — precedence close, then cancellation — and consumes the
+            // one-shot attempt either way. No terminal close/cancellation state can be
+            // overwritten by `.connected`, no publication is possible once close() claimed
+            // `.closing`, and a channel that lost the claim is closed exactly once (a `nil`
+            // take means close()/onCancel already took and closed it). Close is checked
+            // before the cancel latch because close() also sets the latch to abort the
+            // channelInitializer — latch-first would misreport a plain close as ECANCELED.
+            enum PublicationOutcome {
+                case published
+                case closeWon
+                case cancellationWon
+            }
+            let (outcome, orphan): (PublicationOutcome, (any Channel)?) = lock.withLock {
+                guard _closeState == .open else {
+                    _connectAttempt = .failed
+                    return (.closeWon, takeConnectingChannelLocked())
+                }
+                // `_connectCancelled` covers an onCancel that fired while the handler was in
+                // scope; `Task.isCancelled` covers a cancellation after the handler exited
+                // (the old post-`get()` re-check, now folded inside the claim).
+                guard !_connectCancelled, !Task.isCancelled else {
+                    _connectAttempt = .failed
+                    return (.cancellationWon, takeConnectingChannelLocked())
+                }
+                _channel = channel
+                _connectingChannel = nil // ownership transferred to `_channel`.
+                _connectAttempt = .connected
+                return (.published, nil)
+            }
+            orphan?.close(promise: nil)
+            switch outcome {
+            case .published:
+                break
+            case .closeWon:
+                throw POSIXError(.ENOTCONN, description: "TCPTransportApple: closed during connect")
+            case .cancellationWon:
+                throw POSIXError(.ECANCELED)
+            }
         } catch {
+            // Every failure path consumes the one-shot attempt (retry is unsupported), then
+            // applies the pre-existing error mapping unchanged.
+            lock.withLock { _connectAttempt = .failed }
+            if error is CancellationError {
+                throw POSIXError(.ECANCELED)
+            }
+            if let posix = error as? POSIXError {
+                throw posix
+            }
             // If the task was cancelled, the onCancel handler may have closed the channel
             // before the future completed, causing a ChannelError rather than CancellationError.
             // Honour cancellation semantics by checking the flag here.
@@ -205,8 +373,9 @@ public final class TCPTransportApple: SMBTransport, @unchecked Sendable {
     /// to `POSIXError` before propagating (CLAUDE.md convention).
     public func receive() async throws -> Data {
         // EOF convention (SMBTransport contract): return empty Data after close()
-        // rather than throwing, consistent with graceful peer-close signalling.
-        if lock.withLock({ _isClosed }) {
+        // rather than throwing, consistent with graceful peer-close signalling. A transport
+        // in `.closing` is already closed from the caller's perspective.
+        if lock.withLock({ _closeState != .open }) {
             return Data()
         }
         guard lock.withLock({ _channel }) != nil else {
@@ -221,30 +390,107 @@ public final class TCPTransportApple: SMBTransport, @unchecked Sendable {
         }
     }
 
-    /// Closes the connection and shuts down the NIO event loop group.
+    /// Closes the connection and shuts down the NIO event loop group through the owned
+    /// close lifecycle `open → closing(waiters) → closed` (design D6/D7).
     ///
-    /// Idempotent — safe to call multiple times.
+    /// The first caller atomically becomes the teardown **owner**: it aborts any in-flight
+    /// connect (cancel latch + taking/closing whichever channel exists, which also prevents
+    /// any later publication — the D5 claim cannot publish once `.closing` is set), unblocks
+    /// a suspended `receive()`, drains the connect tail, shuts the event-loop group down
+    /// strictly last, then publishes `.closed` and resumes every parked caller exactly once.
+    /// A `close()` arriving during `.closing` returns only after that same completed
+    /// teardown; only a call after `.closed` returns immediately as the terminal no-op.
+    /// Teardown failures are swallowed (`close()` is non-throwing) but never let a waiter
+    /// return before the teardown completed. No lock is held across an `await`, a NIO call,
+    /// or a continuation resumption.
     public func close() async {
-        let channel: (any Channel)? = lock.withLock {
-            guard !_isClosed else { return nil }
-            _isClosed = true
-            // Abort an in-flight connect too: flag the cancellation (so a not-yet-run
-            // channelInitializer closes its channel on arrival) and close whichever channel
-            // exists — the connected one, or the one still being established.
-            _connectCancelled = true
-            let ch = _channel ?? _connectingChannel
-            _channel = nil
-            return ch
+        enum Entry {
+            case alreadyClosed
+            case waitForOwner
+            case own((any Channel)?)
+        }
+        let entry: Entry = lock.withLock {
+            switch _closeState {
+            case .closed:
+                return .alreadyClosed
+            case .closing:
+                return .waitForOwner
+            case .open:
+                _closeState = .closing
+                // Abort an in-flight connect too: flag the cancellation (so a not-yet-run
+                // channelInitializer closes its channel on arrival) and take whichever
+                // channel exists — the connected one, or the one still being established
+                // (the take is the exactly-once ownership transfer; the publication claim
+                // then finds nothing left to close and cannot publish into `.closing`).
+                _connectCancelled = true
+                if let established = _channel {
+                    _channel = nil
+                    return .own(established)
+                }
+                return .own(takeConnectingChannelLocked())
+            }
         }
 
-        if let channel {
-            try? await channel.close().get()
+        switch entry {
+        case .alreadyClosed:
+            return // terminal no-op: a prior close fully completed its teardown.
+
+        case .waitForOwner:
+            // Park until the owner's teardown has fully completed and `.closed` published
+            // (re-checked under the lock so a caller can never park after that happened).
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                let parked: Bool = lock.withLock {
+                    guard _closeState == .closing else { return false } // owner finished meanwhile.
+                    closeWaiters.append(continuation)
+                    return true
+                }
+                if !parked {
+                    continuation.resume(returning: ())
+                }
+            }
+
+        case .own(let channel):
+            if let channel {
+                try? await channel.close().get()
+            }
+
+            // Close the inbound handler's waiting receiver so any suspended receive() unblocks.
+            inboundHandler.signalClosed()
+
+            // Test seam (D8): hold the owner's teardown before the connect-tail drain and
+            // the event-loop-group shutdown.
+            if let gate = closeTeardownGate {
+                await gate()
+            }
+
+            // Drain the connect tail (design D7). The aborted attempt resolves promptly —
+            // its channel was just closed, or the cancel latch closes it on arrival — and
+            // once drained, no connect work can create or retain resources.
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                let parked: Bool = lock.withLock {
+                    guard connectWorkInFlight else { return false }
+                    connectWorkWaiters.append(continuation)
+                    return true
+                }
+                if !parked {
+                    continuation.resume(returning: ())
+                }
+            }
+
+            // Group shutdown strictly last — no NIO work is outstanding by now.
+            try? await group.shutdownGracefully()
+
+            // Fully closed: publish and release every parked caller exactly once.
+            let waiters: [CheckedContinuation<Void, Never>] = lock.withLock {
+                _closeState = .closed
+                let parked = closeWaiters
+                closeWaiters = []
+                return parked
+            }
+            for waiter in waiters {
+                waiter.resume(returning: ())
+            }
         }
-
-        // Close the inbound handler's waiting receiver so any suspended receive() unblocks.
-        inboundHandler.signalClosed()
-
-        try? await group.shutdownGracefully()
     }
 
     // MARK: - Error mapping

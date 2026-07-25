@@ -15,10 +15,11 @@ On Apple, when no kind is supplied the legacy libsmb2-owned TCP path runs unchan
 seam kind is supplied, the
 client SHALL parse the endpoint exactly once (`parseSeamEndpoint(server, defaultPort:)` — 445
 for TCP kinds, 443 for `.quic`), run `.quic` host validation and connect-timeout
-validation/normalization (design D10), and only then construct the
+validation (design D10), and only then construct the
 transport for that kind — `TCPTransportApple` for `.tcp`/`.automatic`,
-`QUICTransportApple(configuration:connectTimeout:)` (receiving the validated, normalized
-connect timeout) for `.quic` on supported OS versions
+the throwing `QUICTransportApple(configuration:)` (which independently derives, validates,
+and normalizes its connect timeout from `configuration.connectTimeout`, so direct
+construction cannot bypass the contract) for `.quic` on supported OS versions
 (throwing `POSIXError(.ENOTSUP)` on older OS versions) — wrap it in the bridge, and pass the
 resolved `(host, port)` plus the kind's selector into `connectWithBridge`, which calls
 `smb2_set_transport` before `smb2_connect_share_async`. The installed selector SHALL be exact,
