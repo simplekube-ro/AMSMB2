@@ -17,8 +17,9 @@
 //  Apple-only tests for the QUIC connect policy wired through
 //  `SMB2Client.connect(server:share:user:transportKind:quicConfiguration:)` (design D4/D9/D10):
 //  per-kind default port and selector exactness, numeric-host rejection independent of the TLS
-//  trust policy, connect-timeout validation, and the Batch-A `.quic` ENOTSUP stub that fires only
-//  after validation passes. Guarded like the rest of the seam (`#if canImport(Network)`).
+//  trust policy, and connect-timeout validation — all of which must fire *before* the `.quic`
+//  branch constructs `QUICTransportApple` (or throws `ENOTSUP` below the availability floor).
+//  Guarded like the rest of the seam (`#if canImport(Network)`).
 //
 
 #if canImport(Network)
@@ -58,9 +59,9 @@ final class QUICSeamConnectTests: XCTestCase, @unchecked Sendable {
     // MARK: - Numeric-host rejection (design D4)
 
     /// WHEN `.quic` connects to a numeric host
-    /// THEN it throws `POSIXError(.EINVAL)` specifically — not the Batch-A `ENOTSUP` stub and not a
-    /// connect-class error — proving the rejection fired in the validation step that precedes
-    /// transport construction and any network activity.
+    /// THEN it throws `POSIXError(.EINVAL)` specifically — not `ENOTSUP` and not a connect-class
+    /// error — proving the rejection fired in the validation step that precedes transport
+    /// construction and any network activity.
     func testQuicNumericHostThrowsEINVALBeforeTransport() async throws {
         let client = try SMB2Client(timeout: 5)
         do {
@@ -99,7 +100,7 @@ final class QUICSeamConnectTests: XCTestCase, @unchecked Sendable {
 
     /// WHEN `.quic` connects with an invalid `connectTimeout` to a non-numeric host
     /// THEN it throws `POSIXError(.EINVAL)` from the connect-timeout normalization — before the
-    /// transport-pending stub and before any network activity.
+    /// transport is constructed and before any network activity.
     func testQuicInvalidConnectTimeoutThrowsEINVAL() async throws {
         let client = try SMB2Client(timeout: 5)
         for badTimeout in [0.0, -1.0, Double.nan, Double.infinity] {

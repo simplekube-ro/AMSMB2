@@ -79,7 +79,9 @@ public final class QUICTransportApple: SMBTransport, @unchecked Sendable {
     // MARK: - Injected collaborators
 
     private let configuration: SMBQUICConfiguration
-    private let connectTimeout: TimeInterval
+    /// The validated, normalized connect deadline in seconds (design D10). Internal (not
+    /// `private`) so tests can observe normalization through the public initializer.
+    let connectTimeout: TimeInterval
     private let driverFactory: (_ host: String, _ port: Int, _ trust: QUICResolvedTrust) -> any QUICConnectionDriver
     private let deadline: any ConnectDeadlineScheduler
 
@@ -112,11 +114,26 @@ public final class QUICTransportApple: SMBTransport, @unchecked Sendable {
 
     /// Retained after `.ready` for `send`/`receive`; cleared by whichever losing path cancels it.
     private var driver: (any QUICConnectionDriver)?
-    /// `true` once the setup body has committed to `driver.start()` while still holding the connect
-    /// claim. A losing winner (cancel/close/deadline) cancels the driver ONLY if it was started —
-    /// so a winner that claims before start performs no cancellation and the setup body starts
-    /// nothing (design D7 "losers perform no side effects").
-    private var driverStarted = false
+    /// Where the connect claim stands relative to `driver.start()` (design D7). The transition to
+    /// `.starting` is the atomic commit toward starting the driver; a loser that wins the claim
+    /// (cancel/close/failure/deadline) consults it to decide who performs the single teardown:
+    /// `.notStarted` → the loser forbids the start forever and cancels nothing; `.starting` →
+    /// start is committed (executing or imminent), so the loser parks its outcome in
+    /// `pendingLoss` and the starting path finishes it — cancel exactly once, then resume —
+    /// after `start()` returns, so the driver is never cancelled before its start side effect
+    /// and no connection activity begins after a losing resume; `.started` → the loser cancels
+    /// the started driver exactly once itself.
+    private enum StartPhase {
+        case notStarted
+        case starting
+        case started
+        case forbidden
+    }
+
+    private var startPhase: StartPhase = .notStarted
+    /// A losing outcome that won while `startPhase == .starting`; consumed exactly once by the
+    /// starting path's post-`start()` handoff.
+    private var pendingLoss: (continuation: CheckedContinuation<Void, any Error>, error: any Error)?
     /// Last `.waiting` error, folded into the `ETIMEDOUT` description on deadline expiry.
     private var lastWaitingError: POSIXError?
     /// `true` once `.ready` won the connect claim — gates `receive()`'s never-connected `ENOTCONN`.
@@ -134,14 +151,18 @@ public final class QUICTransportApple: SMBTransport, @unchecked Sendable {
 
     /// Production initializer: real `NWConnection` driver and `DispatchSourceTimer` deadline.
     ///
-    /// - Parameters:
-    ///   - configuration: the immutable QUIC configuration snapshot (design D6).
-    ///   - connectTimeout: the validated, normalized connect deadline in seconds (design D10) —
-    ///     sourced from `SMBQUICConfiguration.connectTimeout`, independent of `SMB2Manager.timeout`.
-    public convenience init(configuration: SMBQUICConfiguration, connectTimeout: TimeInterval) {
+    /// The connect deadline is derived from `configuration.connectTimeout` — the single source
+    /// of truth (design D10) — and validated/normalized here, so a constructed transport can
+    /// never hold an invalid deadline: `NaN`, `±infinity`, zero, and negative values throw
+    /// `POSIXError(.EINVAL)` before any `NWConnection` exists; values above 3600 s clamp to
+    /// 3600; all other finite positive values (including sub-second) pass unchanged. The
+    /// deadline is always armed and independent of `SMB2Manager.timeout`.
+    ///
+    /// - Parameter configuration: the immutable QUIC configuration snapshot (design D6).
+    public convenience init(configuration: SMBQUICConfiguration) throws {
         self.init(
             configuration: configuration,
-            connectTimeout: connectTimeout,
+            connectTimeout: try SMB2Client.normalizedQUICConnectTimeout(configuration.connectTimeout),
             driverFactory: { host, port, trust in
                 NWConnectionQUICDriver(host: host, port: port, trust: trust)
             },
@@ -211,14 +232,16 @@ public final class QUICTransportApple: SMBTransport, @unchecked Sendable {
                     self?.resolveConnect(.deadline)
                 }
 
-                // Gate the start on STILL holding the claim (design D7 "losers perform no side
-                // effects"): if a close()/deadline winner consumed the claim in the window after the
-                // store lock released, it owns teardown and the setup body starts nothing. Marking
-                // `driverStarted` under the lock lets a later winner know a started driver must be
-                // cancelled, while a winner that claimed before this point cancels nothing.
+                // Commit toward starting the driver, atomically with the claim (design D7): if a
+                // close()/deadline/cancel winner consumed the claim in the window after the store
+                // lock released, it recorded the start as forbidden and the setup body starts
+                // nothing. Once `.starting` is committed, a loser that wins before `start()`
+                // returns parks its outcome instead of cancelling — the handoff below finishes
+                // it, so the driver is never cancelled before its start side effect and never
+                // started after a losing teardown.
                 let mayStart: Bool = lock.withLock {
                     guard case .connecting = connectState else { return false }
-                    driverStarted = true
+                    startPhase = .starting
                     return true
                 }
                 guard mayStart else { return } // winner already resumed the continuation.
@@ -226,6 +249,19 @@ public final class QUICTransportApple: SMBTransport, @unchecked Sendable {
                     onState: { [weak self] state in self?.handleState(state) },
                     onReceive: { [weak self] result in self?.handleReceive(result) }
                 )
+                // Post-start handoff: finish a loss that won while start was committed. Exactly
+                // one cancel of the started driver, and the continuation resumes only after it.
+                let loss = lock.withLock {
+                    () -> (continuation: CheckedContinuation<Void, any Error>, error: any Error)? in
+                    startPhase = .started
+                    defer { pendingLoss = nil }
+                    return pendingLoss
+                }
+                if let loss {
+                    deadline.cancel()
+                    driver.cancel()
+                    loss.continuation.resume(throwing: loss.error)
+                }
             }
         } onCancel: {
             resolveConnect(.taskCancelled)
@@ -243,16 +279,58 @@ public final class QUICTransportApple: SMBTransport, @unchecked Sendable {
         case deadline
     }
 
+    /// The duty a losing winner performs outside the lock (or `nil` when the loss was parked for
+    /// the starting path's handoff).
+    private struct LossDuty {
+        let continuation: CheckedContinuation<Void, any Error>
+        let error: any Error
+        let driverToCancel: (any QUICConnectionDriver)?
+    }
+
+    /// Consumes a losing connect claim. MUST be called while holding `lock`, with `continuation`
+    /// just taken from `.connecting`. Encodes the atomic start/loss handoff (design D7):
+    /// pre-commit losses forbid the start forever (nothing to cancel); losses in the
+    /// commit-to-start window are parked in `pendingLoss` for the starting path (which cancels
+    /// the started driver exactly once, then resumes) and return `nil`; post-start losses cancel
+    /// the started driver themselves.
+    private func consumeLossClaimLocked(
+        _ continuation: CheckedContinuation<Void, any Error>, error: any Error
+    ) -> LossDuty? {
+        connectState = .failed
+        switch startPhase {
+        case .notStarted:
+            startPhase = .forbidden // the setup body must never start the driver now.
+            driver = nil
+            return LossDuty(continuation: continuation, error: error, driverToCancel: nil)
+        case .starting:
+            pendingLoss = (continuation, error) // the starting path finishes this loss.
+            driver = nil
+            return nil
+        case .started, .forbidden:
+            let toCancel = driver
+            driver = nil
+            return LossDuty(continuation: continuation, error: error, driverToCancel: toCancel)
+        }
+    }
+
     /// Atomically claims the connect outcome: decides the winner AND assigns the side-effect duty
-    /// in one critical section (design D7). Exactly one path wins (`connectState == .connecting`);
-    /// losers observe the resolved state and perform NO side effects. On `.ready` the connection
-    /// is retained; on any losing outcome the winner cancels+releases it exactly once. The winner
-    /// always cancels the deadline timer.
+    /// in one critical section (design D7); the effects themselves run outside the lock, performed
+    /// by whichever party the assignment named. Exactly one path wins
+    /// (`connectState == .connecting`); losers observe the resolved state and perform NO side
+    /// effects. Who executes the duty:
+    /// - `.ready` wins → this path cancels the deadline timer and RETAINS the driver.
+    /// - losing outcome, pre-commit → this path forbids the start, cancels the deadline timer,
+    ///   and resumes; there is no driver to cancel.
+    /// - losing outcome in the commit-to-start window → this path performs NOTHING; the loss is
+    ///   parked and the starting path cancels the deadline timer and the driver, then resumes.
+    /// - losing outcome post-start → this path cancels the deadline timer and the driver itself.
+    ///
+    /// So the deadline timer is cancelled exactly once, but NOT always by the winner — moving the
+    /// cancel unconditionally into the winner reintroduces the cancel-before-start-side-effect bug.
     private func resolveConnect(_ outcome: ConnectOutcome) {
-        struct Duty {
-            let continuation: CheckedContinuation<Void, any Error>
-            let error: (any Error)?
-            let driverToCancel: (any QUICConnectionDriver)?
+        enum Duty {
+            case ready(CheckedContinuation<Void, any Error>)
+            case loss(LossDuty)
         }
         let duty: Duty? = lock.withLock {
             guard case .connecting(let continuation) = connectState else { return nil }
@@ -261,47 +339,33 @@ public final class QUICTransportApple: SMBTransport, @unchecked Sendable {
                 connectState = .ready
                 everReady = true
                 // Keep `driver` for send/receive; no cancellation.
-                return Duty(continuation: continuation, error: nil, driverToCancel: nil)
+                return .ready(continuation)
             case .failed(let error):
-                connectState = .failed
-                let toCancel = driverStarted ? driver : nil
-                driver = nil
-                return Duty(continuation: continuation, error: error, driverToCancel: toCancel)
+                return consumeLossClaimLocked(continuation, error: error).map(Duty.loss)
             case .taskCancelled:
-                connectState = .failed
-                let toCancel = driverStarted ? driver : nil
-                driver = nil
-                return Duty(continuation: continuation, error: CancellationError(), driverToCancel: toCancel)
+                return consumeLossClaimLocked(continuation, error: CancellationError()).map(Duty.loss)
             case .closed:
-                connectState = .failed
-                let toCancel = driverStarted ? driver : nil
-                driver = nil
-                return Duty(
-                    continuation: continuation,
-                    error: POSIXError(.ECONNABORTED, description: "QUIC connect aborted by close()"),
-                    driverToCancel: toCancel
-                )
+                return consumeLossClaimLocked(
+                    continuation,
+                    error: POSIXError(.ECONNABORTED, description: "QUIC connect aborted by close()")
+                ).map(Duty.loss)
             case .deadline:
-                connectState = .failed
-                let toCancel = driverStarted ? driver : nil
-                driver = nil
                 let description = lastWaitingError.map {
                     "QUIC connect timed out after \(connectTimeout)s; last waiting error: \($0)"
                 } ?? "QUIC connect timed out after \(connectTimeout)s"
-                return Duty(
-                    continuation: continuation,
-                    error: POSIXError(.ETIMEDOUT, description: description),
-                    driverToCancel: toCancel
-                )
+                return consumeLossClaimLocked(
+                    continuation, error: POSIXError(.ETIMEDOUT, description: description)
+                ).map(Duty.loss)
             }
         }
-        guard let duty else { return } // lost the claim → no side effects (design D7).
+        guard let duty else { return } // lost the claim, or loss parked for the handoff (D7).
         deadline.cancel()
-        duty.driverToCancel?.cancel()
-        if let error = duty.error {
-            duty.continuation.resume(throwing: error)
-        } else {
-            duty.continuation.resume(returning: ())
+        switch duty {
+        case .ready(let continuation):
+            continuation.resume(returning: ())
+        case .loss(let loss):
+            loss.driverToCancel?.cancel()
+            loss.continuation.resume(throwing: loss.error)
         }
     }
 
@@ -340,7 +404,7 @@ public final class QUICTransportApple: SMBTransport, @unchecked Sendable {
                 receiveError = error
                 let waiter = receiveWaiter
                 receiveWaiter = nil
-                let toCancel = driverStarted ? driver : nil
+                let toCancel = driver // post-ready ⇒ the driver was started.
                 driver = nil
                 return .abnormalLoss(waiter, toCancel)
             default:
@@ -464,7 +528,9 @@ public final class QUICTransportApple: SMBTransport, @unchecked Sendable {
                         } else if inboundEOF {
                             continuation.resume(returning: Data()) // peer graceful EOF.
                         } else if !everReady {
-                            // Never connected → ENOTCONN (reserved for the never-connected case).
+                            // Never connected → ENOTCONN. On `receive()` this is the ONLY ENOTCONN
+                            // case (a local close is reported as empty `Data` above); `send(_:)`
+                            // throws ENOTCONN whenever no connection is usable, close() included.
                             continuation.resume(throwing: POSIXError(.ENOTCONN, description: "QUICTransportApple: not connected"))
                         } else if Task.isCancelled {
                             continuation.resume(throwing: CancellationError())
@@ -492,7 +558,7 @@ public final class QUICTransportApple: SMBTransport, @unchecked Sendable {
     public func close() async {
         enum Action {
             case noop
-            case abortConnect(CheckedContinuation<Void, any Error>, (any QUICConnectionDriver)?)
+            case abortConnect(LossDuty)
             case teardown(CheckedContinuation<Data, any Error>?, (any QUICConnectionDriver)?)
         }
         let action: Action = lock.withLock {
@@ -502,10 +568,15 @@ public final class QUICTransportApple: SMBTransport, @unchecked Sendable {
             isClosed = true
             if case .connecting(let continuation) = connectState {
                 // close() while connecting wins the connect claim → ECONNABORTED (design D7).
-                connectState = .failed
-                let toCancel = driverStarted ? driver : nil
-                driver = nil
-                return .abortConnect(continuation, toCancel)
+                // A nil duty means the loss landed in the commit-to-start window and was parked
+                // for the starting path's handoff — close() then performs no teardown itself.
+                guard let duty = consumeLossClaimLocked(
+                    continuation,
+                    error: POSIXError(.ECONNABORTED, description: "QUIC connect aborted by close()")
+                ) else {
+                    return .noop
+                }
+                return .abortConnect(duty)
             }
             // Established (or never-started): record the local-close cause BEFORE cancel.
             if lifecycle == .active {
@@ -521,10 +592,10 @@ public final class QUICTransportApple: SMBTransport, @unchecked Sendable {
         switch action {
         case .noop:
             return
-        case .abortConnect(let continuation, let toCancel):
+        case .abortConnect(let duty):
             deadline.cancel()
-            toCancel?.cancel()
-            continuation.resume(throwing: POSIXError(.ECONNABORTED, description: "QUIC connect aborted by close()"))
+            duty.driverToCancel?.cancel()
+            duty.continuation.resume(throwing: duty.error)
         case .teardown(let waiter, let toCancel):
             toCancel?.cancel()
             waiter?.resume(returning: Data()) // local-close EOF signal (empty Data).
@@ -590,8 +661,8 @@ public final class QUICTransportApple: SMBTransport, @unchecked Sendable {
 final class NWConnectionQUICDriver: QUICConnectionDriver, @unchecked Sendable {
     private let queue = DispatchQueue(label: "org.amsmb2.quic.connection")
     private let verifyQueue = DispatchQueue(label: "org.amsmb2.quic.verify")
-    private let connection: NWConnection?
-    private let initError: POSIXError?
+    let connection: NWConnection?
+    let initError: POSIXError?
     private let lock = NSLock()
     private var onReceive: (@Sendable (Result<Data, POSIXError>) -> Void)?
 
@@ -625,7 +696,11 @@ final class NWConnectionQUICDriver: QUICConnectionDriver, @unchecked Sendable {
         }
 
         let parameters = NWParameters(quic: quicOptions)
-        guard let nwPort = NWEndpoint.Port(rawValue: UInt16(exactly: port) ?? 0), port > 0 else {
+        // Only 1...65535 is a valid port: `UInt16(exactly:)` rejects negatives and > 65535
+        // (which must never silently become UDP/0), and `rawPort > 0` rejects port 0.
+        guard let rawPort = UInt16(exactly: port), rawPort > 0,
+              let nwPort = NWEndpoint.Port(rawValue: rawPort)
+        else {
             self.connection = nil
             self.initError = POSIXError(.EINVAL, description: "QUIC: invalid port \(port)")
             return

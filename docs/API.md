@@ -556,7 +556,7 @@ public protocol SMBTransport: Sendable {
 }
 ```
 
-The transport seam: the abstraction that carries raw SMB2 bytes over the network, decoupled from any specific wire implementation. It is intentionally free of SwiftNIO and libsmb2 dependencies, so conformers can be unit-tested in isolation and reused by both the TCP transport and a future QUIC transport.
+The transport seam: the abstraction that carries raw SMB2 bytes over the network, decoupled from any specific wire implementation. It is intentionally free of SwiftNIO and libsmb2 dependencies, so conformers can be unit-tested in isolation and reused by both the TCP and QUIC transports.
 
 - **Buffer type:** `Foundation.Data` (concrete transports convert to/from NIO `ByteBuffer` internally).
 - **EOF convention:** `receive()` returning empty `Data` signals graceful peer close. Stop the receive loop on an empty result.
@@ -606,14 +606,14 @@ Concrete `SMBTransport` backed by `NIOTransportServices` (SwiftNIO over Network.
 ```swift
 @available(iOS 15, macOS 12, macCatalyst 15, tvOS 15, watchOS 8, visionOS 1, *)
 public final class QUICTransportApple: SMBTransport, @unchecked Sendable {
-    public init(configuration: SMBQUICConfiguration, connectTimeout: TimeInterval)
+    public init(configuration: SMBQUICConfiguration) throws
 }
 ```
 
 Concrete `SMBTransport` backed directly by Network.framework `NWProtocolQUIC` (no NIO). **Apple only** (`#if canImport(Network)`) and **availability-gated** above the package floor — the `@available` annotation names **macCatalyst 15** explicitly. Below the floor (and on Linux) `.quic` fails with `POSIXError(.ENOTSUP)`; the package platform minimums are unchanged.
 
 - One QUIC connection with a **single bidirectional stream** carries the whole SMB session; `send`/`receive` write/read that stream verbatim (SMB2 message multiplexing continues inside it, exactly as over TCP). ALPN is `"smb"`, SNI is the target host, TLS 1.3 is QUIC-implied.
-- The connect deadline is **always armed** from the validated `connectTimeout` (see [`SMBQUICConfiguration`](#smbquicconfiguration)), independent of `SMB2Manager.timeout`.
+- The connect deadline is **always armed** from `configuration.connectTimeout` (see [`SMBQUICConfiguration`](#smbquicconfiguration)), independent of `SMB2Manager.timeout`. The initializer validates and normalizes it — `POSIXError(.EINVAL)` for `NaN`/infinite/zero/negative values, clamped to 3600 s above that — so a constructed transport can never hold an invalid deadline.
 - All `NWError` values are mapped to `POSIXError` before propagating.
 - You normally never construct this directly — set `SMB2Manager.transportKind = .quic`; the manager builds it from your `quicConfiguration`.
 
@@ -708,7 +708,7 @@ All operations throw `POSIXError` on failure. Common codes:
 | 5 | `EIO` | I/O error (network or protocol) |
 | 13 | `EACCES` | Permission denied |
 | 17 | `EEXIST` | File already exists (e.g., `uploadItem` to existing path) |
-| 22 | `EINVAL` | Invalid argument — with `.quic`: a numeric target host, an invalid DER trust anchor, an empty `.customRoots([])` set, or a `NaN`/infinite/non-positive `connectTimeout` |
+| 22 | `EINVAL` | Invalid argument — with `.quic`: a numeric target host, an invalid DER trust anchor, an empty `.customRoots([])` set, a `NaN`/infinite/non-positive `connectTimeout`, or an explicit port outside 1...65535 |
 | 45 | `ENOTSUP` | Unsupported — selecting `.quic` below the QUIC availability floor or on a platform without `Network` (Linux). On Linux this surfaces as `EOPNOTSUPP` (same errno; `.ENOTSUP` is not a distinct `POSIXErrorCode` there). |
 | 53 | `ECONNABORTED` | Transport (QUIC) `close()` called while a connect was in flight |
 | 57 | `ENOTCONN` | Not connected (call `connectShare` first) |

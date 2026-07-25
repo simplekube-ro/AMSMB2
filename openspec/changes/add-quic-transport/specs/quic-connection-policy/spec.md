@@ -108,8 +108,10 @@ layer that would reject a numeric target under an insecure trust policy.
 ### Requirement: QUIC default port is UDP 443
 
 When `.quic` is selected and the server string carries no explicit port, the client SHALL
-default to port 443. An explicit port in the server string SHALL be honored unchanged. TCP
-default remains 445.
+default to port 443. An explicit port in the server string SHALL be honored unchanged. Only
+ports 1...65535 are valid: an out-of-range explicit port (0, negative, or greater than 65535)
+SHALL produce `POSIXError(.EINVAL)` and SHALL NOT create an `NWConnection` — in particular a
+port above 65535 must never silently truncate to UDP/0. TCP default remains 445.
 
 #### Scenario: Default port
 
@@ -121,6 +123,13 @@ default remains 445.
 - **WHEN** connecting with `.quic` to `fs.example.com:8443`
 - **THEN** the transport connects to UDP port 8443
 
+#### Scenario: Out-of-range explicit port rejected
+
+- **WHEN** connecting with `.quic` and an explicit port outside 1...65535 (0, negative, or
+  65536 and larger)
+- **THEN** connect throws `POSIXError(.EINVAL)` and no `NWConnection` is created (boundary
+  ports 1 and 65535 remain accepted and preserved unchanged)
+
 ### Requirement: QUIC connect timeout is dedicated, finite, and always armed
 
 The QUIC connect deadline SHALL be sourced from `SMBQUICConfiguration.connectTimeout`
@@ -131,7 +140,9 @@ existing contract (per-operation timeout; zero or negative disables it; fed to
 and before any network activity, the client SHALL validate and normalize the value through an
 internal table-testable helper: `NaN`, infinite, zero, and negative values SHALL throw
 `POSIXError(.EINVAL)`; values greater than 3600 seconds SHALL be clamped to 3600; all other
-finite positive values (including sub-second) pass through unchanged. The value SHALL travel
+finite positive values (including sub-second) pass through unchanged. The public
+`QUICTransportApple(configuration:)` initializer SHALL apply the same normalization, so a
+directly constructed transport can never hold an invalid, unnormalized deadline. The value SHALL travel
 inside the `SMBQUICConfiguration` snapshot taken under `connectLock` (independently snapshotted
 by construction); `copy(with:)` SHALL preserve it and archiving SHALL omit it with the rest of
 the configuration (a decoded `.quic` manager gets the 30-second default).
@@ -150,6 +161,14 @@ the configuration (a decoded `.quic` manager gets the 30-second default).
   any network activity
 - **NOTE** deterministic boundary tests drive the pure normalization helper for every listed
   value — no network involved
+
+#### Scenario: Direct transport construction cannot bypass validation
+
+- **WHEN** `QUICTransportApple(configuration:)` is constructed directly with an invalid
+  `connectTimeout` (`NaN`, `±infinity`, zero, or negative)
+- **THEN** the initializer throws `POSIXError(.EINVAL)` before any `NWConnection` exists;
+  values above 3600 are clamped to 3600 at construction and finite positive values (including
+  sub-second) are preserved
 
 #### Scenario: Excessively large values are clamped
 

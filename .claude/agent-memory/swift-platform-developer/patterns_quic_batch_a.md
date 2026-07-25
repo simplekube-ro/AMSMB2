@@ -74,7 +74,7 @@ Row C normalization is the KEY subtlety: TCPTransportApple maps task-cancel to `
   call cancel()/reconcile()/claimInstalling() in sequence, assert returned duty + `currentState`).
   Added test-only `var currentState` on the handoff.
 - Wired connectWithBridge tests need a gated actor transport (`GatedOutcomeTransport`: connect parks on a
-  gate until `openGate()`, then succeeds/throws; counts `close()`). Deterministic cancellation-win: 
+  gate until `openGate()`, then succeeds/throws; counts `close()`). Deterministic cancellation-win:
   `await waitUntilConnecting(); task.cancel(); await openGate()` — task.cancel() runs onCancel SYNC before
   gate opens, so `cancelled` commits before reconcile. close() is async (bridge fires `Task{await
   transport.close()}`) → poll `await transport.closeCount == 1`.

@@ -15,7 +15,7 @@ import Foundation
 /// A conforming type is responsible for carrying raw SMB2 bytes over the
 /// network. The protocol is intentionally free of SwiftNIO and libsmb2
 /// dependencies so that conformers can be unit-tested in isolation and
-/// reused by both the TCP and a future QUIC transport.
+/// reused by both the TCP and QUIC transports.
 ///
 /// **Buffer type:** `send(_:)` and `receive()` use `Foundation.Data`
 /// (design decision D2). Concrete transports convert to/from NIO
@@ -55,8 +55,11 @@ public protocol SMBTransport: Sendable {
 /// - `tcp`: Explicit TCP transport. On Apple platforms this routes through
 ///   `NIOTransportServices` (Network.framework); on Linux it falls back to
 ///   libsmb2's built-in BSD socket.
-/// - `quic`: SMB-over-QUIC transport (reserved for a future milestone;
-///   not yet implemented).
+/// - `quic`: SMB-over-QUIC transport (`QUICTransportApple`, backed by
+///   Network.framework). Explicit opt-in: non-numeric hostnames only,
+///   UDP/443 default, no silent TCP fallback. Requires iOS 15 / macOS 12 /
+///   macCatalyst 15 / tvOS 15 / watchOS 8 / visionOS 1; below that floor,
+///   and on Linux, selecting it throws `POSIXError(.ENOTSUP)`.
 /// - `automatic`: Let the library choose the best transport available on
 ///   the current platform.
 public enum SMBTransportKind: Sendable, Equatable, Hashable {

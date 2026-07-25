@@ -51,26 +51,41 @@ the Microsoft/Samba SMB-over-QUIC interop behavior.
 - **THEN** `connect` throws a `POSIXError` (never a raw Network.framework error), preserving
   `CancellationError` when the task was cancelled
 
-### Requirement: connect claims its outcome atomically — selection and side effects in one transition
+### Requirement: connect claims its outcome atomically — selection and duty assignment in one transition
 
 `connect(host:port:)` SHALL be a self-contained lifecycle that does not depend on libsmb2's
 cancellation/timeout machinery (which is not installed during the eager transport connect). It
 SHALL guard the connect outcome with a lock-protected state transition through which every
 completion path — ready, failure, task cancellation, `close()`, deadline expiry — atomically
-claims the outcome **before** performing any cancellation or cleanup: exactly one path wins the
-claim, and only the winner performs side effects. If `.ready` wins, the transport SHALL retain
+claims the outcome **and is assigned its cleanup duty** before any cancellation or cleanup is
+performed: exactly one path wins the claim, and a path that loses the claim SHALL perform no
+side effects whatsoever. The assigned effects (cancelling the deadline timer, cancelling the
+connection, resuming the continuation) SHALL be performed **outside** the lock, by the party the
+transition named — which is the winner itself except in the commit-to-start window, where the
+duty is transferred to the starting path (see the start handoff below). Consequently the
+deadline timer SHALL be cancelled exactly once on every terminal path, but SHALL NOT be assumed
+to be cancelled by the winning path in all cases. If `.ready` wins, the transport SHALL retain
 the connection for `send`/`receive` (the connection reference SHALL NOT be cleared on
 successful connect), and every later losing path SHALL perform no cancellation and no
 destructive cleanup (in particular, a losing task-cancellation handler SHALL NOT cancel the
 `NWConnection`). If task cancellation, deadline expiry, failure, or `close()` wins before
-readiness, the winner SHALL cancel and release the connection exactly once (clearing the stored
-reference and state handler) and resume the continuation with the mapped error. It SHALL handle
+readiness, the connection SHALL be cancelled and released exactly once (clearing the stored
+reference and state handler) and the continuation resumed with the mapped error — with the
+start handoff atomic with the claim: a loser that wins before the connect path commits toward
+starting the driver SHALL suppress the start entirely (the driver's `start` is never invoked
+and nothing is cancelled); a loser that wins after the commit but before `start` returns SHALL
+neither cancel nor resume inside that window — the starting path finishes the parked loss after
+`start` returns, cancelling the started driver exactly once and only then resuming with the
+loser's error, so the driver is never cancelled before its start side effect and no connection
+activity begins after a losing resume; a loser that wins after `start` has returned performs
+the single cancel/release and resume itself. It SHALL handle
 every `NWConnection` state explicitly — `.setup`/`.preparing` (progress), `.waiting`
 (non-terminal; record the error and keep waiting), `.ready` (success), `.failed` (mapped
 `POSIXError`), `.cancelled` (terminal acknowledgment of a requested cancel) — and SHALL enforce
-a deterministic, always-armed connect deadline from the validated `connectTimeout` supplied at
-construction (sourced from `SMBQUICConfiguration.connectTimeout`, design D10 — never from
-`SMB2Manager.timeout`). Once `.ready` has won, a later `.failed`/`.cancelled` state event SHALL
+a deterministic, always-armed connect deadline from the `connectTimeout` validated and
+normalized at construction from `SMBQUICConfiguration.connectTimeout` (design D10 — never from
+`SMB2Manager.timeout`; the public initializer applies the shared normalization helper, so a
+constructed transport can never hold an invalid deadline). Once `.ready` has won, a later `.failed`/`.cancelled` state event SHALL
 route to the established-connection lifecycle (design D8), which discriminates recorded causes
 — a `.cancelled` whose local-close cause was recorded by `close()` is the local-close teardown
 signal, while an unsolicited event is abnormal transport loss — and SHALL NOT re-enter connect
@@ -109,16 +124,32 @@ connecting → `POSIXError(.ECONNABORTED)`; deadline expiry → `POSIXError(.ETI
 #### Scenario: Close while connecting
 
 - **WHEN** `close()` is called while `connect` is in flight and wins the claim
-- **THEN** the `NWConnection` is cancelled and released exactly once and `connect` throws
-  `POSIXError(.ECONNABORTED)`
+- **THEN** `connect` throws `POSIXError(.ECONNABORTED)` and the connection reference is released
+- **AND** if the driver had already been started, it is cancelled exactly once; if `close()` won
+  before the connect path committed toward starting the driver, the start is suppressed and
+  **nothing is cancelled** (there is no connection to cancel). The third phase — a loss landing
+  after the commit but before `start` returns — is governed by the "Loss in the commit-to-start
+  window" scenario below
+
+#### Scenario: Loss in the commit-to-start window
+
+- **WHEN** `close()`, task cancellation, or deadline expiry wins the claim after the connect
+  path has committed toward starting the driver but before the driver's start side effect has
+  occurred
+- **THEN** nothing is cancelled inside that window; after `start` returns, the started driver
+  is cancelled exactly once and `connect` throws the loser's mapped error only after the
+  cancel — no connection activity begins after the losing resume
 
 #### Scenario: Deadline expiry
 
 - **WHEN** the connection has not reached `.ready` when the deadline scheduler fires
   `connectTimeout`
-- **THEN** the `NWConnection` is cancelled exactly once and `connect` throws
-  `POSIXError(.ETIMEDOUT)` (the description includes the last `.waiting` error when one was
-  observed)
+- **THEN** `connect` throws `POSIXError(.ETIMEDOUT)` (the description includes the last
+  `.waiting` error when one was observed)
+- **AND** if the driver had already been started, it is cancelled exactly once; if the deadline
+  won before the connect path committed toward starting the driver, the start is suppressed and
+  **nothing is cancelled**. The third phase — a loss landing after the commit but before `start`
+  returns — is governed by the "Loss in the commit-to-start window" scenario above
 - **AND** a deadline that fires after `.ready` has won the claim is a side-effect-free no-op
 
 #### Scenario: Successful connect keeps the connection
@@ -137,8 +168,9 @@ connecting → `POSIXError(.ECONNABORTED)`; deadline expiry → `POSIXError(.ETI
 
 - **WHEN** any combination of ready, failure, task cancellation, `close()`, and deadline expiry
   occurs, in any order
-- **THEN** the connect continuation is resumed exactly once, the winning path alone performs
-  cleanup, and no losing path performs any side effect
+- **THEN** the connect continuation is resumed exactly once, the party the claim assigned
+  performs cleanup exactly once (the winning path itself, or the starting path when the loss was
+  parked in the commit-to-start window), and no path that lost the claim performs any side effect
 - **NOTE** all race and state scenarios are unit-tested deterministically through the injected
   connection driver and deadline scheduler seams (design D7): the driver scripts `.waiting`/
   `.ready`/`.failed`/`.cancelled` in any interleaving, records `cancel()` requests to prove
@@ -228,9 +260,35 @@ peer-originated graceful EOF — matching `TCPTransportApple` so the `TransportB
 identical teardown signal on both conformers), release all resources, and SHALL be safe to call multiple
 times and concurrently with in-flight operations. Because the cause is recorded first, the
 `.cancelled` state event produced by `close()`'s own `NWConnection.cancel()` SHALL never be
-treated as abnormal transport loss. `receive()` after `close()` SHALL return
-empty `Data`; `POSIXError(.ENOTCONN)` is reserved for `receive()`/`send(_:)` on a
-never-connected transport.
+treated as abnormal transport loss.
+
+The post-`close()` contract is deliberately asymmetric between the two directions, and SHALL use
+the same error and EOF signals as `TCPTransportApple` so `TransportBridge` sees the same teardown
+signalling on both conformers:
+
+- `receive()` after `close()` SHALL return empty `Data` and SHALL NOT throw. The empty `Data`
+  *is* the teardown signal the inbound pump consumes; throwing `ENOTCONN` here would surface a
+  local, expected shutdown as an error.
+- `send(_:)` SHALL throw `POSIXError(.ENOTCONN)` whenever no usable connection exists — this
+  covers both the never-connected transport **and** the transport after `close()`, since
+  `close()` releases the driver. There is no teardown-signal convention on the outbound
+  direction: a write with nowhere to go is a genuine error.
+- `receive()` on a **never-connected** transport (no successful connect ever claimed `.ready`)
+  SHALL throw `POSIXError(.ENOTCONN)`, distinguishing "never connected" from "connected, then
+  closed".
+
+`POSIXError(.ENOTCONN)` is therefore *not* reserved for the never-connected case alone; it is
+the transport's "no usable connection" error, and only `receive()` after a local `close()` is
+exempted from it by the empty-`Data` teardown convention.
+
+One ordering difference from `TCPTransportApple` is intentional and recorded rather than
+specified as equivalence: when inbound chunks are still buffered at `close()`, `receive()` SHALL
+drain those buffered chunks before reporting the close EOF, whereas `TCPTransportApple.receive()`
+short-circuits on its closed flag and reports empty `Data` immediately. Both converge on empty
+`Data` once the buffer is empty, and neither ever throws for a local close. This is not
+observable through `TransportBridge` (its inbound pump is cancelled by `close()`), so the
+difference is documented as a known, benign divergence rather than a behavior either conformer
+must change.
 
 #### Scenario: Close with a parked receiver
 
@@ -246,6 +304,17 @@ never-connected transport.
 #### Scenario: Never connected
 
 - **WHEN** `receive()` is called on a transport that was never connected
+- **THEN** it throws `POSIXError(.ENOTCONN)`
+
+#### Scenario: Send after close
+
+- **WHEN** `send(_:)` is called on a transport that connected successfully and was then closed
+- **THEN** it throws `POSIXError(.ENOTCONN)` (no usable connection), and the bytes reach no
+  driver — in contrast to `receive()` after `close()`, which returns empty `Data`
+
+#### Scenario: Send on a never-connected transport
+
+- **WHEN** `send(_:)` is called on a transport that was never connected
 - **THEN** it throws `POSIXError(.ENOTCONN)`
 
 #### Scenario: Double close

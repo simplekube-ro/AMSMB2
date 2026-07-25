@@ -137,6 +137,44 @@ final class ImmediateFireScheduler: ConnectDeadlineScheduler, @unchecked Sendabl
     }
 }
 
+/// A driver whose `start()` parks at entry — before its start side effect — until the test
+/// releases it. This exposes the exact window after the transport has committed the claim toward
+/// starting the driver but before the driver performs its start side effect, and records the
+/// start/cancel event order so tests can prove "cancel happens exactly once, strictly after start".
+final class GatedStartDriver: QUICConnectionDriver, @unchecked Sendable {
+    private let lock = NSLock()
+    private let entered = TestFlag()
+    private let release = DispatchSemaphore(value: 0)
+    private var _events: [String] = []
+
+    func start(
+        onState _: @escaping @Sendable (QUICConnectionState) -> Void,
+        onReceive _: @escaping @Sendable (Result<Data, POSIXError>) -> Void
+    ) {
+        entered.set()
+        release.wait() // park before the start side effect; the test owns this window.
+        lock.withLock { _events.append("start") }
+    }
+
+    func cancel() {
+        lock.withLock { _events.append("cancel") }
+    }
+
+    func send(_: Data) async throws {}
+
+    // MARK: Test control
+
+    func releaseStart() {
+        release.signal() // signal() is async-safe (only wait() is not).
+    }
+
+    var didEnterStart: Bool { entered.isSet }
+
+    var events: [String] {
+        lock.withLock { _events }
+    }
+}
+
 // MARK: - Tests
 
 @available(iOS 15, macOS 12, macCatalyst 15, tvOS 15, watchOS 8, visionOS 1, *)
@@ -173,7 +211,8 @@ final class QUICTransportAppleTests: XCTestCase, @unchecked Sendable {
 
     // MARK: - 2.2 Skeleton / close / receive contracts
 
-    /// Never-connected `receive()` → `ENOTCONN` (reserved for the never-connected case).
+    /// Never-connected `receive()` → `ENOTCONN`: distinguishes "never connected" from
+    /// "connected, then closed" (which returns empty `Data`).
     func testReceiveOnNeverConnectedThrowsENOTCONN() async {
         let transport = makeTransport(ScriptedQUICDriver(), ManualDeadlineScheduler())
         do {
@@ -199,6 +238,53 @@ final class QUICTransportAppleTests: XCTestCase, @unchecked Sendable {
         await transport.close()
         let data = try await transport.receive()
         XCTAssertEqual(data, Data(), "receive after close is the close EOF signal")
+    }
+
+    /// `send(_:)` on a never-connected transport → `ENOTCONN`. `ENOTCONN` is the transport's
+    /// "no usable connection" error on the outbound direction, not a never-connected-only code.
+    func testSendOnNeverConnectedThrowsENOTCONN() async {
+        let driver = ScriptedQUICDriver()
+        let transport = makeTransport(driver, ManualDeadlineScheduler())
+        do {
+            try await transport.send(Data([0x01]))
+            XCTFail("never-connected send must throw ENOTCONN")
+        } catch let posix as POSIXError {
+            XCTAssertEqual(posix.code, .ENOTCONN)
+        } catch {
+            XCTFail("expected POSIXError(.ENOTCONN), got \(error)")
+        }
+        XCTAssertEqual(driver.sentChunks, [], "no bytes may reach a never-started driver")
+    }
+
+    /// `send(_:)` after a successful connect followed by `close()` → `ENOTCONN`.
+    ///
+    /// WHY this matters: the two directions are deliberately asymmetric after a local close.
+    /// `receive()` returns empty `Data` because that empty `Data` *is* the teardown signal the
+    /// `TransportBridge` inbound pump consumes; the outbound direction has no such convention, so
+    /// a write with nowhere to go must surface as an error rather than silently succeeding. This
+    /// mirrors `TCPTransportApple`, whose `close()` nils `_channel` so `send` hits the identical
+    /// `ENOTCONN` guard — if this ever diverged, the two conformers would report different errors
+    /// for the same post-teardown write.
+    func testSendAfterCloseThrowsENOTCONN() async throws {
+        let driver = ScriptedQUICDriver()
+        let transport = makeTransport(driver, ManualDeadlineScheduler())
+
+        let task = Task { try await transport.connect(host: "fs.example.com", port: 443) }
+        await waitUntil({ driver.didStart }, "driver started")
+        driver.emit(.ready)
+        try await task.value
+
+        await transport.close()
+
+        do {
+            try await transport.send(Data([0x01]))
+            XCTFail("send after close must throw ENOTCONN, not succeed")
+        } catch let posix as POSIXError {
+            XCTAssertEqual(posix.code, .ENOTCONN)
+        } catch {
+            XCTFail("expected POSIXError(.ENOTCONN), got \(error)")
+        }
+        XCTAssertEqual(driver.sentChunks, [], "no bytes may reach the driver after close")
     }
 
     // MARK: - 2.3 Connect state machine (design D7)
@@ -411,6 +497,101 @@ final class QUICTransportAppleTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(driver.cancelCount, 0, "nothing was started → nothing is cancelled")
     }
 
+    // MARK: Commit-to-start gap (P1 regression — the window AFTER the transport commits toward
+    // `driver.start()` but BEFORE the driver's start side effect)
+
+    private func makeGatedTransport(
+        _ driver: GatedStartDriver, _ scheduler: ManualDeadlineScheduler
+    ) -> QUICTransportApple {
+        QUICTransportApple(
+            configuration: SMBQUICConfiguration(),
+            connectTimeout: 30,
+            driverFactory: { _, _, _ in driver },
+            deadline: scheduler
+        )
+    }
+
+    /// Regression (P1): `close()` that wins the claim in the commit-to-start gap must not cancel
+    /// in that window — the starting path finishes the loss after `start()` returns: exactly one
+    /// `cancel()`, strictly after the start side effect, and `connect` throws `ECONNABORTED`
+    /// only after the cancel (no network activity begins after a losing resume).
+    func testCloseInCommitToStartGapCancelsAfterStartExactlyOnce() async {
+        let driver = GatedStartDriver()
+        let transport = makeGatedTransport(driver, ManualDeadlineScheduler())
+
+        let task = Task { try await transport.connect(host: "h", port: 443) }
+        await waitUntil({ driver.didEnterStart }, "transport committed toward start")
+        await transport.close() // loser in the gap; must neither block nor cancel here.
+        XCTAssertEqual(driver.events, [], "no cancel may precede the driver's start side effect")
+
+        driver.releaseStart()
+        do {
+            try await task.value
+            XCTFail("close in the commit-to-start gap must fail the connect")
+        } catch let posix as POSIXError {
+            XCTAssertEqual(posix.code, .ECONNABORTED)
+        } catch {
+            XCTFail("expected POSIXError(.ECONNABORTED), got \(error)")
+        }
+        XCTAssertEqual(
+            driver.events, ["start", "cancel"],
+            "start committed first → started driver cancelled exactly once, after start"
+        )
+    }
+
+    /// Regression (P1): task cancellation winning in the commit-to-start gap — same contract as
+    /// the close-in-gap case, surfacing `CancellationError`.
+    func testTaskCancelInCommitToStartGapCancelsAfterStartExactlyOnce() async {
+        let driver = GatedStartDriver()
+        let transport = makeGatedTransport(driver, ManualDeadlineScheduler())
+
+        let task = Task { try await transport.connect(host: "h", port: 443) }
+        await waitUntil({ driver.didEnterStart }, "transport committed toward start")
+        task.cancel() // loser in the gap.
+        XCTAssertEqual(driver.events, [], "no cancel may precede the driver's start side effect")
+
+        driver.releaseStart()
+        do {
+            try await task.value
+            XCTFail("cancellation in the commit-to-start gap must fail the connect")
+        } catch is CancellationError {
+            // Expected.
+        } catch {
+            XCTFail("expected CancellationError, got \(error)")
+        }
+        XCTAssertEqual(
+            driver.events, ["start", "cancel"],
+            "start committed first → started driver cancelled exactly once, after start"
+        )
+    }
+
+    /// Regression (P1): deadline expiry winning in the commit-to-start gap — same contract,
+    /// surfacing `POSIXError(.ETIMEDOUT)`.
+    func testDeadlineInCommitToStartGapCancelsAfterStartExactlyOnce() async {
+        let driver = GatedStartDriver()
+        let scheduler = ManualDeadlineScheduler()
+        let transport = makeGatedTransport(driver, scheduler)
+
+        let task = Task { try await transport.connect(host: "h", port: 443) }
+        await waitUntil({ driver.didEnterStart }, "transport committed toward start")
+        scheduler.fireNow() // loser in the gap.
+        XCTAssertEqual(driver.events, [], "no cancel may precede the driver's start side effect")
+
+        driver.releaseStart()
+        do {
+            try await task.value
+            XCTFail("deadline in the commit-to-start gap must fail the connect")
+        } catch let posix as POSIXError {
+            XCTAssertEqual(posix.code, .ETIMEDOUT)
+        } catch {
+            XCTFail("expected POSIXError(.ETIMEDOUT), got \(error)")
+        }
+        XCTAssertEqual(
+            driver.events, ["start", "cancel"],
+            "start committed first → started driver cancelled exactly once, after start"
+        )
+    }
+
     /// Failure-versus-cancel: whichever is emitted first wins; the other is a no-op. Here the
     /// failure wins and the late cancel performs nothing extra.
     func testFailureWinsRaceLateCancelIsNoOp() async {
@@ -604,6 +785,96 @@ final class QUICTransportAppleTests: XCTestCase, @unchecked Sendable {
         driver.emit(.ready)
         try await task.value
         return (transport, driver)
+    }
+}
+
+// MARK: - Public initializer timeout validation (P2 regression)
+
+/// The public production path must enforce the same connect-timeout contract as
+/// `SMB2Client.connect` (design D10): a directly constructed `QUICTransportApple` can never hold
+/// an invalid, unnormalized deadline. The timeout's single source of truth is
+/// `SMBQUICConfiguration.connectTimeout`.
+@available(iOS 15, macOS 12, macCatalyst 15, tvOS 15, watchOS 8, visionOS 1, *)
+final class QUICTransportApplePublicInitTests: XCTestCase {
+    func testInvalidConnectTimeoutsThrowEINVALFromPublicInit() {
+        let invalid: [TimeInterval] = [.nan, .infinity, -.infinity, 0, -1, -30.5]
+        for value in invalid {
+            XCTAssertThrowsError(
+                try QUICTransportApple(configuration: SMBQUICConfiguration(connectTimeout: value)),
+                "connectTimeout \(value) must be rejected before any NWConnection exists"
+            ) { error in
+                XCTAssertEqual(
+                    (error as? POSIXError)?.code, .EINVAL, "connectTimeout \(value) → EINVAL"
+                )
+            }
+        }
+    }
+
+    func testValidConnectTimeoutsNormalizeThroughPublicInit() throws {
+        XCTAssertEqual(
+            try QUICTransportApple(
+                configuration: SMBQUICConfiguration(connectTimeout: 7200)).connectTimeout,
+            3600, "values above 3600 clamp to 3600"
+        )
+        XCTAssertEqual(
+            try QUICTransportApple(
+                configuration: SMBQUICConfiguration(connectTimeout: 3600)).connectTimeout,
+            3600, "3600 itself passes unclamped"
+        )
+        XCTAssertEqual(
+            try QUICTransportApple(
+                configuration: SMBQUICConfiguration(connectTimeout: 0.25)).connectTimeout,
+            0.25, "sub-second values are honored as-is"
+        )
+        XCTAssertEqual(
+            try QUICTransportApple(configuration: SMBQUICConfiguration()).connectTimeout,
+            30, "the default deadline is 30 s"
+        )
+    }
+
+    /// The public production path (real driver factory, real deadline scheduler): an
+    /// out-of-range port surfaces as `POSIXError(.EINVAL)` from `connect` — the invalid-port
+    /// driver emits `.failed` without ever creating an `NWConnection`.
+    func testPublicTransportConnectRejectsOutOfRangePort() async throws {
+        let transport = try QUICTransportApple(configuration: SMBQUICConfiguration())
+        do {
+            try await transport.connect(host: "fs.example.com", port: 65536)
+            XCTFail("out-of-range port must throw EINVAL")
+        } catch let posix as POSIXError {
+            XCTAssertEqual(posix.code, .EINVAL)
+        } catch {
+            XCTFail("expected POSIXError(.EINVAL), got \(error)")
+        }
+    }
+}
+
+// MARK: - NWConnectionQUICDriver port validation (P2 regression)
+
+/// Boundary tests for the production driver's port handling: only 1...65535 is accepted;
+/// out-of-range ports (0, negative, > 65535) must produce `POSIXError(.EINVAL)` and create NO
+/// `NWConnection` — in particular 65536 must never silently become UDP/0. Constructing (without
+/// starting) an `NWConnection` is inert, so the accepted-boundary checks touch no network.
+@available(iOS 15, macOS 12, macCatalyst 15, tvOS 15, watchOS 8, visionOS 1, *)
+final class NWConnectionQUICDriverPortTests: XCTestCase {
+    func testOutOfRangePortsAreRejectedWithEINVALAndNoConnection() {
+        for port in [0, -1, 65536, 1 << 20] {
+            let driver = NWConnectionQUICDriver(host: "fs.example.com", port: port, trust: .system)
+            XCTAssertNil(driver.connection, "port \(port): no NWConnection may be created")
+            XCTAssertEqual(driver.initError?.code, .EINVAL, "port \(port): must fail with EINVAL")
+        }
+    }
+
+    func testBoundaryPortsAreAcceptedAndPreserved() throws {
+        for port in [1, 65535] {
+            let driver = NWConnectionQUICDriver(host: "fs.example.com", port: port, trust: .system)
+            XCTAssertNil(driver.initError, "port \(port): valid boundary port must be accepted")
+            let connection = try XCTUnwrap(driver.connection, "port \(port): connection must exist")
+            guard case .hostPort(_, let nwPort) = connection.endpoint else {
+                XCTFail("port \(port): expected a hostPort endpoint, got \(connection.endpoint)")
+                continue
+            }
+            XCTAssertEqual(Int(nwPort.rawValue), port, "the valid explicit port is preserved unchanged")
+        }
     }
 }
 

@@ -1122,7 +1122,7 @@ extension SMB2Client {
 /// `eagerConnecting → localOwned → installing → installed`, plus the terminal states `cancelled`
 /// (cancellation won the claim, awaiting consumption by the eager-completion reconciliation or a
 /// failed install claim) and `finished` (ownership consumed). Every transition is atomic, and —
-/// mirroring D7's `claimConnectOutcome` — the party that wins a transition performs the
+/// mirroring D7's `resolveConnect` — the party that wins a transition performs the
 /// associated close/cleanup duty *outside* the lock. The bridge therefore closes exactly once on
 /// every path, and cancellation racing installation has a single lock-protected winner
 /// (cancelled-first → local close, no libsmb2 call; installed-first → installed-seam teardown).
@@ -1263,13 +1263,14 @@ extension SMB2Client {
     /// and drives the handshake through the no-fd servicing loop rather than `pollUntilComplete`.
     ///
     /// The `tcp`/`automatic` conformer is `TCPTransportApple` (NIOTransportServices); `.quic`
-    /// is validated here (design D4/D10) but its transport is not yet constructed in this batch.
+    /// is validated here (design D4/D10) and then constructs `QUICTransportApple`, or throws
+    /// `ENOTSUP` below the QUIC availability floor (design D1).
     ///
     /// Endpoint parsing and — for `.quic` — host and connect-timeout validation are hoisted here
     /// (design D4) so they run **before** transport construction and before any network activity,
     /// and so `parseSeamEndpoint` is invoked exactly once. `quicConfiguration` is the immutable
-    /// snapshot the manager took under `connectLock` (design D6); it defaults to `nil` (all
-    /// defaults) until the manager surface lands in a later batch.
+    /// snapshot the manager took under `connectLock` (design D6); it defaults to `nil`, which
+    /// means "all `SMBQUICConfiguration` defaults".
     func connect(
         server: String, share: String, user: String,
         transportKind: SMBTransportKind,
@@ -1292,13 +1293,13 @@ extension SMB2Client {
                     description: "SMB over QUIC requires a hostname, not an IP address")
             }
             // Dedicated, finite, always-armed connect deadline (design D10) — independent of
-            // `self.timeout`. Validated/normalized here, before transport construction.
-            let normalizedTimeout = try Self.normalizedQUICConnectTimeout(
-                quicConfiguration?.connectTimeout ?? 30)
+            // `self.timeout`. Validated here, before transport construction and before the
+            // availability check; the transport initializer independently normalizes the same
+            // value from the configuration, so direct construction cannot bypass the contract.
+            _ = try Self.normalizedQUICConnectTimeout(quicConfiguration?.connectTimeout ?? 30)
             if #available(iOS 15, macOS 12, macCatalyst 15, tvOS 15, watchOS 8, visionOS 1, *) {
-                transport = QUICTransportApple(
-                    configuration: quicConfiguration ?? SMBQUICConfiguration(),
-                    connectTimeout: normalizedTimeout)
+                transport = try QUICTransportApple(
+                    configuration: quicConfiguration ?? SMBQUICConfiguration())
             } else {
                 // Below the QUIC availability floor (design D1). Unreachable on CI hosts, which
                 // always satisfy the floor; verified by code inspection, scenario marked manual.

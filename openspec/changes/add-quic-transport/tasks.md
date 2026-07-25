@@ -90,13 +90,18 @@ TDD applies throughout: each task starts by writing/updating the tests for its s
       BEFORE calling `NWConnection.cancel()` (the D8 established-connection lifecycle:
       `ready → localClosing → closed` | `failed(error)`), resuming the parked waiter with empty `Data` (the
       local-close EOF signal — an empty-Data bridge teardown signal, not a peer-originated
-      graceful EOF — matching `TCPTransportApple.signalClosed()`; `ENOTCONN` only for
-      never-connected) — mirror
+      graceful EOF — matching `TCPTransportApple.signalClosed()`; `receive()` after `close()`
+      returns empty `Data`, while `send(_:)` throws `ENOTCONN` whenever no usable connection
+      exists, including after `close()`, and `receive()` throws `ENOTCONN` only when never
+      connected — the same asymmetry as `TCPTransportApple`) — mirror
       `TCPTransportApple`'s shape (D3). Unit-test the state-machine paths that don't need a live
-      server (never-connected `ENOTCONN`, double close, receive-after-close returns empty `Data`)
+      server (never-connected `ENOTCONN` on both directions, double close,
+      receive-after-close returns empty `Data`, send-after-close throws `ENOTCONN`)
 - [x] 2.3 Implement the D7 connect state machine with the **atomic outcome claim**: a
-      lock-protected `claimConnectOutcome(_:)` transition that decides the winner AND assigns
-      the side-effect duty in one critical section (losers perform no cancellation or cleanup;
+      lock-protected `resolveConnect(_:)` transition (with the lock-held helper
+      `consumeLossClaimLocked(_:error:) -> LossDuty?`) that decides the winner AND assigns
+      the side-effect duty in one critical section, with the effects themselves performed
+      outside the lock by the assigned party (losers perform no cancellation or cleanup;
       a winning `.ready` retains the connection for `send`/`receive` — the reference is not
       cleared on success; a winning cancel/deadline/failure/close cancels and releases the
       connection exactly once); explicit handling of
@@ -154,8 +159,10 @@ TDD applies throughout: each task starts by writing/updating the tests for its s
       never overwritten); unsolicited `.failed` and unsolicited `.cancelled` → abnormal loss;
       receive already parked at teardown and `receive()` called after teardown; exactly-once
       waiter resumption and exactly-once resource cleanup
-- [x] 2.6 Wire `.quic` in the `Context.swift` kind dispatch to construct
-      `QUICTransportApple(configuration:connectTimeout:)` (replacing the task-1.3 stub) with the
+- [x] 2.6 Wire `.quic` in the `Context.swift` kind dispatch to construct the throwing
+      `QUICTransportApple(configuration:)` (replacing the task-1.3 stub; the initializer
+      derives, validates, and normalizes the connect timeout from
+      `configuration.connectTimeout` — see task 6.2) with the
       `SMB2_TRANSPORT_QUIC` selector; run the full seam unit suite (bridge/servicing tests must
       stay green)
 
@@ -240,3 +247,73 @@ TDD applies throughout: each task starts by writing/updating the tests for its s
       addition, so the generated-header grep remains the compile-level check of record per D11
 - [ ] 5.4 Ensure artifacts reflect what shipped, close AMSMB2 #29 / RandomPlayer #346, archive
       via `/opsx:archive`
+
+## 6. Adversarial-review fixes (post-implementation)
+
+- [x] 6.1 P1 — atomic start/loss handoff: a loser that wins the connect claim in the
+      commit-to-start window parks its outcome (`pendingLoss`); the starting path finishes it
+      after `driver.start()` returns (cancel exactly once, then resume), so the driver is never
+      cancelled before its start side effect and never started after a losing teardown.
+      Regression-tested with a gated-start driver for close(), task cancellation, and deadline
+      expiry; pre-commit suppression covered by the existing `ImmediateFireScheduler` and
+      gated-factory tests
+- [x] 6.2 P2 — public `QUICTransportApple(configuration:)` (now `throws`) derives the connect
+      deadline from `configuration.connectTimeout` via `normalizedQUICConnectTimeout`, removing
+      the separate unvalidated `connectTimeout:` argument (single source of truth; direct
+      construction cannot bypass EINVAL/clamping); tested through the public initializer
+- [x] 6.3 P2 — `NWConnectionQUICDriver` accepts only ports 1...65535; out-of-range ports
+      (0, negative, > 65535) produce `POSIXError(.EINVAL)` with no `NWConnection` (65536 no
+      longer truncates to UDP/0); boundary-tested for 0, -1, 1, 65535, 65536, 1 << 20 and via
+      the public transport path
+- [x] 6.4 P3 — refreshed stale `.quic` wording in `SMBTransport.swift` and `docs/API.md`;
+      `quic-transport-apple` / `quic-connection-policy` / `api-reference` specs updated for the
+      D7 start/loss handoff, the throwing `QUICTransportApple(configuration:)` initializer, and
+      the 1...65535 port contract
+- [x] 6.5 P1 — artifact/comment truth pass after the second fresh review: restated D7 cleanup
+      duty as *assigned by the claim, executed by the start handoff* (design.md, proposal.md,
+      and the `resolveConnect` doc comment no longer claim the winner always cancels the
+      deadline); added the port-range decision and its post-construction placement rationale to
+      design D4; replaced the phantom `claimConnectOutcome`/`ClaimedDuty` names with the shipped
+      `resolveConnect(_:)` / `consumeLossClaimLocked(_:error:) -> LossDuty?` in design.md,
+      tasks.md, and `Context.swift`; made the `ENOTCONN` requirement match the shipped
+      (TCP-compatible) contract and covered `send()` after `close()` with a test; removed the
+      stale "not yet constructed in this batch" / "later batch" / "Batch-A stub" comments; and
+      reconciled the proposal Impact file list with the files this change actually adds
+- [x] 6.6 P1 — second truth pass after the third fresh review, which found two surviving
+      instances of the same two defect classes that 6.5 fixed only in the sections it named:
+      the `quic-transport-apple` "No double resume" scenario still said "the winning path alone
+      performs cleanup" (now restated as claim-assigns / handoff-executes), and design D3 plus
+      the `receive()` source comment still said `ENOTCONN` was "reserved for the
+      never-connected case" (now stated as the transport's no-usable-connection error, with
+      `receive()`-after-local-close the single exemption). Also corrected the same
+      winner-performs-cleanup phrasing in `docs/ARCHITECTURE.md`, narrowed this change's own
+      "matches `TCPTransportApple` exactly" post-close claim to the signals actually shared and
+      recorded the buffered-drain ordering divergence, documented the accepted cost of the
+      parked commit-to-start window (`close()` may return before the start fires), and listed
+      the three modified test files in the proposal Impact. Lesson recorded: sweep for the
+      offending *phrases* repo-wide, not only the sections a review names
+- [x] 6.7 P1 — cleared both conditions attached to the APPROVED WITH CONDITIONS verdict. The
+      same over-claim class had survived one level below the requirement prose, in two
+      normative WHEN/THEN scenarios of the `quic-transport-apple` spec: "Deadline expiry" and
+      "Close while connecting" both asserted the `NWConnection` "is cancelled exactly once",
+      which is false when the loss wins at `startPhase == .notStarted` — and, for the deadline
+      case, is directly falsified by the shipped passing test
+      `testDeadlineWinsBeforeStartSuppressesDriverStart`, which asserts `cancelCount == 0`.
+      Both scenarios now scope the cancel to the already-started case and state the
+      pre-commit suppression explicitly, so no false acceptance criterion reaches
+      `openspec/specs/` on archive. Verified the neighbouring race scenarios do NOT need the
+      same scoping: their premises (`.ready`/`.failed`/`.waiting` delivered by the driver)
+      imply a started driver. Also recorded the full review history in proposal.md — the
+      first remediation-pass verdict is now preserved as its own superseded section rather
+      than only summarised, and the review ordinals were corrected
+- [x] 6.8 Conditions confirmed cleared by the same reviewer against the live worktree; verdict
+      upgraded to **APPROVED** and recorded in proposal.md, with the conditions-era text kept as
+      superseded history so the gate sees in-file evidence that the conditions were satisfied.
+      Took the reviewer's optional editorial suggestion: both corrected scenarios now name the
+      "Loss in the commit-to-start window" scenario explicitly, so the three-phase partition is
+      stated rather than inferred (name-based reference, so it survives reordering). Recorded in
+      the verdict, for future scenario authors: the neighbouring race scenarios are correct
+      because a pre-start `emit` is a no-op (`onState` is assigned only inside `start()`) AND
+      because they assert duty *accounting* (one cancel, one resume) rather than attributing the
+      cancel to a party — accounting is phase-invariant once the driver is started, attribution
+      is not

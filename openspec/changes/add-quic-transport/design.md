@@ -100,8 +100,12 @@ signal, *not* a peer-originated graceful EOF; implemented via the D8 recorded-ca
 which records the local-close cause *before* `NWConnection.cancel()` so the resulting
 `.cancelled` event is never misread as abnormal loss), exactly like `TCPTransportApple.close()` → `signalClosed()`,
 `TCPTransportApple.swift:429-437` — so `TransportBridge.inboundPump()` sees the identical
-`setInboundEOF()` teardown signal from both conformers; `ENOTCONN` is reserved for the
-never-connected case, matching `TCPTransportApple.receive()`'s `_channel == nil` guard).
+`setInboundEOF()` teardown signal from both conformers; `ENOTCONN` is the transport's
+"no usable connection" error — `send(_:)` throws it whenever no connection is usable, including
+after `close()`, and `receive()` throws it only when the transport was never connected, since
+`receive()` after a local `close()` is exempted by the empty-`Data` teardown convention. Both
+conformers behave identically here: `TCPTransportApple.send` guards on `_channel == nil`, which
+`close()` nils).
 `NWConnection.receive` re-arms itself and appends to the FIFO on the connection's private
 `DispatchQueue`. Rationale: the seam + bridge were validated against this exact concurrency
 shape; introducing an actor here would add a second pattern for no benefit. Alternative (actor)
@@ -138,10 +142,11 @@ rejected for consistency and because `NWConnection` callbacks would hop executor
   `connect(...)` calls `parseSeamEndpoint(server, defaultPort:)`, runs host validation (below)
   and — for `.quic` — connect-timeout validation/normalization (D10), and only then constructs
   the transport — `TCPTransportApple()` for `.tcp`/`.automatic`, or
-  `QUICTransportApple(configuration:connectTimeout:)` for `.quic`, receiving the configuration
-  snapshot and the **validated, normalized** QUIC connect timeout (D10 — sourced from
-  `SMBQUICConfiguration.connectTimeout`, never from `SMB2Client.timeout`) at construction —
-  wraps it in the bridge, and calls
+  `QUICTransportApple(configuration:)` for `.quic`, receiving the configuration snapshot at
+  construction; the initializer derives the **validated, normalized** QUIC connect timeout
+  from `SMBQUICConfiguration.connectTimeout` via the same normalization helper (D10 — never
+  from `SMB2Client.timeout`), so direct construction cannot bypass the contract — wraps it in
+  the bridge, and calls
   `connectWithBridge`. Parsing happens exactly once, and validation precedes both transport
   construction and `bridge.connect()` (the eager-connect ordering). The transport never reads
   configuration from the manager or client after construction, so later settings changes cannot
@@ -182,7 +187,37 @@ rejected for consistency and because `NWConnection` callbacks would hop executor
   validation layer** that would reject a numeric target under an insecure trust policy, which
   is exactly why the rejection must be fail-closed here.
 - **Port defaulting**: `parseSeamEndpoint` gains the `defaultPort:` parameter described above.
-  Explicit ports are honored unchanged.
+  A server string with no explicit port yields UDP/443 for `.quic` (445 for `.tcp`/
+  `.automatic`); an explicit valid port is preserved and honored unchanged.
+- **Port range validation — the one `.quic` check that runs *after* transport construction**:
+  the accepted port range is exactly `1...65535`. Every other value — `0`, negatives, and
+  anything above `65535` — surfaces `POSIXError(.EINVAL)`, and **no `NWConnection` is created**
+  for an invalid port. The check lives inside `NWConnectionQUICDriver.init`, not in the hoisted
+  client-side validation step, and is expressed as `UInt16(exactly: port)` plus an explicit
+  `> 0` guard: `NWEndpoint.Port` is `UInt16`-based, so a bare truncating conversion would let
+  `65536` silently become UDP/0 and `0` become a wildcard port. `UInt16(exactly:)` rejects
+  negatives and out-of-range values by construction; the `> 0` guard rejects port 0. On
+  rejection the driver stores `connection = nil` and `initError = POSIXError(.EINVAL, ...)`
+  instead of constructing an `NWConnection`.
+
+  **Why this placement is safe and intentional.** It sits at the Network.framework boundary
+  because that is where the `UInt16` constraint actually originates — the seam's own
+  `connect(host:port:)` signature is `Int`-typed and driver-neutral, and `MockTransport`/
+  `TCPTransportApple` impose no such range. Hoisting it into `SMB2Client` would duplicate a
+  Network-specific constraint in the platform-neutral policy layer and would still not protect
+  a directly-constructed `QUICTransportApple`, so the driver remains the single fail-closed
+  authority. The placement is nevertheless *architecturally notable* and is recorded here
+  because it is the only `.quic` validation that runs after transport construction, and it
+  therefore reaches the caller by a different route than the hoisted checks: the driver is
+  constructed successfully (holding only `initError`), and `start()` **synchronously** emits
+  `.failed(EINVAL)`. That emission lands inside the D7 commit-to-start window
+  (`startPhase == .starting`), so the losing outcome is *parked* and delivered by the starting
+  path's post-`start()` handoff (D7) rather than by the winner directly. This is safe precisely
+  because the handoff is defined for a synchronous state emission: the lock is never held
+  across `start()`, `driver.cancel()` runs only after `start()` has returned, and the
+  continuation resumes exactly once with `EINVAL`. No network activity occurs on this path —
+  there is no `NWConnection` to start — so "no `NWConnection` for an invalid port" and "the
+  error surfaces as `EINVAL` from `connect`" hold simultaneously.
 - **Opt-in**: only `transportKind == .quic` builds the QUIC transport. `.automatic` remains
   `TCPTransportApple` this milestone (re-evaluate after interop maturity).
 - **No silent fallback**: QUIC connect errors map through `mapTransportConnectError` and
@@ -292,7 +327,7 @@ Set-before-connect, like `timeout`.
    signature exists only under `#if canImport(Network)`) and never read again from the manager.
    On platforms without `Network` (Linux), the **manager** routes on the same snapshot (see
    the Linux paragraph below); the configuration-aware client signature does not exist there.
-4. `SMB2Client` hands the configuration to `QUICTransportApple(configuration:connectTimeout:)`
+4. `SMB2Client` hands the configuration to `QUICTransportApple(configuration:)`
    **at construction**; the transport copies the value and never reaches back to the client or
    manager.
 
@@ -354,16 +389,20 @@ libsmb2's cancellation and timeout machinery is installed, so the transport cann
 "Mirror `TCPTransportApple`" is also not sufficient — the TCP conformer delegates connect
 establishment to NIOTS, while QUIC drives `NWConnection` directly. The binding requirements:
 
-- **Atomic outcome claim — selection AND side effects are one transition**: the connect attempt
-  holds an `NSLock`-guarded state (`connecting(continuation)` → `ready` | `failed(cause)`),
+- **Atomic outcome claim — selection AND duty assignment are one transition**: the connect
+  attempt holds an `NSLock`-guarded state (`connecting(continuation)` → `ready` | `failed`),
   and every completion path funnels through a single internal
-  `claimConnectOutcome(_ outcome: ConnectOutcome) -> ClaimedDuty?` that, **under the lock**,
-  atomically (a) decides whether this path wins (the state is still `connecting`) and
-  (b) takes the continuation and transitions the state. The winner receives back the duty it —
-  and only it — must perform *outside* the lock; a loser receives `nil` and performs **no**
-  side effects at all. This closes the gap where a one-shot gate protected resumption but not
-  side effects (a losing `onCancel` could still `NWConnection.cancel()` a connection that
-  `.ready` had just successfully returned):
+  `resolveConnect(_ outcome: ConnectOutcome)`. **Under the lock** it atomically (a) decides
+  whether this path wins (the state is still `connecting`), (b) takes the continuation and
+  transitions the state, and (c) *assigns* the resulting duty — for a losing outcome via the
+  lock-held helper `consumeLossClaimLocked(_:error:) -> LossDuty?`, which returns the duty to
+  perform or `nil` when the loss is parked for the starting path (see the start handoff below).
+  The **effects** — `deadline.cancel()`, `driver.cancel()`, and `continuation.resume(...)` —
+  are deliberately performed *outside* the lock, by whichever party the assignment named; only
+  the selection and the assignment are atomic. A loser of the claim receives nothing and
+  performs **no** side effects at all. This closes the gap where a one-shot gate protected
+  resumption but not side effects (a losing `onCancel` could still `NWConnection.cancel()` a
+  connection that `.ready` had just successfully returned):
   - If **`.ready` wins**: the transport transitions to the established state, **retains the
     connection reference for `send`/`receive`** (the reference is *not* cleared on successful
     connect), cancels the deadline timer, and resumes the continuation with success. Any later
@@ -377,9 +416,18 @@ establishment to NIOTS, while QUIC drives `NWConnection` directly. The binding r
     `CancellationError` — the live connection is never destroyed by the losing
     connect-claim path itself, and it never leaks.
   - If **task cancellation, deadline expiry, `.failed`, or `close()` wins** before readiness:
-    the winning path — exactly once — cancels the deadline timer, cancels and releases the
-    `NWConnection` (clears the stored reference and its `stateUpdateHandler` so no callback
-    retains the transport past teardown), and resumes the continuation with the mapped error.
+    the connection is — exactly once — cancelled and released (the stored reference and its
+    `stateUpdateHandler` cleared so no callback retains the transport past teardown), the
+    deadline timer cancelled, and the continuation resumed with the mapped error. **Who**
+    performs that duty follows the atomic start handoff: the setup body commits toward
+    `NWConnection.start()` in the same critical section that re-checks the claim, so a loser
+    that wins *before* the commit records the start as forbidden — `start()` is never invoked
+    and there is nothing to cancel; a loser that wins *after* the commit but before `start()`
+    returns parks its outcome instead of cancelling (never cancelling a connection whose start
+    side effect has not happened, and never holding the lock across `start()`, which may
+    synchronously emit a state), and the starting path finishes the parked loss after `start()`
+    returns — cancel exactly once, then resume — so no connection activity begins after a
+    losing resume; a loser that wins after `start()` has returned performs the duty itself.
     All other racing paths lose the claim and are side-effect-free no-ops.
 - **`NWConnection.stateUpdateHandler`, every state handled explicitly**:
   - `.setup`, `.preparing` — progress; no action.
@@ -400,28 +448,62 @@ establishment to NIOTS, while QUIC drives `NWConnection` directly. The binding r
   recorded local-close cause, is abnormal transport loss — the parked or next `receive()`
   throws the mapped `POSIXError`. Neither ever touches the (already consumed) connect claim.
 - **Task cancellation**: `connect` wraps the continuation in `withTaskCancellationHandler`;
-  `onCancel` calls `claimConnectOutcome(.taskCancelled)` and performs the cancel/release duty
-  **only if it wins the claim**; if `.ready` already won, `onCancel` is a side-effect-free
-  no-op. Cancellation *before* start is handled by an explicit `try Task.checkCancellation()`
+  `onCancel` calls `resolveConnect(.taskCancelled)`, which performs (or parks, per the start
+  handoff above) the cancel/release duty **only if it wins the claim**; if `.ready` already
+  won, `onCancel` is a side-effect-free no-op. Cancellation *before* start is handled by an explicit `try Task.checkCancellation()`
   before the `NWConnection` is created.
 - **Deterministic deadline**: a single timer is armed (through the injectable deadline
   scheduler, below) when connect begins, with the validated `connectTimeout` passed at
   construction (sourced from `SMBQUICConfiguration.connectTimeout` per D10 — **independent of
   `SMB2Client.timeout` and of the value later propagated to `smb2_set_timeout`**). On expiry it
-  attempts the claim; a winning claim cancels the connection → connect throws
-  `POSIXError(.ETIMEDOUT)` (description includes the last `.waiting` error, if any). First of
-  ready/failed/cancel/deadline wins via the atomic claim; the timer is cancelled by whichever
-  path wins.
+  attempts the claim; a winning claim causes the connection to be cancelled — directly or via
+  the parked handoff below — and connect throws `POSIXError(.ETIMEDOUT)` (description includes
+  the last `.waiting` error, if any). First of ready/failed/cancel/deadline wins via the atomic
+  claim; the timer is then cancelled exactly once by the party the claim assigned the duty to
+  (the winner itself, except in the parked commit-to-start case, where the starting path
+  cancels it).
 - **Error contract**: task cancellation → `CancellationError` (passes through
   `mapTransportConnectError` unchanged); `close()` while connecting →
   `POSIXError(.ECONNABORTED)`; deadline expiry → `POSIXError(.ETIMEDOUT)`; `.failed` →
   `POSIXError` mapped from the `NWError` (POSIX errno preserved where available, otherwise
   `.ECONNREFUSED` with a description) — never a raw Network.framework error.
-- **Cleanup is the winner's duty**: the winning claim performs all cleanup exactly once — the
-  continuation is consumed inside the claim, the deadline timer is cancelled by the winner, and
-  only a *losing-outcome* winner (cancel/deadline/failure/close) cancels the `NWConnection` and
-  clears the stored reference and `stateUpdateHandler`. A successful connect keeps the
-  connection reference and hands the state machine over to the D3 receive/close shape.
+- **Cleanup duty is assigned by the claim, and the start handoff decides who executes it**: the
+  continuation is consumed inside the claim, and every effect then runs exactly once, outside
+  the lock, by the assigned party. The claim assigns, it does not always execute:
+  - **`.ready` wins** — the *ready path* cancels the deadline timer and **retains** the driver
+    for `send`/`receive`; nothing is cancelled. The state machine hands over to the D3/D8
+    receive/close shape.
+  - **Losing outcome, pre-commit (`startPhase == .notStarted`)** — the winner marks the start
+    `forbidden` (the setup body must never start the driver now), releases the stored
+    reference, cancels the deadline timer, and resumes with the mapped error. There is **no
+    driver to cancel**, because `start()` was never invoked.
+  - **Losing outcome, commit-to-start window (`startPhase == .starting`)** — the winner
+    performs **no** effects at all: it parks `(continuation, error)` in `pendingLoss`, releases
+    the stored reference, and returns. After `driver.start()` returns, the *starting path*
+    consumes the parked loss and performs the whole duty exactly once — `deadline.cancel()`,
+    then `driver.cancel()`, then `continuation.resume(throwing:)`. This ordering is
+    load-bearing: cancelling before `start()` returns would cancel a connection whose start
+    side effect has not happened, and resuming before the cancel would let connection activity
+    begin after the caller already observed the failure.
+  - **Losing outcome, post-start (`startPhase == .started`, and the defensive `forbidden`
+    case)** — the winner itself cancels the deadline timer, cancels the started driver, clears
+    the stored reference and `stateUpdateHandler` (so no callback retains the transport past
+    teardown), and resumes with the mapped error.
+
+  In every case the deadline timer is cancelled exactly once and the `NWConnection` is
+  cancelled at most once, but **it is not universally the winner that does it** — a maintainer
+  moving the cancel unconditionally back into the winning claim would reintroduce the
+  cancel-before-start-side-effect defect this handoff exists to prevent.
+
+  **Accepted cost of the parked window**: because the parked duty is executed only after
+  `driver.start()` returns, a `close()` (or cancel, or deadline) that wins inside the
+  commit-to-start window returns to *its* caller before the start has fired. The connection can
+  therefore still be started and then immediately cancelled after `close()` has returned. This
+  is deliberate and is the price of never cancelling a connection before its start side effect:
+  the guarantee D7 makes is that no connection activity begins after the *losing resume* (the
+  caller of `connect` never observes a failure while the connection is still coming up), not
+  that `close()` returning implies the socket was never touched. Nothing is leaked — the same
+  handoff cancels the driver exactly once — and no continuation resumes twice.
 
 **Deterministic testability — injected seams, no wall-clock, no TEST-NET dependence** (unit
 tests must not depend on how the local network stack treats unroutable addresses — routing,
@@ -431,8 +513,12 @@ a lingering `.waiting`):
 - **Injected connection driver**: the transport talks to `NWConnection` through an internal
   `QUICConnectionDriver` seam (start/cancel + state-event delivery + send/receive primitives).
   The production implementation is a thin `NWConnection` wrapper; tests inject a scripted
-  driver via an internal initializer (`QUICTransportApple(configuration:connectTimeout:driver:)`;
-  the public path uses the production driver). The test driver can deliver `.waiting`,
+  driver factory and an on-demand deadline scheduler via the internal initializer
+  (`QUICTransportApple(configuration:connectTimeout:driverFactory:deadline:)` — taking the
+  already-normalized connect timeout directly; the public throwing
+  `QUICTransportApple(configuration:)` derives, validates, and normalizes that timeout from
+  `configuration.connectTimeout` and supplies the production `NWConnectionQUICDriver` factory
+  and `DispatchSourceTimer`-based scheduler). The test driver can deliver `.waiting`,
   `.ready`, `.failed`, and `.cancelled` deterministically, in any order and interleaving —
   including *post-ready* delivery, so the D8 established-connection lifecycle (local close vs
   unsolicited `.failed`/`.cancelled`) is deterministically testable too.
@@ -448,8 +534,8 @@ a lingering `.waiting`):
   they are not part of the required deterministic unit suite. See tasks 2.3.
 - **Coverage note (as shipped)**: the injected seams make the transport's own behavior fully
   deterministic, but the two Context-level `.quic` *wiring* lines — constructing
-  `QUICTransportApple(configuration:connectTimeout:)` under the `#available` gate and handing it
-  the validated timeout — are not exercised by a deterministic unit test, because a validated
+  `QUICTransportApple(configuration:)` under the `#available` gate after the hoisted timeout
+  validation — are not exercised by a deterministic unit test, because a validated
   non-numeric `.quic` target proceeds to a real `NWConnection` connect (there is no
   transport-factory seam at the `SMB2Client.connect` layer). Both *halves* are independently
   unit-covered — the policy/validation path (`isNumericHost`, `normalizedQUICConnectTimeout`, the
@@ -530,7 +616,9 @@ existing public contract. So the connect deadline gets its own knob:
 - **Validation and normalization** happen in `SMB2Client.connect`'s hoisted validation step
   (D4), before transport construction and before any network activity, via an internal
   table-testable helper `static func normalizedQUICConnectTimeout(_ value: TimeInterval) throws
-  -> TimeInterval`:
+  -> TimeInterval`; the public `QUICTransportApple(configuration:)` initializer applies the
+  same helper to `configuration.connectTimeout`, so a directly constructed transport can never
+  hold an invalid, unnormalized deadline:
   - `NaN`, `+/-infinity`, `0`, and negative values → `POSIXError(.EINVAL)` (fail loud — a
     non-finite or non-positive connect deadline is a configuration error, never "disabled";
     the QUIC connect deadline cannot be disabled).
@@ -602,7 +690,7 @@ close this — any check leaves an unprotected gap after it. Normative design:
   the eager-completion reconciliation on a failure or cancellation outcome, or by an
   install-block failure path). Every transition is atomic; the party that wins a transition —
   and only that party — performs the associated close/cleanup duty *outside* the lock (the
-  same claim-assigns-duty shape as D7's `claimConnectOutcome`). The bridge therefore closes
+  same claim-assigns-duty shape as D7's `resolveConnect`). The bridge therefore closes
   exactly once on every path.
 - **Transitions and duties**:
   - **`eagerConnecting`** (before/during `bridge.connect`): `onCancel` transitions
@@ -695,7 +783,7 @@ close this — any check leaves an unprotected gap after it. Normative design:
   and is never created at all on a failed install claim — and no connected-but-unowned bridge
   or registered libsmb2 operation survives any interleaving.
 - **Deterministic testability**: the handoff is factored as an internal lock-protected type
-  (transition table in, assigned duty out — mirroring D7's `claimConnectOutcome`) so every
+  (transition table in, assigned duty out — mirroring D7's `resolveConnect`) so every
   transition and race above — including all reconciliation rows A–D and both commit orders of
   race E — is unit-tested directly, without real task-cancellation timing.
   MockTransport-backed `connectWithBridge` tests then cover the wired paths:
