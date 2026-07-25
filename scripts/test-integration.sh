@@ -148,10 +148,13 @@ else
     SKIPPED=$(echo "$OUTPUT" | grep -c "' skipped " 2>/dev/null || true)
 fi
 
-# 5. Always stop containers
+# 5. Always stop containers. Teardown must never mask the test report (`set -e` is active):
+# e.g. removing the compose network fails when another project's container is attached to it.
 if [[ "$SKIP_DOCKER" == false ]]; then
     echo "Stopping Docker containers..."
-    "${COMPOSE[@]}" -f "$FIXTURES_DIR/docker-compose.yml" down -v
+    if ! "${COMPOSE[@]}" -f "$FIXTURES_DIR/docker-compose.yml" down -v; then
+        echo "⚠ Docker teardown reported errors (shared network/volume still in use?) — test results below are unaffected"
+    fi
 fi
 
 # 6. Report and exit
