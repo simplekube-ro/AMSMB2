@@ -288,8 +288,10 @@ TDD applies throughout: each task starts by writing/updating the tests for its s
       `receive()`-after-local-close the single exemption). Also corrected the same
       winner-performs-cleanup phrasing in `docs/ARCHITECTURE.md`, narrowed this change's own
       "matches `TCPTransportApple` exactly" post-close claim to the signals actually shared and
-      recorded the buffered-drain ordering divergence, documented the accepted cost of the
-      parked commit-to-start window (`close()` may return before the start fires), and listed
+      recorded the buffered-drain ordering divergence, documented the then-accepted cost of the
+      parked commit-to-start window — `close()` could return before the start fired — (that
+      allowance was later judged a violation of `SMBTransport.close()`'s released-on-return
+      contract and replaced by the close-waiter handoff in 7.1), and listed
       the three modified test files in the proposal Impact. Lesson recorded: sweep for the
       offending *phrases* repo-wide, not only the sections a review names
 - [x] 6.7 P1 — cleared both conditions attached to the APPROVED WITH CONDITIONS verdict. The
@@ -317,3 +319,45 @@ TDD applies throughout: each task starts by writing/updating the tests for its s
       because they assert duty *accounting* (one cancel, one resume) rather than attributing the
       cancel to a party — accounting is phase-invariant once the driver is started, attribution
       is not
+
+## 7. Close-completion truth, overflow safety, and executor-safe race tests (fourth review pass)
+
+- [x] 7.1 P1 — `close()` completion made truthful: the previously "accepted cost" of the parked
+      commit-to-start window (`close()` could return before the start fired) violated
+      `SMBTransport.close()`'s released-on-return promise and was replaced with close waiters —
+      parking a loss sets `teardownPending` under the lock, every `close()` call (first,
+      repeated, or concurrent) that observes it parks a continuation in `closeWaiters`, and the
+      post-start handoff resumes those waiters only after cancelling the started driver and
+      resuming the connect continuation. Deterministic regression tests prove: close does not
+      complete while the committed start is gated; releasing the start yields exactly
+      `start → cancel`; `close()` completes only after the cancel (event-ordered
+      `close-returned`); connect throws `ECONNABORTED` exactly once; two concurrent closes wait
+      for the same teardown with one cancel; and `close()` waits even when task cancellation
+      (not close) parked the loss. Task cancellation and deadline expiry keep their existing
+      rule — the continuation is not resumed until the committed driver has been cancelled
+- [x] 7.2 P2 — overflow-safe endpoint port parsing: `parseLeadingPort` stops accumulating once
+      the value already exceeds 65535 (no later digit can make it valid; intermediate bounded
+      at 655,359), so an arbitrarily long digit string never traps; the `.quic` branch rejects
+      explicit ports outside 1...65535 with `EINVAL` at endpoint validation, before any
+      transport is constructed or the `NWConnection` driver factory is reached (the driver
+      keeps its own fail-closed check for directly constructed transports). Endpoint regression
+      tests cover a 300-digit port (plain and bracketed host form), 0, and 65536; parser
+      boundary tests preserve 65535 and 65536 exactly; TCP parsing is unchanged for every
+      in-range port
+- [x] 7.3 P2 — executor-safe deterministic race tests: `driver.start()` and the post-start
+      handoff now run on a dedicated serial start queue (`org.amsmb2.quic.start`), so
+      `GatedStartDriver`'s park occupies a GCD worker, never a Swift cooperative-pool thread;
+      its wait is bounded (10 s) and records a `start-timeout` diagnostic event so broken
+      coordination fails visibly instead of hanging; the cancellation-before-start test cancels
+      the current task from inside the driver factory (no semaphore, no parking). The full QUIC
+      transport suite verified green under `LIBDISPATCH_COOPERATIVE_POOL_STRICT=1`
+- [x] 7.4 Unrelated `scripts/test-integration.sh` teardown-suppression hunk (committed as
+      0f7ea0e during an earlier remediation sequence) restored to the pre-change content as an
+      unstaged worktree edit; disposition of the already-pushed commit is left to the maintainer
+- [x] 7.5 Artifacts reconciled with the shipped behavior: design D7 (close-waiter ownership
+      invariant and the dedicated start queue, replacing the "accepted cost" paragraph), design
+      D4 (layered port validation with the hoisted endpoint check), `quic-transport-apple`
+      (close-completion requirement, commit-to-start and concurrent-close scenarios),
+      `quic-connection-policy` (overflow-never-traps scenario, endpoint-level rejection),
+      `docs/ARCHITECTURE.md`, proposal.md, and source comments; the stale APPROVED verdict
+      marked superseded pending a fresh review

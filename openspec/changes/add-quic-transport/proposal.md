@@ -6,12 +6,12 @@ The pluggable-transport milestone (RandomPlayer #344/#345, AMSMB2 #28) landed th
 
 ## What Changes
 
-- Add `QUICTransportApple`, a new `SMBTransport` conformer backed by Network.framework QUIC (`NWProtocolQUIC`) — system QUIC, nothing to ship, App-Store-safe. Availability-gated (`@available(iOS 15, macOS 12, macCatalyst 15, tvOS 15, watchOS 8, visionOS 1, *)`; Package.swift's floors — including `.macCatalyst(.v13)` — are unchanged); older OS versions fail with `ENOTSUP`. Its `connect` is a self-contained, deadline-bounded, cancellable state machine over `NWConnection` in which outcome *selection* and cleanup-*duty assignment* are a single atomic, lock-protected transition, while the assigned effects (cancelling the deadline timer, cancelling the connection, resuming the continuation) are performed outside the lock by the party the transition named — which, for a loss landing in the commit-to-start window, is the starting path rather than the winner (design D7) — it cannot rely on libsmb2's timeout machinery, which is not yet installed during the eager transport connect; the deadline comes from a dedicated `SMBQUICConfiguration.connectTimeout` (default 30 s, design D10), independent of `SMB2Manager.timeout`'s "zero/negative disables" contract. On the client side, `SMB2Client.connectWithBridge` guards the entire interval from before the eager `bridge.connect` through seam installation with a lock-protected bridge-ownership handoff (design D12): exactly one owner is responsible for closing the bridge at every point — the eager-completion reconciliation after `bridge.connect` returns (which closes the still-local bridge exactly once on every cancellation or failure outcome and normalizes a cancellation win to `CancellationError`, regardless of the conformer's internal cancellation error — `TCPTransportApple` maps cancellation to `POSIXError(.ECANCELED)`, the QUIC machine throws `CancellationError`), the cancellation handler while the bridge is locally owned, or the installed seam's `teardownSeam()` — and `smb2_set_transport`/`smb2_connect_share_async` never begin once cancellation has won.
+- Add `QUICTransportApple`, a new `SMBTransport` conformer backed by Network.framework QUIC (`NWProtocolQUIC`) — system QUIC, nothing to ship, App-Store-safe. Availability-gated (`@available(iOS 15, macOS 12, macCatalyst 15, tvOS 15, watchOS 8, visionOS 1, *)`; Package.swift's floors — including `.macCatalyst(.v13)` — are unchanged); older OS versions fail with `ENOTSUP`. Its `connect` is a self-contained, deadline-bounded, cancellable state machine over `NWConnection` in which outcome *selection* and cleanup-*duty assignment* are a single atomic, lock-protected transition, while the assigned effects (cancelling the deadline timer, cancelling the connection, resuming the continuation) are performed outside the lock by the party the transition named — which, for a loss landing in the commit-to-start window, is the starting path rather than the winner, with every `close()` call waiting for that parked teardown to complete before returning — so a returned `close()` guarantees no parked driver start or cancel remains outstanding (design D7) — it cannot rely on libsmb2's timeout machinery, which is not yet installed during the eager transport connect; the deadline comes from a dedicated `SMBQUICConfiguration.connectTimeout` (default 30 s, design D10), independent of `SMB2Manager.timeout`'s "zero/negative disables" contract. On the client side, `SMB2Client.connectWithBridge` guards the entire interval from before the eager `bridge.connect` through seam installation with a lock-protected bridge-ownership handoff (design D12): exactly one owner is responsible for closing the bridge at every point — the eager-completion reconciliation after `bridge.connect` returns (which closes the still-local bridge exactly once on every cancellation or failure outcome and normalizes a cancellation win to `CancellationError`, regardless of the conformer's internal cancellation error — `TCPTransportApple` maps cancellation to `POSIXError(.ECANCELED)`, the QUIC machine throws `CancellationError`), the cancellation handler while the bridge is locally owned, or the installed seam's `teardownSeam()` — and `smb2_set_transport`/`smb2_connect_share_async` never begin once cancellation has won.
 - Wire mapping follows the Microsoft/Samba interop behavior (verified against Samba's client implementation, `source3/libsmb/smbsock_connect.c`): ALPN token `"smb"`, TLS 1.3, one QUIC connection with a **single bidirectional stream used as a byte pipe**. The stream carries the exact same framed SMB2 byte stream as direct TCP (4-byte transport length prefix included) — libsmb2 keeps doing all SMB framing/auth inside the tunnel; the transport stays a dumb pipe, same as `TCPTransportApple`.
 - Connection policy (per #346 — "don't get these wrong"):
   - QUIC is **explicit opt-in** — never auto-selected; `.automatic` continues to mean TCP.
   - **Numeric hosts rejected** — any host the platform resolver classifies as a numeric IPv4/IPv6 address *without DNS* (`getaddrinfo` with `AI_NUMERICHOST`) is refused, including legacy forms such as `127.1`, `2130706433`, hex/octal IPv4, and scoped IPv6 (`fe80::1%en0`) — not just canonical `inet_pton` literals (mirrors Samba/Windows client behavior). The required rejection table is acceptance criteria: if the platform classifier misses a listed form, the classifier is supplemented with deterministic parsing — the table is never weakened (design D4). Rejection runs before the TLS trust policy is applied and is independent of it; `.insecureNoVerification` never bypasses it (with chain and hostname verification disabled, no later validation layer would catch a numeric target).
-  - Default port **UDP/443** when the server string has no explicit port (TCP keeps 445).
+  - Default port **UDP/443** when the server string has no explicit port (TCP keeps 445). Explicit ports are validated to `1...65535` at endpoint validation, before any transport is constructed; endpoint parsing is overflow-safe, so an oversized digit string of any length yields `EINVAL` instead of trapping (design D4).
   - No silent TCP fallback: a QUIC connect failure surfaces as an error; falling back is the caller's decision.
 - TLS security surface: system trust evaluation and hostname verification by default — **never insecure by default**. Trust is a mutually exclusive policy (`system` / `customRoots` / `insecureNoVerification`, design D5): custom DER trust anchors (covering private-CA and self-signed server certificates) *replace* system roots and keep hostname verification; the insecure escape hatch is a separate, explicit case. Certificate/SPKI *pinning* is explicitly **not** part of this change.
 - Public API: `SMB2Manager` gains transport selection (today `connect(shareName:encrypted:)` hardcodes `.automatic`, `AMSMB2.swift:1511`) plus `SMBQUICConfiguration`, a platform-neutral options type (trust anchors as DER `[Data]`, converted to `SecCertificate` only inside the Apple transport — so the type compiles and exists on Linux; plus the `connectTimeout` knob, design D10). The manager snapshots both settings under its `connectLock` before suspending; on Apple the immutable snapshot flows through `SMB2Client.connect(server:share:user:transportKind:quicConfiguration:)` (a `#if canImport(Network)` signature) into the transport initializer (design D6), where `.quic` constructs `QUICTransportApple` instead of throwing; on Linux the manager routes on the same snapshot (`.quic` → `ENOTSUP` before any network activity, `.tcp`/`.automatic` → the legacy path unchanged). Copying (`NSCopying`) preserves both settings. The new surface is intentionally Swift-only — not Objective-C-representable and not exposed to ObjC; the existing ObjC API is unchanged (design D11).
@@ -43,6 +43,66 @@ The pluggable-transport milestone (RandomPlayer #344/#345, AMSMB2 #28) landed th
 - **Downstream**: unblocks RandomPlayer #347 (adopt pluggable transports in RandomPlayer).
 
 ## Review
+
+**Verdict: APPROVED** (project-architect, 2026-07-25 — issued as APPROVED WITH CONDITIONS by a
+fresh independent review of the complete live worktree after the fourth remediation pass, then
+upgraded to APPROVED by the same reviewer after confirming all three conditions cleared
+first-hand against the live worktree: every edited passage read, the factual claims in the new
+scoping text checked against the code, no executable change since the mechanism review
+[diffstat-accounted], affected suites re-run 41/0, `openspec validate --strict` clean. The
+original review treated all prior verdicts as leads only, re-verified every load-bearing claim
+first-hand, and re-ran all listed test commands itself: QUIC transport suite 30/0 both with and
+without `LIBDISPATCH_COOPERATIVE_POOL_STRICT=1`, endpoint/parser suites 11/0, full suite 260/0
+with 67 server-gated skips, `openspec validate --strict` clean.)
+
+The reviewer confirmed all three remediation items are **correctly implemented and genuinely
+proven**: the close-waiter teardown is race-free (the `isClosed`/`teardownPending` pair is set
+in one critical section, the handoff's two lock acquisitions strand no waiter, at most one loss
+can ever exist, the local `driver` capture is the correct object, and no lock is held across
+await/resume/start/cancel on any path added by the pass); the gated regression tests prove the
+close-completion ordering deterministically (positive waiter-count observation, event-ordered
+`close-returned`, one cancel for two concurrent closes, no wall-clock coordination); the
+overflow fix is provably trap-free (intermediate bounded at 655,359, `strtol` semantics
+preserved, endpoint rejection ordered before transport construction by reading, and NIOTS
+range-checks rather than traps downstream, so the TCP path strictly improves); and the
+`scripts/test-integration.sh` worktree copy is byte-identical to the pre-`0f7ea0e` content.
+
+Three conditions were attached — all honesty-of-claims wording, no code changes — addressed in
+the same pass and **confirmed cleared by the same reviewer against the live worktree**
+(2026-07-25; the reviewer verified each edited site, including that `.ready` genuinely is
+emitted by the start side effect and that `cancel()` clears both handlers, so the scoping
+text's factual claims hold):
+
+- **C1 (must fix)**: the unqualified "no driver start or network activity can ever occur after
+  `close()` has returned" was narrowly false on the one committed-start path with **no parked
+  loss** — `.ready` winning while `start()` had not yet returned, where `close()` cancels the
+  driver itself and the tail of `start()` (`armReceive`) runs against a cancelled driver with
+  cleared handlers (safe; nothing leaks or resumes twice). *Fixed by scoping every such claim
+  to the parked committed-start teardown* in `QUICTransportApple.swift` (close doc comment and
+  the gap test's doc comment), design.md D7 (with the explicit `.ready`-mid-`start()`
+  paragraph, also avoiding a re-introduced unqualified "all resources" per observation O1),
+  `specs/quic-transport-apple/spec.md` (both the scenario AND-clause and the close
+  requirement), `docs/ARCHITECTURE.md`, and the proposal summary sentence.
+- **C2 (should fix)**: design.md described `LIBDISPATCH_COOPERATIVE_POOL_STRICT=1` as a
+  "width-1 cooperative executor"; it disables cooperative-pool overcommit and does not force
+  width 1. *Fixed*: the structural argument (the only blocking wait sits on a GCD worker) is
+  stated as the proof, with the strict-pool green run recorded as corroborating evidence.
+- **C3 (should fix)**: the superseded banner said "third remediation pass" while tasks.md §7
+  and the inline annotations say fourth. *Fixed*: reconciled to "fourth".
+
+Non-blocking observations recorded by the reviewer, left intentionally unfixed as pre-existing
+or cosmetic: O1 (a pre-schedule loss can leave the armed deadline timer to self-expire within
+`connectTimeout` — bounded, weak-self, benign; the D7 scoping paragraph now accounts for it),
+O2 (dead `lifecycle = .localClosing` assignment immediately overwritten), O3 (`receive()`
+resumes its continuation inside the lock — safe, never suspends, pre-existing), O4 (parser-
+level boundary coverage for port 1 — *added anyway* as a one-line assertion), O5 (duplicate
+file header in `QUICSeamConnectTests.swift`, cosmetic), O6 (double-`connect()` on one instance
+guarded by documented contract only — unreachable via `SMB2Client`, pre-existing).
+
+> **STATUS: SUPERSEDED (2026-07-25).** The APPROVED verdict below predates
+> the fourth remediation pass (close()-completes-teardown contract, overflow-safe endpoint port
+> parsing, non-blocking gated race tests) and is therefore stale for the current worktree. It is
+> preserved as history only. The current verdict is recorded above this block.
 
 **Verdict: APPROVED** (project-architect, 2026-07-25 — both conditions of the same reviewer's
 APPROVED WITH CONDITIONS verdict cleared in task 6.7 and **confirmed against the live worktree**
@@ -126,10 +186,15 @@ corrected — still asserted unconditional cancellation:
 
 Non-blocking, recorded faithfully and not fixed here: `GatedStartDriver.start()` blocks on a
 `DispatchSemaphore` on a cooperative-pool thread — correct and green on multi-core hosts, but a
-starvation (hang) hazard on a single-core CI runner; `parseLeadingPort` accumulates port digits
+starvation (hang) hazard on a single-core CI runner *(fixed in the fourth pass, task 7.3: start
+and the handoff moved to a dedicated non-cooperative queue, bounded wait with diagnostic)*;
+`parseLeadingPort` accumulates port digits
 into `Int` with no overflow guard, so an absurdly long numeric port traps instead of yielding
-the documented `EINVAL` (pre-existing, shared with the `.tcp` path, belongs to the separate
-`.tcp` port-validation follow-up); `SMB2ServicingLoopTests.swift:298` still uses
+the documented `EINVAL` *(this review's "pre-existing, belongs to the separate `.tcp`
+port-validation follow-up" classification was **wrong** and is corrected in the fourth pass:
+the active `quic-connection-policy` requirement normatively covers every explicit port "65536
+and larger", so a trap for a larger value was in scope for this change — fixed in task 7.2
+with overflow-safe parsing and hoisted endpoint validation)*; `SMB2ServicingLoopTests.swift:298` still uses
 implementation-batch vocabulary ("Since Batch B"), cosmetic; and the post-close seam contract
 (`receive()` → empty `Data`, `send()` → `ENOTCONN`) is normative only in the QUIC capability
 spec although it is a seam-wide contract shared with `TCPTransportApple` — its proper home is

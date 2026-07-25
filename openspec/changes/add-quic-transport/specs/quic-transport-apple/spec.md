@@ -75,9 +75,11 @@ start handoff atomic with the claim: a loser that wins before the connect path c
 starting the driver SHALL suppress the start entirely (the driver's `start` is never invoked
 and nothing is cancelled); a loser that wins after the commit but before `start` returns SHALL
 neither cancel nor resume inside that window — the starting path finishes the parked loss after
-`start` returns, cancelling the started driver exactly once and only then resuming with the
-loser's error, so the driver is never cancelled before its start side effect and no connection
-activity begins after a losing resume; a loser that wins after `start` has returned performs
+`start` returns, cancelling the started driver exactly once, only then resuming with the
+loser's error, and only after that completing any `close()` callers parked on the pending
+teardown — so the driver is never cancelled before its start side effect, no connection
+activity begins after a losing resume, and `close()` never returns while the committed start
+(or its cancel) is still pending; a loser that wins after `start` has returned performs
 the single cancel/release and resume itself. It SHALL handle
 every `NWConnection` state explicitly — `.setup`/`.preparing` (progress), `.waiting`
 (non-terminal; record the error and keep waiting), `.ready` (success), `.failed` (mapped
@@ -139,6 +141,18 @@ connecting → `POSIXError(.ECONNABORTED)`; deadline expiry → `POSIXError(.ETI
 - **THEN** nothing is cancelled inside that window; after `start` returns, the started driver
   is cancelled exactly once and `connect` throws the loser's mapped error only after the
   cancel — no connection activity begins after the losing resume
+- **AND** any `close()` call made while that teardown is pending — whether it is the loss's
+  owner or arrived after another loser parked the loss — SHALL NOT return until the started
+  driver has been cancelled, so a parked committed start (or its cancel) can never fire after
+  `close()` has returned
+
+#### Scenario: Concurrent closes during a pending committed-start teardown
+
+- **WHEN** two or more `close()` calls race the commit-to-start window (or each other) while
+  the committed start's teardown is pending
+- **THEN** every `close()` caller waits for the same single teardown, the started driver is
+  cancelled exactly once, and the connect continuation is resumed exactly once with
+  `POSIXError(.ECONNABORTED)`
 
 #### Scenario: Deadline expiry
 
@@ -260,7 +274,13 @@ peer-originated graceful EOF — matching `TCPTransportApple` so the `TransportB
 identical teardown signal on both conformers), release all resources, and SHALL be safe to call multiple
 times and concurrently with in-flight operations. Because the cause is recorded first, the
 `.cancelled` state event produced by `close()`'s own `NWConnection.cancel()` SHALL never be
-treated as abnormal transport loss.
+treated as abnormal transport loss. `close()` SHALL NOT complete while a committed driver
+start's **parked-loss** teardown is still pending (the commit-to-start window, design D7):
+every `close()` call — first, repeated, or concurrent — waits for that teardown, so once any
+`close()` has returned, no parked start, cancel, or close-owned resource release remains
+outstanding. In the one committed-start case with no parked loss (`.ready` won while `start()`
+had not yet returned), no wait is needed: the start side effect has already happened and
+`close()` cancels the driver itself before returning (design D7).
 
 The post-`close()` contract is deliberately asymmetric between the two directions, and SHALL use
 the same error and EOF signals as `TCPTransportApple` so `TransportBridge` sees the same teardown

@@ -189,28 +189,40 @@ rejected for consistency and because `NWConnection` callbacks would hop executor
 - **Port defaulting**: `parseSeamEndpoint` gains the `defaultPort:` parameter described above.
   A server string with no explicit port yields UDP/443 for `.quic` (445 for `.tcp`/
   `.automatic`); an explicit valid port is preserved and honored unchanged.
-- **Port range validation — the one `.quic` check that runs *after* transport construction**:
-  the accepted port range is exactly `1...65535`. Every other value — `0`, negatives, and
-  anything above `65535` — surfaces `POSIXError(.EINVAL)`, and **no `NWConnection` is created**
-  for an invalid port. The check lives inside `NWConnectionQUICDriver.init`, not in the hoisted
-  client-side validation step, and is expressed as `UInt16(exactly: port)` plus an explicit
-  `> 0` guard: `NWEndpoint.Port` is `UInt16`-based, so a bare truncating conversion would let
-  `65536` silently become UDP/0 and `0` become a wildcard port. `UInt16(exactly:)` rejects
-  negatives and out-of-range values by construction; the `> 0` guard rejects port 0. On
-  rejection the driver stores `connection = nil` and `initError = POSIXError(.EINVAL, ...)`
-  instead of constructing an `NWConnection`.
+- **Port range validation — layered, fail-closed at both ends**: the accepted port range is
+  exactly `1...65535`. Every other value — `0`, negatives, anything above `65535`, and
+  oversized digit strings of any length — surfaces `POSIXError(.EINVAL)`; on the client path no
+  transport is constructed, and in every case **no `NWConnection` is created**. Two layers
+  enforce this:
 
-  **Why this placement is safe and intentional.** It sits at the Network.framework boundary
-  because that is where the `UInt16` constraint actually originates — the seam's own
-  `connect(host:port:)` signature is `Int`-typed and driver-neutral, and `MockTransport`/
-  `TCPTransportApple` impose no such range. Hoisting it into `SMB2Client` would duplicate a
-  Network-specific constraint in the platform-neutral policy layer and would still not protect
-  a directly-constructed `QUICTransportApple`, so the driver remains the single fail-closed
-  authority. The placement is nevertheless *architecturally notable* and is recorded here
-  because it is the only `.quic` validation that runs after transport construction, and it
-  therefore reaches the caller by a different route than the hoisted checks: the driver is
-  constructed successfully (holding only `initError`), and `start()` **synchronously** emits
-  `.failed(EINVAL)`. That emission lands inside the D7 commit-to-start window
+  1. **Hoisted endpoint validation in `SMB2Client` (before transport construction)**: after
+     `parseSeamEndpoint`, the `.quic` branch rejects any explicit port outside `1...65535`
+     with `EINVAL`, so an invalid port never reaches the transport or the `NWConnection`
+     driver factory. This is also where **parsing overflow** is rejected: `parseLeadingPort`
+     is overflow-safe by construction — digit accumulation stops once the value already
+     exceeds 65535, because no further digit can bring it back into range (bounding the
+     intermediate at 655,359) — so an arbitrarily long digit string parses to an out-of-range
+     value instead of trapping, and this guard rejects it. The parser is shared with the TCP
+     path, whose behavior is unchanged for every in-range port; out-of-range values remain
+     out-of-range (only their exact magnitude is clamped) and fail downstream identically.
+  2. **`NWConnectionQUICDriver.init` (the Network.framework boundary)**: expressed as
+     `UInt16(exactly: port)` plus an explicit `> 0` guard — `NWEndpoint.Port` is
+     `UInt16`-based, so a bare truncating conversion would let `65536` silently become UDP/0
+     and `0` become a wildcard port; `UInt16(exactly:)` rejects negatives and out-of-range
+     values by construction, and the `> 0` guard rejects port 0. On rejection the driver
+     stores `connection = nil` and `initError = POSIXError(.EINVAL, ...)` instead of
+     constructing an `NWConnection`.
+
+  **Why both layers exist.** The hoisted check makes the normative contract — `EINVAL` with no
+  transport constructed and no network factory reached — hold for the client connect path, and
+  it is the natural home for the overflow rejection because the out-of-range value originates
+  in endpoint parsing. The driver check remains the fail-closed authority for a
+  **directly-constructed** `QUICTransportApple`, whose `connect(host:port:)` is `Int`-typed
+  and bypasses client-side validation entirely. The driver placement is *architecturally
+  notable* because it is the only `.quic` validation that runs after transport construction,
+  and it therefore reaches the caller by a different route than the hoisted checks: the driver
+  is constructed successfully (holding only `initError`), and `start()` **synchronously**
+  emits `.failed(EINVAL)`. That emission lands inside the D7 commit-to-start window
   (`startPhase == .starting`), so the losing outcome is *parked* and delivered by the starting
   path's post-`start()` handoff (D7) rather than by the winner directly. This is safe precisely
   because the handoff is defined for a synchronous state emission: the lock is never held
@@ -481,10 +493,12 @@ establishment to NIOTS, while QUIC drives `NWConnection` directly. The binding r
     performs **no** effects at all: it parks `(continuation, error)` in `pendingLoss`, releases
     the stored reference, and returns. After `driver.start()` returns, the *starting path*
     consumes the parked loss and performs the whole duty exactly once — `deadline.cancel()`,
-    then `driver.cancel()`, then `continuation.resume(throwing:)`. This ordering is
+    then `driver.cancel()`, then `continuation.resume(throwing:)`, then completing any
+    `close()` callers parked on the pending teardown. This ordering is
     load-bearing: cancelling before `start()` returns would cancel a connection whose start
-    side effect has not happened, and resuming before the cancel would let connection activity
-    begin after the caller already observed the failure.
+    side effect has not happened, resuming before the cancel would let connection activity
+    begin after the caller already observed the failure, and completing close waiters any
+    earlier would let `close()` return while a driver start or cancel was still outstanding.
   - **Losing outcome, post-start (`startPhase == .started`, and the defensive `forbidden`
     case)** — the winner itself cancels the deadline timer, cancels the started driver, clears
     the stored reference and `stateUpdateHandler` (so no callback retains the transport past
@@ -495,15 +509,47 @@ establishment to NIOTS, while QUIC drives `NWConnection` directly. The binding r
   moving the cancel unconditionally back into the winning claim would reintroduce the
   cancel-before-start-side-effect defect this handoff exists to prevent.
 
-  **Accepted cost of the parked window**: because the parked duty is executed only after
-  `driver.start()` returns, a `close()` (or cancel, or deadline) that wins inside the
-  commit-to-start window returns to *its* caller before the start has fired. The connection can
-  therefore still be started and then immediately cancelled after `close()` has returned. This
-  is deliberate and is the price of never cancelling a connection before its start side effect:
-  the guarantee D7 makes is that no connection activity begins after the *losing resume* (the
-  caller of `connect` never observes a failure while the connection is still coming up), not
-  that `close()` returning implies the socket was never touched. Nothing is leaked — the same
-  handoff cancels the driver exactly once — and no continuation resumes twice.
+  **Close waiters — `close()` never returns before the parked teardown completes**: the parked
+  duty being executed only after `driver.start()` returns must not leak through `close()`'s
+  contract — `SMBTransport.close()` promises that all resources are released when it returns,
+  so a parked start (or its cancel) firing after `close()` has returned is a contract
+  violation, not an acceptable cost. The ownership invariant: **the starting path owns the single teardown;
+  a `close()` caller in that window owns nothing but a completion dependency on it.**
+  Mechanically, parking a loss (by `close()` itself, or by cancellation/deadline before
+  `close()` arrived) sets a `teardownPending` flag under the lock, and every `close()` call —
+  first, repeated, or concurrent — that observes the flag parks a waiter continuation in
+  `closeWaiters`; the starting path resumes those waiters only after it has cancelled the
+  started driver and resumed the connect continuation. Because `close()` is `async`, waiting
+  parks a continuation — no thread blocks and no lock is held across the wait, the resume, or
+  any driver call. Consequences: after any `close()` returns, no parked committed start (or
+  its cancel) remains outstanding — a driver start whose loss was parked can never fire after
+  `close()` has returned; the driver is cancelled at most once; the connect continuation
+  resumes exactly once with `ECONNABORTED` when close owns the loss; and concurrent/repeated
+  `close()` calls all observe completed teardown before returning. Task cancellation and
+  deadline expiry keep their existing rule — the connect continuation is not resumed until the
+  committed driver has been cancelled — but only `close()` additionally waits for the handoff,
+  because only `close()` carries the released-on-return promise.
+
+  The promise is scoped precisely: the one committed-start case with **no** parked loss —
+  `.ready` resolving the claim while `start()` has not yet returned — needs no waiter. There
+  the start side effect has already happened (`.ready` was emitted by it), and `close()`
+  cancels the driver itself, through the established-lifecycle branch, before returning; the
+  tail of `start()` then runs against a cancelled driver whose handlers were cleared, and can
+  neither start anything new nor deliver anywhere. So released-on-return means *no pending
+  teardown and no cancellable resource left*, not an unqualified "nothing executes afterward"
+  (the always-armed deadline timer's bounded self-expiry after a pre-schedule loss is the
+  other, equally benign, tail).
+
+  **Start runs on a dedicated queue**: the connect path invokes `driver.start()` and the
+  post-start handoff on a private serial `DispatchQueue` (`org.amsmb2.quic.start`), never on a
+  Swift cooperative-pool thread. Production cost is one queue hop before `NWConnection.start`;
+  the payoff is that the deterministic race tests can park inside `start()` (holding the
+  commit-to-start window open) while occupying only a GCD worker — the connect task itself is
+  suspended on its continuation — so the gated tests cannot starve the cooperative pool
+  regardless of its width (structurally: the only blocking wait sits on a GCD worker; the
+  suite also runs green with cooperative-pool overcommit disabled via
+  `LIBDISPATCH_COOPERATIVE_POOL_STRICT=1`, as corroborating evidence), and their bounded
+  in-driver wait turns broken coordination into a visible failure instead of a hang.
 
 **Deterministic testability — injected seams, no wall-clock, no TEST-NET dependence** (unit
 tests must not depend on how the local network stack treats unroutable addresses — routing,

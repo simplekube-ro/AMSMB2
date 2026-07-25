@@ -1292,6 +1292,14 @@ extension SMB2Client {
                 throw POSIXError(.EINVAL,
                     description: "SMB over QUIC requires a hostname, not an IP address")
             }
+            // Explicit-port range validation (design D4): only 1...65535 is valid, rejected
+            // here so an out-of-range port never constructs a transport or reaches the
+            // NWConnection driver factory (the driver independently re-rejects out-of-range
+            // ports for directly constructed transports).
+            guard (1...65535).contains(endpoint.port) else {
+                throw POSIXError(.EINVAL,
+                    description: "SMB over QUIC: invalid port \(endpoint.port)")
+            }
             // Dedicated, finite, always-armed connect deadline (design D10) — independent of
             // `self.timeout`. Validated here, before transport construction and before the
             // availability check; the transport initializer independently normalizes the same
@@ -1381,7 +1389,13 @@ extension SMB2Client {
     }
 
     /// Parses leading decimal digits from `text`, mirroring C `strtol(text, NULL, 10)`:
-    /// returns `0` when no leading digit is present.
+    /// returns `0` when no leading digit is present. Overflow-safe by construction: digits stop
+    /// accumulating once the value already exceeds 65535 — it is out of the valid port range and
+    /// no further digit can bring it back, so an arbitrarily long digit string never traps and
+    /// the result stays out-of-range for the caller's `EINVAL` rejection (the accumulated value
+    /// is bounded by 655,359). Shared with the TCP path, whose behavior is unchanged for every
+    /// in-range port; out-of-range values remain out-of-range (only their exact magnitude is
+    /// clamped) and fail downstream identically.
     private static func parseLeadingPort(_ text: Substring) -> Int {
         var port = 0
         var sawDigit = false
@@ -1389,8 +1403,9 @@ extension SMB2Client {
             guard let value = character.wholeNumberValue,
                   character.isASCII, value >= 0, value <= 9
             else { break }
-            port = port * 10 + value
             sawDigit = true
+            guard port <= 65535 else { break }
+            port = port * 10 + value
         }
         return sawDigit ? port : 0
     }

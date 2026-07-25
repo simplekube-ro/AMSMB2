@@ -96,6 +96,39 @@ final class QUICSeamConnectTests: XCTestCase, @unchecked Sendable {
         }
     }
 
+    // MARK: - Explicit-port range validation (design D4, P2 overflow regression)
+
+    /// WHEN `.quic` connects with an explicit port outside 1...65535 — including an oversized
+    /// digit string hundreds of characters long (which previously trapped in the leading-digit
+    /// parser before any range check could run) and the bracketed-host form
+    /// THEN connect throws `POSIXError(.EINVAL)` from the endpoint validation that precedes
+    /// transport construction — it never traps and never reaches a transport or the
+    /// `NWConnection` driver factory.
+    func testQuicOutOfRangeOrOversizedPortThrowsEINVALBeforeTransport() async throws {
+        let nines = String(repeating: "9", count: 300)
+        for server in [
+            "fs.example.com:\(nines)",
+            "[fs.example.com]:\(nines)",
+            "fs.example.com:65536",
+            "fs.example.com:0",
+        ] {
+            let client = try SMB2Client(timeout: 5)
+            do {
+                try await client.connect(
+                    server: server, share: "share", user: "user",
+                    transportKind: .quic, quicConfiguration: nil
+                )
+                XCTFail("out-of-range port in \(server.prefix(24))… must throw before any transport")
+            } catch let posix as POSIXError {
+                XCTAssertEqual(
+                    posix.code, .EINVAL,
+                    "out-of-range port must be EINVAL, not a trap or a connect-class error"
+                )
+            }
+            XCTAssertFalse(client.isConnected, "no seam session on a rejected port")
+        }
+    }
+
     // MARK: - Connect-timeout validation wired into the hoisted step (design D10)
 
     /// WHEN `.quic` connects with an invalid `connectTimeout` to a non-numeric host

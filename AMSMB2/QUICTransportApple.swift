@@ -84,6 +84,11 @@ public final class QUICTransportApple: SMBTransport, @unchecked Sendable {
     let connectTimeout: TimeInterval
     private let driverFactory: (_ host: String, _ port: Int, _ trust: QUICResolvedTrust) -> any QUICConnectionDriver
     private let deadline: any ConnectDeadlineScheduler
+    /// Dedicated (non-cooperative) queue for `driver.start()` and the post-start handoff, so the
+    /// call never occupies a Swift cooperative-pool thread — a driver that blocks inside
+    /// `start()` (the deterministic race tests do) parks a GCD worker only, and the connect task
+    /// suspends on its continuation instead of pinning an executor thread (design D7).
+    private let startQueue = DispatchQueue(label: "org.amsmb2.quic.start")
 
     // MARK: - Lock-guarded state (design D3)
 
@@ -119,10 +124,11 @@ public final class QUICTransportApple: SMBTransport, @unchecked Sendable {
     /// (cancel/close/failure/deadline) consults it to decide who performs the single teardown:
     /// `.notStarted` → the loser forbids the start forever and cancels nothing; `.starting` →
     /// start is committed (executing or imminent), so the loser parks its outcome in
-    /// `pendingLoss` and the starting path finishes it — cancel exactly once, then resume —
-    /// after `start()` returns, so the driver is never cancelled before its start side effect
-    /// and no connection activity begins after a losing resume; `.started` → the loser cancels
-    /// the started driver exactly once itself.
+    /// `pendingLoss` and the starting path finishes it — cancel exactly once, then resume,
+    /// then complete any parked `close()` callers — after `start()` returns, so the driver is
+    /// never cancelled before its start side effect, no connection activity begins after a
+    /// losing resume, and `close()` never returns while that teardown is pending; `.started` →
+    /// the loser cancels the started driver exactly once itself.
     private enum StartPhase {
         case notStarted
         case starting
@@ -134,6 +140,14 @@ public final class QUICTransportApple: SMBTransport, @unchecked Sendable {
     /// A losing outcome that won while `startPhase == .starting`; consumed exactly once by the
     /// starting path's post-`start()` handoff.
     private var pendingLoss: (continuation: CheckedContinuation<Void, any Error>, error: any Error)?
+    /// `true` from the moment a losing outcome is parked in `pendingLoss` until the post-start
+    /// handoff has cancelled the started driver and resumed the connect continuation. While set,
+    /// `close()` parks in `closeWaiters` instead of returning — `SMBTransport.close()` promises
+    /// all resources are released when it returns, so no driver start (or cancel) may still be
+    /// pending at that point (design D7).
+    private var teardownPending = false
+    /// `close()` callers parked until a pending committed-start teardown completes (design D7).
+    private var closeWaiters: [CheckedContinuation<Void, Never>] = []
     /// Last `.waiting` error, folded into the `ETIMEDOUT` description on deadline expiry.
     private var lastWaitingError: POSIXError?
     /// `true` once `.ready` won the connect claim — gates `receive()`'s never-connected `ENOTCONN`.
@@ -245,22 +259,37 @@ public final class QUICTransportApple: SMBTransport, @unchecked Sendable {
                     return true
                 }
                 guard mayStart else { return } // winner already resumed the continuation.
-                driver.start(
-                    onState: { [weak self] state in self?.handleState(state) },
-                    onReceive: { [weak self] result in self?.handleReceive(result) }
-                )
-                // Post-start handoff: finish a loss that won while start was committed. Exactly
-                // one cancel of the started driver, and the continuation resumes only after it.
-                let loss = lock.withLock {
-                    () -> (continuation: CheckedContinuation<Void, any Error>, error: any Error)? in
-                    startPhase = .started
-                    defer { pendingLoss = nil }
-                    return pendingLoss
-                }
-                if let loss {
-                    deadline.cancel()
-                    driver.cancel()
-                    loss.continuation.resume(throwing: loss.error)
+                // The start + post-start handoff runs on the dedicated start queue (never a
+                // cooperative thread); the connect task suspends on the continuation meanwhile.
+                startQueue.async { [self] in
+                    driver.start(
+                        onState: { [weak self] state in self?.handleState(state) },
+                        onReceive: { [weak self] result in self?.handleReceive(result) }
+                    )
+                    // Post-start handoff: finish a loss that won while start was committed —
+                    // exactly one cancel of the started driver, the continuation resumes only
+                    // after it, and only then are parked `close()` callers completed (so a
+                    // returned `close()` proves no start or cancel is still pending).
+                    let loss = lock.withLock {
+                        () -> (continuation: CheckedContinuation<Void, any Error>, error: any Error)? in
+                        startPhase = .started
+                        defer { pendingLoss = nil }
+                        return pendingLoss
+                    }
+                    if let loss {
+                        deadline.cancel()
+                        driver.cancel()
+                        loss.continuation.resume(throwing: loss.error)
+                    }
+                    let waiters: [CheckedContinuation<Void, Never>] = lock.withLock {
+                        teardownPending = false
+                        let waiters = closeWaiters
+                        closeWaiters = []
+                        return waiters
+                    }
+                    for waiter in waiters {
+                        waiter.resume(returning: ())
+                    }
                 }
             }
         } onCancel: {
@@ -304,6 +333,7 @@ public final class QUICTransportApple: SMBTransport, @unchecked Sendable {
             return LossDuty(continuation: continuation, error: error, driverToCancel: nil)
         case .starting:
             pendingLoss = (continuation, error) // the starting path finishes this loss.
+            teardownPending = true // close() must wait for that handoff before returning.
             driver = nil
             return nil
         case .started, .forbidden:
@@ -322,7 +352,8 @@ public final class QUICTransportApple: SMBTransport, @unchecked Sendable {
     /// - losing outcome, pre-commit → this path forbids the start, cancels the deadline timer,
     ///   and resumes; there is no driver to cancel.
     /// - losing outcome in the commit-to-start window → this path performs NOTHING; the loss is
-    ///   parked and the starting path cancels the deadline timer and the driver, then resumes.
+    ///   parked and the starting path cancels the deadline timer and the driver, then resumes,
+    ///   then completes any `close()` callers parked on the pending teardown.
     /// - losing outcome post-start → this path cancels the deadline timer and the driver itself.
     ///
     /// So the deadline timer is cancelled exactly once, but NOT always by the winner — moving the
@@ -555,26 +586,36 @@ public final class QUICTransportApple: SMBTransport, @unchecked Sendable {
     /// `NWConnection.cancel()`, so the resulting `.cancelled` state event is never misread as
     /// abnormal loss (design D8); resumes a parked `receive()` with empty `Data` (the local-close
     /// EOF signal, matching `TCPTransportApple.signalClosed()`), and releases resources.
+    ///
+    /// `SMBTransport.close()` promises resources are released when it returns, so this never
+    /// completes while a committed `driver.start()` whose loss was parked is still awaiting its
+    /// teardown: every path — including repeated/concurrent `close()` calls — waits for the
+    /// post-start handoff to finish that teardown before returning (design D7). The one
+    /// committed-start case with no parked loss (`.ready` won while `start()` had not yet
+    /// returned) needs no wait: the start side effect has already happened — `.ready` was
+    /// emitted by it — and `close()` cancels the driver itself before returning, leaving only
+    /// the tail of `start()` running against a cancelled driver with cleared handlers.
     public func close() async {
         enum Action {
-            case noop
+            case none
             case abortConnect(LossDuty)
             case teardown(CheckedContinuation<Data, any Error>?, (any QUICConnectionDriver)?)
         }
         let action: Action = lock.withLock {
             if isClosed {
-                return .noop
+                return .none
             }
             isClosed = true
             if case .connecting(let continuation) = connectState {
                 // close() while connecting wins the connect claim → ECONNABORTED (design D7).
                 // A nil duty means the loss landed in the commit-to-start window and was parked
-                // for the starting path's handoff — close() then performs no teardown itself.
+                // for the starting path's handoff — close() performs no teardown itself, but
+                // waits below until that handoff has completed it.
                 guard let duty = consumeLossClaimLocked(
                     continuation,
                     error: POSIXError(.ECONNABORTED, description: "QUIC connect aborted by close()")
                 ) else {
-                    return .noop
+                    return .none
                 }
                 return .abortConnect(duty)
             }
@@ -590,8 +631,8 @@ public final class QUICTransportApple: SMBTransport, @unchecked Sendable {
             return .teardown(waiter, toCancel)
         }
         switch action {
-        case .noop:
-            return
+        case .none:
+            break
         case .abortConnect(let duty):
             deadline.cancel()
             duty.driverToCancel?.cancel()
@@ -600,6 +641,24 @@ public final class QUICTransportApple: SMBTransport, @unchecked Sendable {
             toCancel?.cancel()
             waiter?.resume(returning: Data()) // local-close EOF signal (empty Data).
         }
+        // Wait for a pending committed-start teardown (this close's own parked loss, one parked
+        // earlier by cancellation/deadline, or one an earlier close() is already waiting on).
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            let parked: Bool = lock.withLock {
+                guard teardownPending else { return false }
+                closeWaiters.append(continuation)
+                return true
+            }
+            if !parked {
+                continuation.resume(returning: ()) // no pending teardown — nothing to wait for.
+            }
+        }
+    }
+
+    /// Test observability (internal, like `connectTimeout`): how many `close()` callers are
+    /// currently parked awaiting a pending committed-start teardown.
+    var pendingCloseWaiterCount: Int {
+        lock.withLock { closeWaiters.count }
     }
 
     // MARK: - Trust resolution (design D5)

@@ -141,6 +141,11 @@ final class ImmediateFireScheduler: ConnectDeadlineScheduler, @unchecked Sendabl
 /// releases it. This exposes the exact window after the transport has committed the claim toward
 /// starting the driver but before the driver performs its start side effect, and records the
 /// start/cancel event order so tests can prove "cancel happens exactly once, strictly after start".
+///
+/// The park never blocks a Swift cooperative thread: the transport invokes `start()` on its
+/// dedicated (non-cooperative) start queue, so this wait occupies a GCD worker only. The wait is
+/// **bounded** — if coordination breaks, a `"start-timeout"` event is recorded and `start()`
+/// returns, so the test fails with a visible diagnostic instead of hanging the run.
 final class GatedStartDriver: QUICConnectionDriver, @unchecked Sendable {
     private let lock = NSLock()
     private let entered = TestFlag()
@@ -152,7 +157,10 @@ final class GatedStartDriver: QUICConnectionDriver, @unchecked Sendable {
         onReceive _: @escaping @Sendable (Result<Data, POSIXError>) -> Void
     ) {
         entered.set()
-        release.wait() // park before the start side effect; the test owns this window.
+        // Park before the start side effect; the test owns this window (bounded, see above).
+        if release.wait(timeout: .now() + 10) == .timedOut {
+            lock.withLock { _events.append("start-timeout") }
+        }
         lock.withLock { _events.append("start") }
     }
 
@@ -166,6 +174,12 @@ final class GatedStartDriver: QUICConnectionDriver, @unchecked Sendable {
 
     func releaseStart() {
         release.signal() // signal() is async-safe (only wait() is not).
+    }
+
+    /// Appends a test-owned marker (e.g. `"close-returned"`) to the same ordered event stream,
+    /// so caller-visible completions can be ordered against `start`/`cancel`.
+    func record(_ event: String) {
+        lock.withLock { _events.append(event) }
     }
 
     var didEnterStart: Bool { entered.isSet }
@@ -346,28 +360,24 @@ final class QUICTransportAppleTests: XCTestCase, @unchecked Sendable {
     }
 
     /// Cancellation before start: the connect throws `CancellationError` and never starts the
-    /// driver (no `NWConnection` is created). Deterministic via a gated driver factory.
+    /// driver (no `NWConnection` is created). Deterministic — and free of any parking — because
+    /// the driver factory runs on the connect task itself, in exactly the window between
+    /// `Task.checkCancellation()` and the continuation store: cancelling the current task there
+    /// exercises the store's cancellation re-check at any executor width.
     func testCancellationBeforeStartThrowsAndNeverStartsDriver() async {
         let driver = ScriptedQUICDriver()
         let scheduler = ManualDeadlineScheduler()
-        let factoryEntered = TestFlag()
-        let releaseFactory = DispatchSemaphore(value: 0)
         let transport = QUICTransportApple(
             configuration: SMBQUICConfiguration(),
             connectTimeout: 30,
             driverFactory: { _, _, _ in
-                factoryEntered.set()
-                releaseFactory.wait() // hold connect between checkCancellation and the store.
+                withUnsafeCurrentTask { $0?.cancel() }
                 return driver
             },
             deadline: scheduler
         )
 
         let task = Task { try await transport.connect(host: "h", port: 443) }
-        await waitUntil({ factoryEntered.isSet }, "factory entered")
-        task.cancel()
-        releaseFactory.signal() // signal() is async-safe (only wait() is not).
-
         do {
             try await task.value
             XCTFail("cancel before start must throw")
@@ -512,16 +522,30 @@ final class QUICTransportAppleTests: XCTestCase, @unchecked Sendable {
     }
 
     /// Regression (P1): `close()` that wins the claim in the commit-to-start gap must not cancel
-    /// in that window — the starting path finishes the loss after `start()` returns: exactly one
-    /// `cancel()`, strictly after the start side effect, and `connect` throws `ECONNABORTED`
-    /// only after the cancel (no network activity begins after a losing resume).
-    func testCloseInCommitToStartGapCancelsAfterStartExactlyOnce() async {
+    /// in that window (the starting path finishes the loss after `start()` returns) — **and must
+    /// not complete** until that teardown has run: `SMBTransport.close()` promises resources are
+    /// released when it returns, so the parked committed start (and its cancel) may never fire
+    /// after `close()` has returned. Proven by ordering `close-returned` in the same
+    /// event stream as `start`/`cancel`.
+    func testCloseInCommitToStartGapWaitsForTeardownAndCancelsAfterStartOnce() async {
         let driver = GatedStartDriver()
         let transport = makeGatedTransport(driver, ManualDeadlineScheduler())
 
         let task = Task { try await transport.connect(host: "h", port: 443) }
         await waitUntil({ driver.didEnterStart }, "transport committed toward start")
-        await transport.close() // loser in the gap; must neither block nor cancel here.
+
+        let closeDone = TestFlag()
+        let closeTask = Task {
+            await transport.close() // loser in the gap; must park until the handoff tears down.
+            driver.record("close-returned")
+            closeDone.set()
+        }
+        await waitUntil(
+            { transport.pendingCloseWaiterCount == 1 }, "close parked awaiting teardown"
+        )
+        XCTAssertFalse(
+            closeDone.isSet, "close() must not complete while the committed start is still gated"
+        )
         XCTAssertEqual(driver.events, [], "no cancel may precede the driver's start side effect")
 
         driver.releaseStart()
@@ -533,9 +557,95 @@ final class QUICTransportAppleTests: XCTestCase, @unchecked Sendable {
         } catch {
             XCTFail("expected POSIXError(.ECONNABORTED), got \(error)")
         }
+        await closeTask.value
+        // All tasks are joined and the transport holds no further path to the driver, so this
+        // final snapshot is exhaustive: start happened exactly once, cancel exactly once and
+        // strictly after start, and close() returned only after the cancel.
+        XCTAssertEqual(
+            driver.events, ["start", "cancel", "close-returned"],
+            "close() may return only after the committed start was performed and cancelled"
+        )
+    }
+
+    /// Regression (P1): two concurrent `close()` callers racing the same commit-to-start gap
+    /// must BOTH wait for the same teardown, and the teardown still cancels exactly once.
+    func testConcurrentClosesInCommitToStartGapBothWaitForTeardownOneCancel() async {
+        let driver = GatedStartDriver()
+        let transport = makeGatedTransport(driver, ManualDeadlineScheduler())
+
+        let task = Task { try await transport.connect(host: "h", port: 443) }
+        await waitUntil({ driver.didEnterStart }, "transport committed toward start")
+
+        let firstDone = TestFlag()
+        let secondDone = TestFlag()
+        let firstClose = Task {
+            await transport.close()
+            firstDone.set()
+        }
+        let secondClose = Task {
+            await transport.close()
+            secondDone.set()
+        }
+        await waitUntil(
+            { transport.pendingCloseWaiterCount == 2 }, "both close callers parked"
+        )
+        XCTAssertFalse(firstDone.isSet, "first close must wait for the pending teardown")
+        XCTAssertFalse(secondDone.isSet, "second close must wait for the same pending teardown")
+        XCTAssertEqual(driver.events, [], "no cancel may precede the driver's start side effect")
+
+        driver.releaseStart()
+        do {
+            try await task.value
+            XCTFail("close in the commit-to-start gap must fail the connect")
+        } catch let posix as POSIXError {
+            XCTAssertEqual(posix.code, .ECONNABORTED, "connect aborts exactly once with ECONNABORTED")
+        } catch {
+            XCTFail("expected POSIXError(.ECONNABORTED), got \(error)")
+        }
+        await firstClose.value
+        await secondClose.value
         XCTAssertEqual(
             driver.events, ["start", "cancel"],
-            "start committed first → started driver cancelled exactly once, after start"
+            "one teardown serves both close callers: exactly one cancel, after start"
+        )
+    }
+
+    /// Regression (P1): when task cancellation (not close) parked the loss in the gap, a
+    /// subsequent `close()` must still wait for the committed start's teardown — otherwise the
+    /// driver would start after `close()` returned even though close never owned the claim.
+    func testCloseAfterCancelParkedLossWaitsForTeardown() async {
+        let driver = GatedStartDriver()
+        let transport = makeGatedTransport(driver, ManualDeadlineScheduler())
+
+        let task = Task { try await transport.connect(host: "h", port: 443) }
+        await waitUntil({ driver.didEnterStart }, "transport committed toward start")
+        task.cancel() // parks the loss in the gap; teardown is now pending.
+
+        let closeDone = TestFlag()
+        let closeTask = Task {
+            await transport.close()
+            driver.record("close-returned")
+            closeDone.set()
+        }
+        await waitUntil(
+            { transport.pendingCloseWaiterCount == 1 }, "close parked behind the cancel's teardown"
+        )
+        XCTAssertFalse(closeDone.isSet, "close must wait even when another loser parked the loss")
+        XCTAssertEqual(driver.events, [], "no cancel may precede the driver's start side effect")
+
+        driver.releaseStart()
+        do {
+            try await task.value
+            XCTFail("cancellation in the commit-to-start gap must fail the connect")
+        } catch is CancellationError {
+            // Expected.
+        } catch {
+            XCTFail("expected CancellationError, got \(error)")
+        }
+        await closeTask.value
+        XCTAssertEqual(
+            driver.events, ["start", "cancel", "close-returned"],
+            "close() returns only after the committed start was performed and cancelled"
         )
     }
 

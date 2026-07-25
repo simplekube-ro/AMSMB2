@@ -109,9 +109,16 @@ layer that would reject a numeric target under an insecure trust policy.
 
 When `.quic` is selected and the server string carries no explicit port, the client SHALL
 default to port 443. An explicit port in the server string SHALL be honored unchanged. Only
-ports 1...65535 are valid: an out-of-range explicit port (0, negative, or greater than 65535)
-SHALL produce `POSIXError(.EINVAL)` and SHALL NOT create an `NWConnection` — in particular a
-port above 65535 must never silently truncate to UDP/0. TCP default remains 445.
+ports 1...65535 are valid: an out-of-range explicit port (0, negative, or greater than 65535 —
+with no upper bound on the digit string's length) SHALL produce `POSIXError(.EINVAL)` from the
+endpoint validation that precedes transport construction, SHALL NOT construct a transport or
+reach the `NWConnection` driver factory on the client connect path, and SHALL NOT create an
+`NWConnection` — in particular a port above 65535 must never silently truncate to UDP/0.
+Endpoint parsing SHALL never trap on an oversized port: digit accumulation stops once the
+value is already out of the valid range (no later digit can make it valid again), so an
+arbitrarily long digit string parses to an out-of-range value and is rejected with `EINVAL`
+like any other. TCP default remains 445, and TCP parsing behavior is unchanged for every
+in-range port.
 
 #### Scenario: Default port
 
@@ -127,8 +134,16 @@ port above 65535 must never silently truncate to UDP/0. TCP default remains 445.
 
 - **WHEN** connecting with `.quic` and an explicit port outside 1...65535 (0, negative, or
   65536 and larger)
-- **THEN** connect throws `POSIXError(.EINVAL)` and no `NWConnection` is created (boundary
+- **THEN** connect throws `POSIXError(.EINVAL)` before any transport is constructed, no
+  `NWConnection` driver factory is reached, and no `NWConnection` is created (boundary
   ports 1 and 65535 remain accepted and preserved unchanged)
+
+#### Scenario: Oversized explicit port never traps
+
+- **WHEN** connecting with `.quic` (plain or bracketed host form) and an explicit port of
+  hundreds of digits (for example `fs.example.com:` followed by 300 `9`s)
+- **THEN** endpoint parsing does not trap or crash, connect throws `POSIXError(.EINVAL)`
+  before any transport is constructed, and no `NWConnection` driver factory is reached
 
 ### Requirement: QUIC connect timeout is dedicated, finite, and always armed
 
