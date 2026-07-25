@@ -33,7 +33,13 @@ import NIOTransportServices
 
 /// An `SMBTransport` backed by NIOTransportServices (Network.framework) on Apple platforms.
 ///
-/// One instance maps to one TCP connection lifetime. After `close()` the instance is
+/// One instance maps to one TCP connection lifetime, and `connect(host:port:)` is strictly
+/// **one-shot**: the first call atomically reserves the instance's single connect attempt,
+/// and every other call is rejected deterministically without creating a bootstrap or any
+/// network activity — `POSIXError(.EALREADY)` while the attempt is in flight or after it
+/// failed (retry after a failed attempt is NOT supported; build a fresh transport, as
+/// `SMB2Client` does), `POSIXError(.EISCONN)` once connected, and the existing
+/// `POSIXError(.ENOTCONN)` after `close()` (checked first). After `close()` the instance is
 /// unusable; create a fresh one to reconnect.
 ///
 /// Thread-safety: all mutable state is guarded by `NSLock`. Conforms to `Sendable`
@@ -52,10 +58,24 @@ public final class TCPTransportApple: SMBTransport, @unchecked Sendable {
     private var _connectingChannel: (any Channel)?
     /// Set when the in-flight connect is cancelled. If `onCancel` fires before the
     /// `channelInitializer` has run, the initializer observes this and closes the channel
-    /// immediately. Guarded by `lock`.
+    /// immediately. Never reset — it latches for the lifetime of the instance's single
+    /// one-shot attempt. Guarded by `lock`.
     private var _connectCancelled = false
     /// Set by `close()` to prevent re-use after teardown. Guarded by `lock`.
     private var _isClosed = false
+    /// One-shot connect attempt state (mirrors `QUICTransportApple`'s reservation): `connect`
+    /// may only transition `.idle → .inFlight`, so exactly one call ever owns the attempt;
+    /// every other call is rejected by the state it observes (`.inFlight`/`.failed` →
+    /// `EALREADY`, `.connected` → `EISCONN`) without creating a bootstrap or touching the
+    /// owning attempt's channel. Guarded by `lock`.
+    private enum ConnectAttempt {
+        case idle
+        case inFlight
+        case connected
+        case failed
+    }
+
+    private var _connectAttempt: ConnectAttempt = .idle
     private let lock = NSLock()
     /// Accumulates inbound bytes from the NIO channel for async `receive()` calls.
     private let inboundHandler = InboundBufferingHandler()
@@ -90,15 +110,28 @@ public final class TCPTransportApple: SMBTransport, @unchecked Sendable {
     /// NIO bootstrap is still connecting, the underlying NWConnection is closed as
     /// soon as it becomes available and `POSIXError(.ECANCELED)` is thrown.
     public func connect(host: String, port: Int) async throws {
-        // Guard: re-use after close() is not supported. Reset the per-attempt cancel state so a
-        // fresh connect never inherits a latched flag from a prior cancelled attempt (which would
-        // otherwise make this attempt's channelInitializer close the channel immediately).
-        let isClosed: Bool = lock.withLock {
-            if !_isClosed { _connectCancelled = false }
-            return _isClosed
-        }
-        guard !isClosed else {
-            throw POSIXError(.ENOTCONN, description: "TCPTransportApple: transport is closed")
+        // One-shot attempt reservation (atomic; before any bootstrap work). The closed guard
+        // keeps its existing contract and precedence. In `.idle` on an open transport,
+        // `_connectCancelled` cannot be set (its only writers are an in-flight attempt's
+        // onCancel — which requires the reservation — and `close()`, which latches
+        // `_isClosed`), so no per-attempt reset is needed.
+        try lock.withLock {
+            guard !_isClosed else {
+                throw POSIXError(.ENOTCONN, description: "TCPTransportApple: transport is closed")
+            }
+            switch _connectAttempt {
+            case .idle:
+                _connectAttempt = .inFlight
+            case .inFlight:
+                throw POSIXError(.EALREADY, description: "TCPTransportApple: connect already in progress")
+            case .connected:
+                throw POSIXError(.EISCONN, description: "TCPTransportApple: already connected")
+            case .failed:
+                throw POSIXError(
+                    .EALREADY,
+                    description: "TCPTransportApple: one-shot connect attempt already consumed"
+                )
+            }
         }
 
         let bootstrap = NIOTSConnectionBootstrap(group: group)
@@ -165,12 +198,22 @@ public final class TCPTransportApple: SMBTransport, @unchecked Sendable {
                 throw POSIXError(.ECANCELED)
             }
 
-            lock.withLock { _channel = channel }
-        } catch is CancellationError {
-            throw POSIXError(.ECANCELED)
-        } catch let posix as POSIXError {
-            throw posix
+            // Publish the channel and consume the one-shot attempt in the same critical
+            // section, so no observer sees a connected transport still reporting in-flight.
+            lock.withLock {
+                _channel = channel
+                _connectAttempt = .connected
+            }
         } catch {
+            // Every failure path consumes the one-shot attempt (retry is unsupported), then
+            // applies the pre-existing error mapping unchanged.
+            lock.withLock { _connectAttempt = .failed }
+            if error is CancellationError {
+                throw POSIXError(.ECANCELED)
+            }
+            if let posix = error as? POSIXError {
+                throw posix
+            }
             // If the task was cancelled, the onCancel handler may have closed the channel
             // before the future completed, causing a ChannelError rather than CancellationError.
             // Honour cancellation semantics by checking the flag here.

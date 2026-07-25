@@ -6,6 +6,7 @@
 
 ## QUIC transport
 - quic-transport-review.md — add-quic-transport gate history + verified D7/port/ENOTCONN code facts; 7th review 2026-07-25 = APPROVED (conditions cleared).
+- tcp-one-shot-connect-review.md — fix-tcp-one-shot-connect APPROVED 2026-07-25 (conditions cleared); delta-spec must append not restate; mutation-check recipe; 127.0.0.1:1 never fast-refuses on NIOTS.
 
 ## Concurrency / Swift 6
 - swift6-strict-concurrency-context.md — swift:6.1 Linux hard-errors on @Sendable captures macOS only warns on; local cbPtr construction + nonisolated(unsafe) for must-cross handler & queueKey. FINAL REVIEW 2026-06-27: 5 fixes correct & race-safe (retain/release 1:1, no UAF/double-free); confirmed FIRST-HAND macOS Context.swift recompile clean + make linuxtest exit 0 (114 tests/50 skip/0 fail). C2b test-portability fixes (2 test files) accepted into this change. proposal.md Non-Goal still wrongly says "confined to Context.swift" — must reconcile before archive.

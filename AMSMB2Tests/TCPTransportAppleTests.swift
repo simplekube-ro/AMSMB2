@@ -22,6 +22,7 @@
 
 #if canImport(Network)
 
+import Network
 import XCTest
 
 @testable import AMSMB2
@@ -234,6 +235,177 @@ final class TCPTransportAppleTests: XCTestCase, @unchecked Sendable {
             // Expected: onCancel fired and resumed the continuation with CancellationError.
         } catch {
             XCTFail("Expected CancellationError, got \(type(of: error)): \(error)")
+        }
+    }
+
+    // MARK: - One-shot connect ownership (mirrors QUICTransportApple)
+
+    /// Starts a real TCP listener on an ephemeral 127.0.0.1 port and retains accepted
+    /// connections so the transport's channel stays alive for the duration of a test.
+    /// Bounded: if the listener never becomes ready within 5 s the continuation throws.
+    private func startLocalListener() async throws -> (NWListener, LockedBox<[NWConnection]>, Int) {
+        let listener = try NWListener(using: .tcp, on: .any)
+        let retained = LockedBox<[NWConnection]>([])
+        listener.newConnectionHandler = { connection in
+            retained.mutate { $0.append(connection) }
+            connection.start(queue: DispatchQueue(label: "test.tcp.listener.connection"))
+        }
+        let queue = DispatchQueue(label: "test.tcp.listener")
+        let port: Int = try await withCheckedThrowingContinuation { continuation in
+            let resumed = LockedBox<Bool>(false)
+            let resumeOnce: @Sendable (Result<Int, any Error>) -> Void = { result in
+                var first = false
+                resumed.mutate { alreadyResumed in
+                    if !alreadyResumed {
+                        alreadyResumed = true
+                        first = true
+                    }
+                }
+                guard first else { return }
+                continuation.resume(with: result)
+            }
+            listener.stateUpdateHandler = { state in
+                switch state {
+                case .ready:
+                    resumeOnce(.success(Int(listener.port?.rawValue ?? 0)))
+                case .failed(let error):
+                    resumeOnce(.failure(error))
+                default:
+                    break
+                }
+            }
+            queue.asyncAfter(deadline: .now() + 5) {
+                resumeOnce(.failure(POSIXError(.ETIMEDOUT, description: "listener never became ready")))
+            }
+            listener.start(queue: queue)
+        }
+        XCTAssertNotEqual(port, 0, "listener must report a real ephemeral port")
+        return (listener, retained, port)
+    }
+
+    /// WHEN a second connect() races a first call whose attempt is still in flight
+    /// THEN the second call fails promptly with EALREADY (no second bootstrap, bounded well
+    /// under the connect timeout) and the owning attempt proceeds unaffected.
+    ///
+    /// The first connect targets TEST-NET-1 (the file's established pending-connect pattern).
+    /// On hosts that fast-fail the reserved address, the first attempt has already consumed
+    /// the one shot as `.failed` — which also maps to EALREADY, so the assertion holds in
+    /// both environments (which is why in-flight and after-failure share an error code).
+    func testSecondConnectWhileAttemptInFlightThrowsEALREADYPromptly() async {
+        let transport = TCPTransportApple(connectTimeoutSeconds: 3)
+        defer { Task { await transport.close() } }
+
+        let firstTask: Task<Void, any Error> = Task {
+            try await transport.connect(host: "192.0.2.1", port: 445)
+        }
+        // Let the first connect take the reservation and get in flight.
+        try? await Task.sleep(nanoseconds: 150_000_000) // 150 ms
+
+        let start = Date()
+        do {
+            try await transport.connect(host: "192.0.2.1", port: 445)
+            XCTFail("second connect must be rejected, not attempted")
+        } catch let posix as POSIXError {
+            XCTAssertEqual(posix.code, .EALREADY, "second connect must fail with EALREADY")
+        } catch {
+            XCTFail("expected POSIXError(.EALREADY), got \(type(of: error)): \(error)")
+        }
+        XCTAssertLessThan(
+            Date().timeIntervalSince(start), 1.5,
+            "the rejection must be prompt — a slow failure means a second bootstrap ran"
+        )
+
+        firstTask.cancel()
+        do {
+            try await firstTask.value
+            XCTFail("first connect to a black-holed endpoint must throw")
+        } catch {
+            // Any error is fine (ECANCELED, or a fast-fail network error) — the point is the
+            // owning attempt completed on its own terms, unaffected by the rejected call.
+        }
+    }
+
+    /// WHEN connect() is called after a previous call connected successfully
+    /// THEN it fails promptly with EISCONN and the established channel remains installed and
+    /// usable for send() — the rejected call must not replace or leak the live channel.
+    func testConnectAfterConnectedThrowsEISCONNAndKeepsChannelUsable() async throws {
+        let (listener, retained, port) = try await startLocalListener()
+        defer {
+            listener.cancel()
+            retained.value.forEach { $0.cancel() }
+        }
+
+        let transport = TCPTransportApple(connectTimeoutSeconds: 5)
+        defer { Task { await transport.close() } }
+        try await transport.connect(host: "127.0.0.1", port: port)
+
+        do {
+            try await transport.connect(host: "127.0.0.1", port: port)
+            XCTFail("connect after an established connection must be rejected")
+        } catch let posix as POSIXError {
+            XCTAssertEqual(posix.code, .EISCONN, "connect after connected must fail with EISCONN")
+        } catch {
+            XCTFail("expected POSIXError(.EISCONN), got \(type(of: error)): \(error)")
+        }
+
+        // The original channel must still be usable — the rejected call touched nothing.
+        try await transport.send(Data("still-usable".utf8))
+    }
+
+    /// WHEN the first connect attempt failed and connect() is called again
+    /// THEN the call fails promptly with EALREADY — retry after failure is unsupported
+    /// (one instance per connection lifetime; build a fresh transport instead). The
+    /// elapsed-time bound proves no second network attempt ran.
+    func testConnectAfterFailedAttemptThrowsEALREADYPromptly() async {
+        let transport = TCPTransportApple(connectTimeoutSeconds: 2)
+        defer { Task { await transport.close() } }
+
+        do {
+            try await transport.connect(host: "127.0.0.1", port: 1) // refused-port pattern.
+            XCTFail("connect to a refused port must throw")
+        } catch {
+            // Expected — any network-layer failure consumes the one-shot attempt.
+        }
+
+        let start = Date()
+        do {
+            try await transport.connect(host: "127.0.0.1", port: 1)
+            XCTFail("retry after a failed attempt must be rejected")
+        } catch let posix as POSIXError {
+            XCTAssertEqual(posix.code, .EALREADY, "retry after failure must fail with EALREADY")
+        } catch {
+            XCTFail("expected POSIXError(.EALREADY), got \(type(of: error)): \(error)")
+        }
+        XCTAssertLessThan(
+            Date().timeIntervalSince(start), 1.0,
+            "the rejection must be prompt — a slow failure means a second bootstrap ran"
+        )
+    }
+
+    /// WHEN connect() is called after close(), even when an attempt had already failed
+    /// THEN it throws ENOTCONN — the conformer's existing closed-transport contract takes
+    /// precedence over the one-shot attempt state. (Contract-preservation guard: this
+    /// passes before and after the one-shot change; it pins the error-precedence order.)
+    func testConnectAfterCloseThrowsENOTCONNEvenAfterFailedAttempt() async {
+        let transport = TCPTransportApple(connectTimeoutSeconds: 2)
+        do {
+            try await transport.connect(host: "127.0.0.1", port: 1)
+            XCTFail("connect to a refused port must throw")
+        } catch {
+            // Expected.
+        }
+        await transport.close()
+
+        do {
+            try await transport.connect(host: "127.0.0.1", port: 445)
+            XCTFail("connect after close must throw")
+        } catch let posix as POSIXError {
+            XCTAssertEqual(
+                posix.code, .ENOTCONN,
+                "closed contract wins over attempt state: expected ENOTCONN, got \(posix.code)"
+            )
+        } catch {
+            XCTFail("expected POSIXError(.ENOTCONN), got \(type(of: error)): \(error)")
         }
     }
 

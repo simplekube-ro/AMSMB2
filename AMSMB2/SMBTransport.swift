@@ -36,10 +36,12 @@ public protocol SMBTransport: Sendable {
     ///
     /// An instance represents a single connection lifetime: callers create a
     /// fresh transport per connection (as `SMB2Client` does) rather than
-    /// reusing one across connects. Conformers should document their own
-    /// rejection behavior for repeated calls — `QUICTransportApple` is
-    /// strictly one-shot and rejects every call after the first
-    /// deterministically (`EALREADY`/`EISCONN`/`ECONNABORTED`).
+    /// reusing one across connects. Both in-tree conformers are strictly
+    /// one-shot and reject every call after the first deterministically:
+    /// `EALREADY` while an attempt is in flight or after a failed attempt,
+    /// `EISCONN` once connected, and — deliberately keeping each conformer's
+    /// pre-existing closed contract — `ECONNABORTED` after `close()` on
+    /// `QUICTransportApple` versus `ENOTCONN` on `TCPTransportApple`.
     func connect(host: String, port: Int) async throws
 
     /// Sends `bytes` to the remote peer.
