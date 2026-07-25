@@ -42,8 +42,8 @@ the Microsoft/Samba SMB-over-QUIC interop behavior.
 - **WHEN** `connect(host:port:)` is called
 - **THEN** the QUIC security options carry ALPN `"smb"` and SNI equal to `host`
 - **AND** the connection targets UDP `port`
-- **NOTE** verified by code inspection plus the manual interop gate (tasks 4.2) — the live
-  handshake cannot run in unit tests
+- **NOTE** verified by code inspection plus the manual interop gate (completed 2026-07-24, see
+  docs/INTEROP-QUIC.md) — the live handshake cannot run in unit tests
 
 #### Scenario: Handshake failure maps to POSIXError
 
@@ -288,8 +288,13 @@ Under `.customRoots`, the transport SHALL implement this exact fail-closed seque
   a system root and matches the hostname
 - **THEN** no verify block is installed, the system default verification path runs, and the
   handshake succeeds
-- **NOTE** live-handshake half verified at the manual interop gate; the no-verify-block-installed
-  half is unit-verified
+- **NOTE** the no-verify-block-installed half is verified by the `resolveTrust` unit test
+  (`.system` resolves to a no-anchors decision carrying no verify material) plus code inspection of
+  the production driver's `.system` branch, which installs no verify block. The complementary
+  live half — system-trust **enforcement** — was completed 2026-07-24 (see docs/INTEROP-QUIC.md):
+  `.system` against the rig (whose cert chains only to the private lab CA) is rejected, proving the
+  system path runs untouched. A system-root-chained-cert *success* is not exercised because no
+  public-CA SMB-over-QUIC server is available (WS2025 deferred)
 
 #### Scenario: Default trust rejects invalid certificates
 

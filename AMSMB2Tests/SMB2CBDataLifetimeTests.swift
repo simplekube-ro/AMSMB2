@@ -144,7 +144,8 @@ final class SMB2CBDataLifetimeTests: XCTestCase, @unchecked Sendable {
         let task = Task { [client] in
             try await client!.connectWithBridge(
                 server: "testserver", share: "testshare", user: "testuser",
-                bridge: bridge
+                host: "testserver", port: 445,
+                bridge: bridge, selector: SMB2Client.seamSelector(for: .automatic)
             )
         }
 

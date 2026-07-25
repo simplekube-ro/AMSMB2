@@ -332,6 +332,10 @@ and does **not** exist on Linux. The routing there is:
 - If the snapshot kind is `.quic`, the manager throws `POSIXError(.ENOTSUP)` **before**
   constructing any transport, touching the client connect path, or attempting any network
   activity — never a silent downgrade (the no-silent-fallback rule applies to platforms too).
+  Implementation note: `POSIXErrorCode` has no `.ENOTSUP` case on Linux
+  (swift-corelibs-foundation), so the rejection bridges the C `ENOTSUP` errno through the numeric
+  `POSIXErrorCode(_ code: Int32)` initializer; on Linux that surfaces as the `EOPNOTSUPP` alias
+  of `ENOTSUP` (same errno 95), which is the Linux spelling of the same "not supported" result.
 - If the snapshot kind is `.tcp` or `.automatic`, the manager invokes the existing legacy
   client connect path (`connect(server:share:user:)`, the libsmb2-owned socket) **unchanged**.
 - No QUIC-only type that requires Network or Security frameworks leaks into Linux compilation:
@@ -442,6 +446,17 @@ a lingering `.waiting`):
   connection remains usable; when a losing outcome wins, exactly one `cancel()` was recorded.
 - TEST-NET-1 endpoints remain only as **optional integration/smoke coverage** (non-gating);
   they are not part of the required deterministic unit suite. See tasks 2.3.
+- **Coverage note (as shipped)**: the injected seams make the transport's own behavior fully
+  deterministic, but the two Context-level `.quic` *wiring* lines — constructing
+  `QUICTransportApple(configuration:connectTimeout:)` under the `#available` gate and handing it
+  the validated timeout — are not exercised by a deterministic unit test, because a validated
+  non-numeric `.quic` target proceeds to a real `NWConnection` connect (there is no
+  transport-factory seam at the `SMB2Client.connect` layer). Both *halves* are independently
+  unit-covered — the policy/validation path (`isNumericHost`, `normalizedQUICConnectTimeout`, the
+  selector) and the transport behavior (via the D7 seams) — so only the literal construction call
+  rests on the interop gate (tasks 4.x). A transport-factory injection point on `SMB2Client`
+  could close this if it is ever judged necessary; it was not added to avoid widening the client
+  surface for a single construction line.
 
 ### D8: Disconnect semantics — best-effort local, honestly scoped (option B)
 
@@ -655,15 +670,19 @@ close this — any check leaves an unprotected gap after it. Normative design:
   - **Install-block failure paths** (context gone, `smb2_set_transport` failure,
     `smb2_connect_share_async < 0` — all reachable only *after* a successful `installing`
     claim, since a failed claim returns before anything is created): the block owns the bridge
-    (it won `installing`), performs today's cleanup, and transitions to `finished`, making any
-    late `onCancel` a side-effect-free no-op on the bridge. Cleanup releases **only the
-    resources actually created at the point of failure**, in claim-then-create order:
-    context-gone (checked after the claim and `cbPtr` construction) closes the bridge and
-    releases `cbPtr` — no `ext.userdata` retain exists yet because `makeExternalTransport()`
-    has not run; `smb2_set_transport` failure additionally balances the `ext.userdata`
-    `Unmanaged` retain; `smb2_connect_share_async < 0` releases `cbPtr` and tears down via
-    `teardownSeam()` (by then `transportBridge` is set and libsmb2 owns the `ext.userdata`
-    retain through the C close trampoline).
+    (it won `installing`) and performs today's cleanup, releasing **only the resources actually
+    created at the point of failure**, in claim-then-create order. The two **pre-install**
+    failures — before `transportBridge` is assigned — transition to `finished`, making any late
+    `onCancel` a side-effect-free no-op on the bridge: context-gone (checked after the claim and
+    `cbPtr` construction) closes the bridge and releases `cbPtr` — no `ext.userdata` retain
+    exists yet because `makeExternalTransport()` has not run; `smb2_set_transport` failure
+    additionally balances the `ext.userdata` `Unmanaged` retain. The **post-install**
+    `smb2_connect_share_async < 0` path runs *after* `transportBridge` is assigned (state
+    `installed`), so ownership stays with `transportBridge`/`teardownSeam()` and the state is
+    **not** moved to `finished`: it releases `cbPtr` and tears down via `teardownSeam()` (by then
+    `transportBridge` is set and libsmb2 owns the `ext.userdata` retain through the C close
+    trampoline), and a late `onCancel` routes through the idempotent installed-teardown path
+    rather than the bridge no-op.
 - **No leaks, provably**: at every instant exactly one party is responsible for closing — the
   eager-completion reconciliation (every cancellation or failure outcome of `bridge.connect`:
   rows B/C/D and the race rule E), `onCancel` (`localOwned`), the install block (`installing`
@@ -701,11 +720,53 @@ connect and installation) rejected: every check leaves a gap after it; only an a
 claim/handoff makes the ownership total. This applies to both conformers — the TCP seam path
 gains the same guarantee.
 
+## Interop observations (2026-07-24, live against the standing rig)
+
+First-contact and the full interop matrix were run live (macOS `NWProtocolQUIC` client ↔
+Samba 4.23.6 + lxin/quic on `ubuntu-brix.kaveman.intra`). Headline findings:
+
+- **Framing (D2): CONFIRMED.** NEGOTIATE, tree-connect, directory enumeration, and multi-MB
+  reads/writes all parse cleanly through libsmb2's direct-transport byte-stream reader over the
+  QUIC stream — the 4-byte length prefix is present; no fork-seam frame-stripping is needed. The
+  contingency below did not fire.
+- **Headline interop finding — Apple ↔ lxin/quic `active_connection_id_limit` incompatibility
+  (server-side patch required until upstreamed).** Apple's `NWProtocolQUIC` advertises the QUIC
+  transport parameter `active_connection_id_limit = 64`; lxin/quic (through at least HEAD
+  `03a9c7c`) rejects any value `> 8` with `-EINVAL`, closing the handshake with
+  `CONNECTION_CLOSE(TRANSPORT_PARAMETER_ERROR)` before any ServerHello. This violates
+  RFC 9000 §18.2 (the value is the peer's storage willingness; only `< 2` is invalid — larger
+  values MUST be accepted). Confirmed by a three-stack discriminator: OpenSSL 3.5.5's QUIC client
+  (advertises `2`) and Samba's own client interoperate; Apple (advertises `64`) does not. There is
+  **no client-side remedy** (`NWProtocolQUIC` does not expose the parameter). Remediation is a
+  one-line RFC-correct clamp in the kernel module (`value > QUIC_CONN_ID_LIMIT` → clamp, not
+  reject); with it, first-contact and the full matrix pass. **Fixed upstream 2026-07-25** in
+  lxin/quic master `47ca73f` — our PR [lxin/quic#78](https://github.com/lxin/quic/pull/78) for
+  issue [#77](https://github.com/lxin/quic/issues/77) (fork `simplekube-ro/quic`, commit
+  `08dbf11`). Rigs built from ≥ `47ca73f` need no local patch; this rig was moved to pure upstream
+  master on 2026-07-25 and re-verified 14/14 (26 s). See docs/INTEROP-QUIC.md trap #4.
+- **No premature idle teardown / keepalive tuning needed.** Multi-MB transfers and interleaved
+  connect/op/disconnect cycles complete within `NWProtocolQUIC` defaults; the risk below did not
+  materialize.
+- **Best-effort disconnect + server-close behavior (D8), observed.** After a best-effort local
+  `disconnect()`, the server reaped the session ≈ 2.2 s later (observed via `smbstatus`) — a
+  best-effort teardown, not guaranteed DISCONNECT delivery. A server-initiated close mid-session
+  surfaces to our client as `POSIXError(.ENOTCONN)` ("SMB2 server not connected") on the next
+  operation — prompt and clean, no hang. See docs/INTEROP-QUIC.md.
+- **Rig test-infra caveat, resolved (not an SMB/QUIC fault).** The rig originally published QUIC
+  via docker's userland UDP proxy (`-p 443:443/udp`), which wedged for new LAN flows under a
+  sustained connect/disconnect burst (the whole 14-test suite back-to-back). Switching the rig to
+  `--network host` (QUIC binds host UDP/443 directly, no userland proxy) fixed it: the full 14-test
+  suite now runs stably in a single 40 s pass. See docs/INTEROP-QUIC.md trap #5.
+
+WS2025 (Microsoft-native MsQuic server) remains the other conformant target, deferred until a
+Windows host is available — it may accept Apple's ClientHello where lxin/quic needs the patch.
+
 ## Risks / Trade-offs
 
 - [Framing assumption wrong over QUIC] → Verified as first interop gate (D2); contingency is a
   seam-level fix in the libsmb2 fork, transport unchanged. Until interop passes, the feature is
-  unreleased-opt-in, so blast radius is zero.
+  unreleased-opt-in, so blast radius is zero. **Resolved 2026-07-24: framing confirmed on the
+  wire (see Interop observations above); contingency not needed.**
 - [No CI-able QUIC server: Samba needs `quic.ko` — no distro kernel ships it (not mainlined as
   of Linux 7.0), and GitHub macOS runners cannot reach a module-capable Linux host] → CI keeps
   MockTransport-based unit coverage. Interop runs against the standing lab rig, verified

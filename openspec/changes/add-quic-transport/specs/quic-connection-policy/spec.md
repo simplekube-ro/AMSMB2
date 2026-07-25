@@ -32,7 +32,9 @@ switch to QUIC based on port number, server capability, or any other heuristic.
 - **THEN** `SMB2Manager` throws `POSIXError(.ENOTSUP)` from the transport snapshot it took
   before suspension, **before** constructing any transport or attempting any network activity —
   never a silent downgrade to the legacy TCP path (design D6)
-- **NOTE** covered by a Linux unit test run under `make linuxtest`
+- **NOTE** covered by a Linux unit test run under `make linuxtest`. `POSIXErrorCode` has no
+  `.ENOTSUP` case on Linux, so the error surfaces there as the `EOPNOTSUPP` alias of `ENOTSUP`
+  (same errno 95); the Linux test asserts `.EOPNOTSUPP` accordingly
 
 #### Scenario: tcp and automatic on Linux use the legacy path unchanged
 

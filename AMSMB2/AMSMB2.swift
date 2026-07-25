@@ -11,6 +11,9 @@ import Foundation
 #if !canImport(Darwin)
 import FoundationNetworking
 #endif
+#if canImport(Glibc)
+import Glibc  // for the `ENOTSUP` errno constant in the Linux `.quic` rejection.
+#endif
 import SMB2
 
 /// Implements SMB2 File operations.
@@ -71,6 +74,61 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
             _timeout = newValue
             client?.timeout = newValue
         }
+    }
+
+    /// Backing storage for `transportKind`, guarded by `connectLock` (never touched from async
+    /// code — see the `needsReconnect`/`setClient` pattern). Platform-neutral (design D6).
+    private var _transportKind: SMBTransportKind = .automatic
+    /// Backing storage for `quicConfiguration`, guarded by `connectLock`.
+    private var _quicConfiguration: SMBQUICConfiguration?
+
+    /// Selects the transport for the next connection. Default `.automatic` (TCP this milestone).
+    ///
+    /// Set-before-connect, exactly like `timeout`: the value is snapshotted under `connectLock`
+    /// at the start of each connect attempt (design D6), so mutating it never races an in-flight
+    /// attempt and never mutates an established connection — the new value applies to the next
+    /// `connectShare`. `.quic` is Apple-only at runtime; on Linux it throws `POSIXError(.ENOTSUP)`.
+    ///
+    /// This is intentionally Swift-only API (design D11): `SMBTransportKind` has no
+    /// Objective-C representation, so an Objective-C app must set it through a small Swift shim.
+    public var transportKind: SMBTransportKind {
+        get {
+            connectLock.lock()
+            defer { connectLock.unlock() }
+            return _transportKind
+        }
+        set {
+            connectLock.lock()
+            _transportKind = newValue
+            connectLock.unlock()
+        }
+    }
+
+    /// Optional QUIC configuration (trust policy + connect timeout) used only when
+    /// `transportKind == .quic` (design D5/D10). `nil` means all defaults (system trust, 30 s
+    /// connect timeout). Snapshotted alongside `transportKind`; **not** serialized (the trust
+    /// material is security-sensitive — design D6). Swift-only API (design D11).
+    public var quicConfiguration: SMBQUICConfiguration? {
+        get {
+            connectLock.lock()
+            defer { connectLock.unlock() }
+            return _quicConfiguration
+        }
+        set {
+            connectLock.lock()
+            _quicConfiguration = newValue
+            connectLock.unlock()
+        }
+    }
+
+    /// Takes an immutable value snapshot of the transport settings under `connectLock` (design
+    /// D6). Called at the top of each connect attempt, before any suspension point, so mutating
+    /// the properties mid-connect cannot affect the in-flight attempt. `internal` so the snapshot
+    /// value semantics are directly unit-testable.
+    func transportSnapshot() -> (kind: SMBTransportKind, quic: SMBQUICConfiguration?) {
+        connectLock.lock()
+        defer { connectLock.unlock() }
+        return (_transportKind, _quicConfiguration)
     }
 
     override public var debugDescription: String {
@@ -182,6 +240,11 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
         self._password =
             aDecoder.decodeObject(of: NSString.self, forKey: CodingKeys.password.stringValue) as String? ?? ""
         self._timeout = aDecoder.decodeDouble(forKey: CodingKeys.timeout.stringValue)
+        // `transportKind` via the private string mapping; missing key → `.automatic` (old
+        // archives). `quicConfiguration` is intentionally NOT decoded (design D6).
+        let transportCode = aDecoder.decodeObject(
+            of: NSString.self, forKey: CodingKeys.transportKind.stringValue) as String?
+        self._transportKind = Self.transportKind(fromCode: transportCode)
         super.init()
     }
 
@@ -191,6 +254,12 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
         aCoder.encode(_workstation, forKey: CodingKeys.workstation.stringValue)
         aCoder.encode(_user, forKey: CodingKeys.user.stringValue)
         aCoder.encode(timeout, forKey: CodingKeys.timeout.stringValue)
+        // Encode only the transport kind (private string mapping); `quicConfiguration` is
+        // deliberately omitted — trust material must not be honored from a persisted archive.
+        // Read through the synchronized snapshot, never the backing field directly (design D6).
+        aCoder.encode(
+            Self.transportKindCode(transportSnapshot().kind),
+            forKey: CodingKeys.transportKind.stringValue)
     }
 
     public static var supportsSecureCoding: Bool {
@@ -200,6 +269,27 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
     enum CodingKeys: String, CodingKey {
         case url, domain, workstation
         case user, password, timeout
+        case transportKind
+    }
+
+    /// Private string mapping for `SMBTransportKind` used by `NSSecureCoding`/`Codable` (design
+    /// D6). Deliberately NOT a public `RawRepresentable` conformance on `SMBTransportKind`.
+    private static func transportKindCode(_ kind: SMBTransportKind) -> String {
+        switch kind {
+        case .tcp: return "tcp"
+        case .quic: return "quic"
+        case .automatic: return "automatic"
+        }
+    }
+
+    /// Decodes the private string mapping; missing/unknown values fall back to `.automatic`, so
+    /// archives created before this change (and any future unknown token) keep decoding (design D6).
+    private static func transportKind(fromCode code: String?) -> SMBTransportKind {
+        switch code {
+        case "tcp": return .tcp
+        case "quic": return .quic
+        default: return .automatic
+        }
     }
 
     public required init(from decoder: any Decoder) throws {
@@ -221,6 +311,10 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
         self._user = try container.decodeIfPresent(String.self, forKey: .user) ?? ""
         self._password = try container.decodeIfPresent(String.self, forKey: .password) ?? ""
         self._timeout = try container.decodeIfPresent(TimeInterval.self, forKey: .timeout) ?? 60
+        // `transportKind` via the private string mapping; missing key → `.automatic` (old
+        // archives). `quicConfiguration` is intentionally NOT decoded (design D6).
+        self._transportKind = Self.transportKind(
+            fromCode: try container.decodeIfPresent(String.self, forKey: .transportKind))
         super.init()
     }
 
@@ -231,6 +325,9 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
         try container.encode(_workstation, forKey: .workstation)
         try container.encode(_user, forKey: .user)
         try container.encode(timeout, forKey: .timeout)
+        // Encode only the transport kind; `quicConfiguration` is deliberately omitted (design D6).
+        // Read through the synchronized snapshot, never the backing field directly (design D6).
+        try container.encode(Self.transportKindCode(transportSnapshot().kind), forKey: .transportKind)
     }
 
     open func copy(with _: NSZone? = nil) -> Any {
@@ -240,6 +337,12 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
         )!
         new._workstation = _workstation
         new.timeout = timeout
+        // Preserve the transport settings as value snapshots (design D6) — otherwise copying a
+        // `.quic` manager would silently revert to `.automatic`/TCP. `copy` preserves
+        // `quicConfiguration` (in-process value copy); archiving deliberately does not.
+        let snapshot = transportSnapshot()
+        new._transportKind = snapshot.kind
+        new._quicConfiguration = snapshot.quic
         return new
     }
 
@@ -1499,18 +1602,35 @@ extension SMB2Manager {
     }
 
     private func connect(shareName: String, encrypted: Bool) async throws -> SMB2Client {
+        // Immutable transport-settings snapshot under `connectLock`, BEFORE any suspension point
+        // (design D6). Every hop from here is a `Sendable` value copy, so mutating
+        // `transportKind`/`quicConfiguration` cannot race this in-flight attempt.
+        let snapshot = transportSnapshot()
+
+        #if !canImport(Network)
+        // Linux routing (design D6): `.quic` is rejected up front — before constructing the
+        // client, touching the connect path, or any network activity — never a silent downgrade.
+        if case .quic = snapshot.kind {
+            // `.ENOTSUP` is not a `POSIXErrorCode` case on Linux; bridge the C `ENOTSUP` errno
+            // (== `EOPNOTSUPP` there) through the numeric initializer for a portable code.
+            throw POSIXError(.init(ENOTSUP),
+                description: "SMB over QUIC is not supported on this platform")
+        }
+        #endif
+
         let client = try SMB2Client(timeout: _timeout)
         initClient(client, encrypted: encrypted)
         guard let host = url.host else { throw POSIXError(.EINVAL) }
         let server = host + (url.port.map { ":\($0)" } ?? "")
         #if canImport(Network)
-        // Apple default: route through the NIO TCP transport seam (`automatic` → TCPTransportApple).
-        // The legacy libsmb2-owned socket path is compiled out on Apple (see Context.swift); Linux
-        // keeps the legacy `connect(server:share:user:)` below.
+        // Apple: route through the transport seam with the snapshot kind + QUIC configuration.
+        // The legacy libsmb2-owned socket path is compiled out on Apple (see Context.swift).
         try await client.connect(
-            server: server, share: shareName, user: _user, transportKind: .automatic
+            server: server, share: shareName, user: _user,
+            transportKind: snapshot.kind, quicConfiguration: snapshot.quic
         )
         #else
+        // Linux: `.tcp`/`.automatic` use the legacy libsmb2-owned socket path, unchanged.
         try await client.connect(server: server, share: shareName, user: _user)
         #endif
         // Assign only after successful connection (absorbed review finding #13).

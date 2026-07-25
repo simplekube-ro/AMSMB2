@@ -17,6 +17,7 @@ graph TB
     LibSMB2["libsmb2 (C)<br/><i>SMB2/3 protocol implementation</i>"]
     Bridge["TransportBridge → SMBTransport<br/><i>Apple — external-transport seam</i>"]
     TCP["TCPTransportApple<br/><i>NIOTransportServices (Network.framework)</i>"]
+    QUIC["QUICTransportApple<br/><i>NWProtocolQUIC — opt-in .quic</i>"]
     Server["SMB Server"]
 
     App --> Manager
@@ -26,7 +27,9 @@ graph TB
     Client --> LibSMB2
     LibSMB2 -->|"Apple: external-transport callbacks"| Bridge
     Bridge --> TCP
+    Bridge --> QUIC
     TCP -->|"TCP/445"| Server
+    QUIC -->|"QUIC (UDP)/443"| Server
     LibSMB2 -->|"Linux: built-in BSD socket, TCP/445"| Server
 
     style App fill:#f9f,stroke:#333
@@ -36,6 +39,7 @@ graph TB
     style LibSMB2 fill:#fdb,stroke:#333
     style Bridge fill:#dfd,stroke:#333
     style TCP fill:#dfd,stroke:#333
+    style QUIC fill:#dfd,stroke:#333
     style Server fill:#ddd,stroke:#333
 ```
 
@@ -44,7 +48,7 @@ graph TB
 | **Public API** | `SMB2Manager` | Connection lifecycle, all file/directory operations, NSSecureCoding/Codable (passwords excluded from serialization), Obj-C compatibility |
 | **File Abstraction** | `SMB2FileHandle` | Open/close files, read/write/seek, IOCTL (fsctl), Change Notify |
 | **Context Wrapper** | `SMB2Client` | Wraps `smb2_context`, provides thread-safe access via a serial event loop queue, drives servicing (Apple: seam signal loop; Linux: `DispatchSource`) |
-| **Transport (Apple)** | `TransportBridge`, `SMBTransport`, `TCPTransportApple` | Carries the SMB2 byte stream over a Swift-owned NIO/Network.framework TCP connection via libsmb2's external-transport callbacks |
+| **Transport (Apple)** | `TransportBridge`, `SMBTransport`, `TCPTransportApple`, `QUICTransportApple` | Carries the SMB2 byte stream over a Swift-owned Network.framework connection (TCP via NIOTS by default, or QUIC opt-in) through libsmb2's external-transport callbacks |
 | **C Library** | libsmb2 | SMB2/3 protocol encoding/decoding, network I/O (Linux), NTLM authentication |
 
 ## Connection Lifecycle
@@ -198,7 +202,7 @@ graph TB
 
 > **Platform:** Apple only (`#if canImport(Network)`). This is the **default** transport for Apple platforms — `SMB2Manager.connectShare(...)` routes through it automatically. Linux keeps libsmb2's built-in socket (see [Socket Monitoring (Linux)](#socket-monitoring-linux)).
 
-On Apple platforms, AMSMB2 does not let libsmb2 own a BSD socket. Instead it installs a Swift-owned transport through libsmb2's **external-transport** C API, so the SMB2 byte stream rides over `NIOTransportServices` (SwiftNIO on Network.framework). This is the *transport seam*: a narrow, NIO-free, libsmb2-free boundary that decouples the SMB2 client from any specific wire implementation (TCP today, QUIC reserved for the future).
+On Apple platforms, AMSMB2 does not let libsmb2 own a BSD socket. Instead it installs a Swift-owned transport through libsmb2's **external-transport** C API, so the SMB2 byte stream rides over a Swift transport. This is the *transport seam*: a narrow, NIO-free, libsmb2-free boundary that decouples the SMB2 client from any specific wire implementation. Two conformers exist: `TCPTransportApple` (`NIOTransportServices`, the default) and `QUICTransportApple` (Network.framework `NWProtocolQUIC`, opt-in via `SMB2Manager.transportKind = .quic`).
 
 ```mermaid
 flowchart TB
@@ -213,23 +217,30 @@ flowchart TB
     end
     Proto["SMBTransport (protocol)<br/><i>Data-based, NIO-free</i>"]
     TCP["TCPTransportApple<br/>NIOTransportServices channel"]
+    QUIC["QUICTransportApple<br/>NWProtocolQUIC, single stream"]
     Server["SMB Server"]
 
     EXT -->|"cSend"| OUT --> OPUMP --> Proto
     Proto -->|"receive()"| IPUMP --> IN -->|"cRecv"| EXT
     Proto --> TCP
+    Proto --> QUIC
     TCP <-->|"TCP/445"| Server
+    QUIC <-->|"QUIC (UDP)/443, ALPN smb"| Server
     IN -.->|"inbound-ready signal"| SVC["eventLoopQueue → smb2_service()"]
 ```
+
+Both conformers honor the identical seam contract (incremental inbound buffering, empty-`Data` EOF, `POSIXError` mapping), so `TransportBridge` and the servicing loop are unchanged between them — QUIC is a different wire under the same byte-pipe.
 
 ### Types
 
 | Type | Visibility | Role |
 |------|-----------|------|
-| `SMBTransport` | `public protocol` | The seam. Async `connect(host:port:)` / `send(_:)` / `receive()` / `close()` over `Data`. No SwiftNIO, no libsmb2 — unit-testable in isolation and reusable by a future QUIC transport. `receive()` returning empty `Data` signals graceful EOF. |
-| `SMBTransportKind` | `public enum` | Selects a transport: `.tcp`, `.quic` (reserved — throws `ENOTSUP`), `.automatic`. |
+| `SMBTransport` | `public protocol` | The seam. Async `connect(host:port:)` / `send(_:)` / `receive()` / `close()` over `Data`. No SwiftNIO, no libsmb2 — unit-testable in isolation, shared by the TCP and QUIC conformers. `receive()` returning empty `Data` signals graceful EOF. |
+| `SMBTransportKind` | `public enum` | Selects a transport: `.tcp`, `.quic`, `.automatic` (never QUIC). |
 | `TCPTransportApple` | `public final class` | Concrete `SMBTransport` over `NIOTransportServices`. Converts `Data` ↔ `ByteBuffer` internally; buffers inbound bytes (`InboundBufferingHandler`) for incremental drain; maps NWError/ChannelError → `POSIXError`. One instance = one connection lifetime. |
-| `TransportBridge` | `internal final class` | Wires libsmb2's four external-transport C callbacks to an `SMBTransport`. Backs `ext.userdata` via `Unmanaged.passRetained`, balanced exactly once in the C `close` trampoline. |
+| `QUICTransportApple` | `public final class` | Concrete `SMBTransport` over Network.framework `NWProtocolQUIC` (availability-gated, macCatalyst 15 explicit). One QUIC connection + single bidirectional stream carries the whole SMB session; ALPN `"smb"`, SNI = host, TLS 1.3. Self-contained connect state machine + established-connection lifecycle (below); maps `NWError` → `POSIXError`. |
+| `SMBQUICConfiguration` | `public struct` | Platform-neutral QUIC config — DER `[Data]` trust anchors + connect timeout (no Security.framework types, so it compiles on Linux). Mutually exclusive `TrustPolicy` (`.system`/`.customRoots`/`.insecureNoVerification`). |
+| `TransportBridge` | `internal final class` | Wires libsmb2's four external-transport C callbacks to an `SMBTransport`. Backs `ext.userdata` via `Unmanaged.passRetained`, balanced exactly once in the C `close` trampoline. Unchanged across both conformers. |
 
 ### How servicing works without a socket fd
 
@@ -244,9 +255,17 @@ Because the external transport is installed with `smb2_set_transport(ctx, SMB2_T
 
 All libsmb2 calls still run exclusively on `eventLoopQueue`, and the existing `CheckedContinuation`, `CBData.isAbandoned` guard, per-operation timeout, and `withTaskCancellationHandler` mechanisms are reused unchanged. Cancellation and teardown cancel both pump tasks, close the transport, and resume any suspended continuations with no leaks.
 
+### QUIC conformer (`QUICTransportApple`)
+
+Unlike the TCP conformer, which delegates connect establishment to NIOTS, the QUIC conformer drives `NWConnection` directly, so it owns its own connect and teardown state machines (all state guarded by a single `NSLock`; every completion path claims the outcome under the lock and performs its side effects outside it — the same "claim-assigns-duty" discipline used by the seam bridge-ownership handoff):
+
+- **Connect state machine.** Because the eager `bridge.connect` runs *before* libsmb2's cancellation/timeout machinery is installed, connect is self-contained. A lock-protected outcome claim (`connecting → ready | failed`) funnels every completion — `.ready`, `.failed`, task cancellation, `close()`, deadline expiry — through one critical section: exactly one path wins and performs side effects; losers do nothing (a losing task-cancellation never cancels the `NWConnection`). `NWConnection` states are handled explicitly (`.setup`/`.preparing` progress; `.waiting` non-terminal, error recorded; `.ready` success; `.failed` mapped `POSIXError`; `.cancelled` terminal ack). A deterministic, always-armed deadline is sourced from the validated `SMBQUICConfiguration.connectTimeout` (independent of `SMB2Manager.timeout`). Error contract: task cancel → `CancellationError`; `close()` while connecting → `ECONNABORTED`; deadline → `ETIMEDOUT`; `.failed` → mapped `POSIXError`.
+- **Established-connection lifecycle (recorded causes).** After `.ready`, teardown is discriminated by cause: **local close** — `close()` records the local-close cause under the lock *before* `NWConnection.cancel()`, so the resulting `.cancelled` is a no-op ack and a parked/next `receive()` sees empty `Data` (matching `TCPTransportApple.signalClosed()`); **peer graceful EOF** — empty `Data` from a remote stream close; **abnormal loss** — an unsolicited post-ready `.failed`, or a `.cancelled` with no recorded local-close cause, makes the parked/next `receive()` throw a mapped `POSIXError`. The first lock-protected transition out of `ready` wins; a recorded local-close result is never overwritten.
+- **Testability.** The connection and the connect deadline are reached only through injected `QUICConnectionDriver` and `ConnectDeadlineScheduler` seams, so every state and race is unit-tested deterministically with no wall-clock and no live network.
+
 ### Public-API note
 
-The transport seam types are `public` (for extensibility and a future QUIC transport), but `SMB2Manager` does **not** currently expose transport selection — `connectShare(...)` always uses `.automatic` on Apple. Consumers cannot yet inject a custom `SMBTransport` or pick a `SMBTransportKind` through the public API.
+`SMB2Manager` exposes transport selection through `transportKind` (default `.automatic` → TCP) and `quicConfiguration`, snapshotted under the manager's lock at connect start (changes never affect an in-flight or established connection). The seam types are `public`; consumers opt into QUIC via these settings. The selection surface is **Swift-only** — `SMBTransportKind`/`SMBQUICConfiguration` are not Objective-C-representable and are absent from the generated Objective-C interface (the existing Objective-C API is unchanged). See [docs/API.md](API.md) and, for the live interop procedure, [docs/INTEROP-QUIC.md](INTEROP-QUIC.md).
 
 ## Socket Monitoring (Linux)
 
@@ -334,6 +353,9 @@ Every async operation supports Swift task cancellation. The pattern is consisten
 | `SMBTransport.swift` | Transport (Apple) | `SMBTransport` protocol and `SMBTransportKind` enum — the NIO-free, libsmb2-free transport seam |
 | `TransportBridge.swift` | Transport (Apple) | `TransportBridge` — wires libsmb2's external-transport C callbacks to an async `SMBTransport`; inbound/outbound pumps and FIFOs (`#if canImport(Network)`) |
 | `TCPTransportApple.swift` | Transport (Apple) | `TCPTransportApple` — concrete `SMBTransport` over `NIOTransportServices`; `Data` ↔ `ByteBuffer`, inbound buffering, POSIXError mapping (`#if canImport(Network)`) |
+| `QUICTransportApple.swift` | Transport (Apple) | `QUICTransportApple` — concrete `SMBTransport` over Network.framework `NWProtocolQUIC`; D7 connect state machine + D8 established-connection lifecycle, injected driver/deadline seams, TLS trust wiring (`#if canImport(Network)`) |
+| `SMBQUICConfiguration.swift` | Public API | `SMBQUICConfiguration` + `TrustPolicy` — platform-neutral QUIC config (no `#if`) |
+| `QUICConnectionPolicy.swift` | Public API | Platform-neutral QUIC policy helpers on `SMB2Client`: `isNumericHost` (numeric-target rejection) and `normalizedQUICConnectTimeout` (connect-deadline validation) |
 | `FileHandle.swift` | File Abstraction | `SMB2FileHandle` class — open/close/read/write/seek/ioctl/changeNotify, pipelined I/O |
 | `Directory.swift` | File Abstraction | Directory enumeration handle |
 | `Stream.swift` | Public API | `AsyncInputStream` — adapts `AsyncSequence` to `InputStream` for streaming writes, with high-water/low-water mark backpressure |

@@ -16,6 +16,8 @@ Complete reference for the AMSMB2 public API. All async methods also have comple
 | [`SMBTransport`](#smbtransport) | Public protocol — the transport seam carrying SMB2 bytes over the wire (Apple) |
 | [`SMBTransportKind`](#smbtransportkind) | Enum selecting a transport: `.tcp` / `.quic` / `.automatic` |
 | [`TCPTransportApple`](#tcptransportapple) | Concrete `SMBTransport` over `NIOTransportServices` (Apple only) |
+| [`QUICTransportApple`](#quictransportapple) | Concrete `SMBTransport` over Network.framework QUIC (Apple only, availability-gated) |
+| [`SMBQUICConfiguration`](#smbquicconfiguration) | Platform-neutral SMB-over-QUIC config: TLS `TrustPolicy` + connect timeout |
 
 ---
 
@@ -47,6 +49,10 @@ Progress handlers return `true` to continue or `false` to cancel the operation.
 | `url` | `URL` | SMB server URL (read-only, set at init) |
 | `timeout` | `TimeInterval` | Operation timeout in seconds (default: 60). Set to 0 to disable. |
 | `smbClient` | `SMB2Client` (throws) | The underlying client. Throws `POSIXError(.ENOTCONN)` if not connected. |
+| `transportKind` | `SMBTransportKind` | Transport for the next connection (default `.automatic` → TCP). Set before `connectShare`. Swift-only; see [SMB-over-QUIC](#smb-over-quic). |
+| `quicConfiguration` | `SMBQUICConfiguration?` | Optional QUIC trust policy + connect timeout, used only when `transportKind == .quic` (`nil` = all defaults). Swift-only. |
+
+Both settings are **set-before-connect** and snapshotted under the manager's lock at the start of each connect — mutating them never affects an in-flight or established connection; new values apply to the next `connectShare` (exactly like `timeout`). They are platform-neutral (present on Linux too) but **Swift-only** — intentionally absent from the Objective-C interface (see [SMB-over-QUIC](#smb-over-quic)).
 
 ---
 
@@ -574,8 +580,8 @@ Selects which transport a connection uses.
 | Case | Meaning |
 |------|---------|
 | `.tcp` | Explicit TCP. On Apple routes through `NIOTransportServices`; on Linux falls back to libsmb2's built-in BSD socket. |
-| `.quic` | SMB-over-QUIC. Reserved for a future milestone — **not yet implemented** (selecting it throws `POSIXError(.ENOTSUP)`). |
-| `.automatic` | Let the library choose the best available transport on the current platform. This is what `SMB2Manager` uses on Apple. |
+| `.quic` | SMB-over-QUIC (Apple, availability-gated — see [`QUICTransportApple`](#quictransportapple)). Explicit opt-in; non-numeric hostnames only; UDP/443 default; no silent TCP fallback. On Linux, or below the availability floor, selecting it throws `POSIXError(.ENOTSUP)`. See [SMB-over-QUIC](#smb-over-quic). |
+| `.automatic` | Let the library choose the best available transport on the current platform. Currently TCP — `.automatic` never selects QUIC. This is what `SMB2Manager` uses by default. |
 
 ## TCPTransportApple
 
@@ -595,6 +601,102 @@ Concrete `SMBTransport` backed by `NIOTransportServices` (SwiftNIO over Network.
 
 ---
 
+## QUICTransportApple
+
+```swift
+@available(iOS 15, macOS 12, macCatalyst 15, tvOS 15, watchOS 8, visionOS 1, *)
+public final class QUICTransportApple: SMBTransport, @unchecked Sendable {
+    public init(configuration: SMBQUICConfiguration, connectTimeout: TimeInterval)
+}
+```
+
+Concrete `SMBTransport` backed directly by Network.framework `NWProtocolQUIC` (no NIO). **Apple only** (`#if canImport(Network)`) and **availability-gated** above the package floor — the `@available` annotation names **macCatalyst 15** explicitly. Below the floor (and on Linux) `.quic` fails with `POSIXError(.ENOTSUP)`; the package platform minimums are unchanged.
+
+- One QUIC connection with a **single bidirectional stream** carries the whole SMB session; `send`/`receive` write/read that stream verbatim (SMB2 message multiplexing continues inside it, exactly as over TCP). ALPN is `"smb"`, SNI is the target host, TLS 1.3 is QUIC-implied.
+- The connect deadline is **always armed** from the validated `connectTimeout` (see [`SMBQUICConfiguration`](#smbquicconfiguration)), independent of `SMB2Manager.timeout`.
+- All `NWError` values are mapped to `POSIXError` before propagating.
+- You normally never construct this directly — set `SMB2Manager.transportKind = .quic`; the manager builds it from your `quicConfiguration`.
+
+---
+
+## SMBQUICConfiguration
+
+```swift
+public struct SMBQUICConfiguration: Sendable, Equatable {
+    public enum TrustPolicy: Sendable, Equatable {
+        case system                     // default: system chain evaluation + hostname verification
+        case customRoots([Data])        // DER anchors; non-empty; REPLACE system roots; hostname still verified
+        case insecureNoVerification     // debug-only: disables chain + hostname checks
+    }
+    public var trustPolicy: TrustPolicy = .system
+    public var connectTimeout: TimeInterval = 30
+    public init(trustPolicy: TrustPolicy = .system, connectTimeout: TimeInterval = 30)
+}
+```
+
+Platform-neutral SMB-over-QUIC configuration — it holds **no Security.framework types** (trust anchors are DER-encoded `[Data]`), so it compiles and is public API on every platform, including Linux (where it is inert because `.quic` throws `ENOTSUP`).
+
+**`TrustPolicy`** (secure by default; the enum makes "custom roots + insecure" unrepresentable):
+
+| Case | Behavior |
+|------|----------|
+| `.system` (default) | System trust store evaluates the chain; hostname verified. No custom verify logic installed. |
+| `.customRoots([Data])` | DER anchors **replace** the system roots (not augment); a self-signed leaf may be its own anchor; hostname is still verified. Invalid DER or an empty `.customRoots([])` set throws `POSIXError(.EINVAL)` before any network activity. |
+| `.insecureNoVerification` | **Debug-only escape hatch.** Disables certificate-chain validation and hostname verification. TLS 1.3 encryption and the ALPN `"smb"` requirement remain. Never bypasses numeric-host rejection. |
+
+**`connectTimeout`** — the dedicated QUIC connect deadline in seconds (default **30**). Finite and positive only: `NaN`, `±infinity`, `0`, and negative values throw `POSIXError(.EINVAL)`; values above **3600** clamp to 3600. It is **independent of `SMB2Manager.timeout`** (whose "zero-or-negative disables" contract is unchanged and continues to feed the per-operation `smb2_set_timeout`); the QUIC connect deadline cannot be disabled.
+
+> A verify-failed QUIC handshake (`.system` against an untrusted cert, or `.customRoots` with a non-matching anchor) does not fail fast — `NWConnection` keeps it waiting until `connectTimeout`, so the failure surfaces as `POSIXError(.ETIMEDOUT)`. Use a shorter `connectTimeout` if you need snappier trust-failure feedback.
+
+---
+
+## SMB-over-QUIC
+
+Opt into QUIC by setting `SMB2Manager.transportKind = .quic` (optionally with a `quicConfiguration`) before `connectShare`. Availability floor per platform: **iOS 15 / macOS 12 / macCatalyst 15 / tvOS 15 / watchOS 8 / visionOS 1**. On Linux the settings exist but are inert — `.quic` throws `POSIXError(.ENOTSUP)` (on Linux this surfaces as its `EOPNOTSUPP` alias; `.ENOTSUP` is not a distinct `POSIXErrorCode` there) before any transport is constructed or any packet is sent.
+
+**Connection policy:**
+
+- **Explicit opt-in** — `.automatic` never selects QUIC.
+- **Non-numeric hostnames only** — every numeric IPv4/IPv6 target (in any form) is rejected with `POSIXError(.EINVAL)` before any transport exists. `localhost`, single-label names, and other non-numeric names are accepted even though they may later fail resolution. Rejection **precedes and is independent of** the TLS trust policy — `.insecureNoVerification` does not bypass it.
+- **UDP/443 default** — an explicit port in the server string is honored; otherwise QUIC defaults to 443 (TCP defaults to 445).
+- **No silent fallback** — a `.quic` connect failure is surfaced to you; the library never retries over TCP on its own.
+
+**Snapshot / copy / serialization semantics:**
+
+- `transportKind` and `quicConfiguration` are snapshotted at connect start; changes never affect an in-flight or established connection (they apply to the next `connectShare`).
+- `copy()` preserves both `transportKind` and `quicConfiguration`.
+- `NSSecureCoding`/`Codable` round-trip **only** `transportKind` (via a private string mapping; old/unknown archives decode to `.automatic`). `quicConfiguration` is **never serialized** — trust anchors and the insecure flag are security-sensitive, so a decoded `.quic` manager gets `quicConfiguration == nil` (system-trust default). This copy-vs-archive asymmetry is deliberate.
+
+**Objective-C:** `transportKind`, `quicConfiguration`, `SMBQUICConfiguration`, and `QUICTransportApple` are **Swift-only** — their types are not Objective-C-representable, so they are absent from the generated Objective-C interface (the existing Objective-C API is unchanged). An Objective-C app opts into QUIC through a small Swift shim, e.g.:
+
+```swift
+// AMSMB2QUICShim.swift — call from Objective-C
+@objc extension SMB2Manager {
+    @objc func useQUIC(insecure: Bool) {
+        transportKind = .quic
+        quicConfiguration = SMBQUICConfiguration(
+            trustPolicy: insecure ? .insecureNoVerification : .system)
+    }
+}
+```
+
+**Best-effort disconnect:** local `disconnect()` queues and flushes the DISCONNECT PDU but does not guarantee wire delivery (the seam may tear down first). SMB sessions survive this — servers reap idle sessions.
+
+**Caller-side fallback pattern** (the library does not fall back for you):
+
+```swift
+manager.transportKind = .quic
+manager.quicConfiguration = SMBQUICConfiguration()   // system trust, 30 s connect timeout
+do {
+    try await manager.connectShare(name: "share")
+} catch {
+    manager.transportKind = .automatic               // retry over TCP
+    try await manager.connectShare(name: "share")
+}
+```
+
+---
+
 ## Common Errors
 
 All operations throw `POSIXError` on failure. Common codes:
@@ -606,12 +708,16 @@ All operations throw `POSIXError` on failure. Common codes:
 | 5 | `EIO` | I/O error (network or protocol) |
 | 13 | `EACCES` | Permission denied |
 | 17 | `EEXIST` | File already exists (e.g., `uploadItem` to existing path) |
-| 45 | `ENOTSUP` | Operation not supported (e.g., selecting the not-yet-implemented QUIC transport) |
+| 22 | `EINVAL` | Invalid argument — with `.quic`: a numeric target host, an invalid DER trust anchor, an empty `.customRoots([])` set, or a `NaN`/infinite/non-positive `connectTimeout` |
+| 45 | `ENOTSUP` | Unsupported — selecting `.quic` below the QUIC availability floor or on a platform without `Network` (Linux). On Linux this surfaces as `EOPNOTSUPP` (same errno; `.ENOTSUP` is not a distinct `POSIXErrorCode` there). |
+| 53 | `ECONNABORTED` | Transport (QUIC) `close()` called while a connect was in flight |
 | 57 | `ENOTCONN` | Not connected (call `connectShare` first) |
-| 60 | `ETIMEDOUT` | Operation timed out (also a transport connect timeout) |
+| 60 | `ETIMEDOUT` | Operation or connect timed out — including the QUIC connect deadline (`SMBQUICConfiguration.connectTimeout`); note a QUIC TLS-trust rejection also surfaces here |
 | 61 | `ECONNREFUSED` | Connection refused by the peer (e.g., transport connect failure) |
 
-> Numeric values shown are Darwin (Apple) `errno` codes; the symbolic constant is what you match in `catch`. Linux assigns different numbers to the same symbols.
+Task cancellation surfaces as `CancellationError` (not a `POSIXError`) — see [Task Cancellation](#task-cancellation).
+
+> Numeric values shown are Darwin (Apple) `errno` codes; the symbolic constant is what you match in `catch`. Linux assigns different numbers to the same symbols (and, as noted, lacks `.ENOTSUP` — it uses `.EOPNOTSUPP`).
 
 ---
 

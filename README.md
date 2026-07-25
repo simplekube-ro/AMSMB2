@@ -97,6 +97,33 @@ try await smb.downloadItem(atPath: "/report.pdf", to: downloadURL, progress: nil
 try await smb.disconnectShare()
 ```
 
+### SMB over QUIC (opt-in, Apple platforms)
+
+SMB-over-QUIC rides SMB2/3 over a TLS 1.3 QUIC tunnel (UDP/443) instead of TCP. It is **opt-in** and available on iOS 15 / macOS 12 / macCatalyst 15 / tvOS 15 / watchOS 8 / visionOS 1 or later (on Linux, or below the floor, `.quic` throws `POSIXError(.ENOTSUP)`).
+
+```swift
+let smb = SMB2Manager(url: URL(string: "smb://fs.example.com")!, credential: credential)!
+
+// Opt into QUIC before connecting. Secure by default: system trust + hostname verification.
+smb.transportKind = .quic
+smb.quicConfiguration = SMBQUICConfiguration()          // .system trust, 30 s connect timeout
+
+// Private-CA / self-signed lab servers: supply DER anchors (they REPLACE the system roots;
+// hostname is still verified).
+smb.quicConfiguration = SMBQUICConfiguration(trustPolicy: .customRoots([caCertificateDER]))
+
+try await smb.connectShare(name: "Documents")
+```
+
+Security caveats:
+
+- **Secure by default** — `.system` verifies the chain against the system trust store and checks the hostname. `.customRoots([Data])` replaces (does not augment) the system roots but still verifies the hostname.
+- **`.insecureNoVerification` is a debug-only escape hatch** — it disables chain and hostname verification (TLS encryption and ALPN `"smb"` remain). Do not ship it.
+- **Non-numeric hostnames only** — numeric IP targets are rejected with `POSIXError(.EINVAL)` (independent of the trust policy; `.insecureNoVerification` does not bypass it).
+- **No silent fallback** — a `.quic` failure is thrown to you; the library never retries over TCP. Implement fallback yourself if you want it (`try .quic`, `catch`, retry `.tcp`).
+
+The new transport surface is Swift-only (not exposed to Objective-C). See **[docs/API.md](docs/API.md)** for the full contract and **[docs/INTEROP-QUIC.md](docs/INTEROP-QUIC.md)** for the live interop procedure and server requirements.
+
 ## Testing
 
 ### Prerequisites
@@ -130,8 +157,9 @@ make cleanlinuxtest   # Clean Docker build
 
 ## Documentation
 
-- **[Architecture](docs/ARCHITECTURE.md)** — Layer stack, event loop model, transport layer (Apple seam) and socket monitoring (Linux), buffer pool, pipelined I/O, thread safety model
+- **[Architecture](docs/ARCHITECTURE.md)** — Layer stack, event loop model, transport layer (Apple seam: TCP + QUIC) and socket monitoring (Linux), buffer pool, pipelined I/O, thread safety model
 - **[API Reference](docs/API.md)** — Complete reference for all public types and methods
+- **[SMB-over-QUIC interop](docs/INTEROP-QUIC.md)** — Repeatable interop procedure, server (Samba + lxin/quic) requirements and traps, and verified results
 
 ## License
 
