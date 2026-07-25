@@ -255,8 +255,11 @@ TDD applies throughout: each task starts by writing/updating the tests for its s
       `quicConfiguration`, `SMBQUICConfiguration`, and `QUICTransportApple` are all absent — the
       runtime-introspection unit test (task 3.3) cannot catch an accidental `@objcMembers`
       addition, so the generated-header grep remains the compile-level check of record per D11
-- [ ] 5.4 Ensure artifacts reflect what shipped, close AMSMB2 #29 / RandomPlayer #346, archive
-      via `/opsx:archive`
+- [x] 5.4 Ensure artifacts reflect what shipped, close AMSMB2 #29 / RandomPlayer #346, archive
+      via `/opsx:archive` — artifacts reconciled through review round 10 (see 5.3 correction
+      and `fix-tcp-one-shot-connect` §3); archived 2026-07-25. Issue closure deferred to the
+      merge of PR simplekube-ro/AMSMB2#57 (branch not yet merged at archive time; closing the
+      issues now would be premature)
 
 ## 6. Adversarial-review fixes (post-implementation)
 
