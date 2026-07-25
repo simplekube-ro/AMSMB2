@@ -51,6 +51,62 @@ the Microsoft/Samba SMB-over-QUIC interop behavior.
 - **THEN** `connect` throws a `POSIXError` (never a raw Network.framework error), preserving
   `CancellationError` when the task was cancelled
 
+### Requirement: connect is one-shot — the attempt is reserved atomically and rejected calls perform no work
+
+`connect(host:port:)` SHALL be strictly one-shot per instance: the first call SHALL atomically
+reserve the instance's single connect attempt (under the state lock, **before** trust
+resolution or driver construction), and every other call SHALL fail promptly and
+deterministically without constructing a driver, creating any network activity, arming any
+timer, or overwriting the owning attempt's continuation, driver, deadline, start phase, or
+established lifecycle. The rejection error mapping SHALL be: attempt in flight (reserved or
+connecting) → `POSIXError(.EALREADY)`; after successful connect → `POSIXError(.EISCONN)`;
+after a failed attempt → `POSIXError(.EALREADY)` (**retry after a failed first attempt is NOT
+supported** — one instance maps to one connection lifetime and `SMB2Client` constructs a fresh
+transport per connect; callers do the same); after `close()` → `POSIXError(.ECONNABORTED)`
+(the closed-transport contract, checked first). An accepted attempt that fails eager
+validation (trust `EINVAL`) SHALL also consume the one shot. Close or task cancellation racing
+the reservation/preparation phase SHALL NOT strand the reservation: the continuation store
+re-checks both and aborts the attempt (`ECONNABORTED` / `CancellationError`) before any
+deadline is armed or driver started.
+
+#### Scenario: Concurrent second connect is rejected with EALREADY
+
+- **WHEN** a second `connect` call races a first call that owns the in-flight attempt
+- **THEN** the second call fails promptly with `POSIXError(.EALREADY)` and never constructs a
+  driver, and the first call proceeds to its own outcome unaffected (neither call hangs)
+
+#### Scenario: Connect after ready is rejected with EISCONN
+
+- **WHEN** `connect` is called after a previous call already reached `.ready`
+- **THEN** it fails promptly with `POSIXError(.EISCONN)` and the established driver remains
+  installed and usable for `send`/`receive`
+
+#### Scenario: Connect racing the commit-to-start gap cannot overwrite the attempt
+
+- **WHEN** a second `connect` call arrives while the first attempt is inside the
+  commit-to-start window (committed toward `driver.start()`, start side effect not yet done)
+- **THEN** the second call fails promptly with `POSIXError(.EALREADY)`, constructs nothing,
+  and the first attempt's continuation and driver are untouched — the driver starts exactly
+  once and the first call still completes with its own outcome
+
+#### Scenario: Connect after close preserves the closed-transport contract
+
+- **WHEN** `connect` is called after `close()` has been called
+- **THEN** it fails promptly with `POSIXError(.ECONNABORTED)` and the driver factory is never
+  invoked
+
+#### Scenario: Retry after a failed attempt is rejected
+
+- **WHEN** the first connect attempt has failed and `connect` is called again
+- **THEN** the call fails promptly with `POSIXError(.EALREADY)`; no second driver is ever
+  constructed or started (a fresh transport instance is required to retry)
+
+#### Scenario: Exactly one start and one terminal result per accepted attempt
+
+- **WHEN** any combination of accepted and rejected `connect` calls occurs
+- **THEN** the driver factory runs at most once, `driver.start()` runs at most once, and the
+  accepted attempt's continuation resolves exactly once
+
 ### Requirement: connect claims its outcome atomically — selection and duty assignment in one transition
 
 `connect(host:port:)` SHALL be a self-contained lifecycle that does not depend on libsmb2's
@@ -73,14 +129,16 @@ readiness, the connection SHALL be cancelled and released exactly once (clearing
 reference and state handler) and the continuation resumed with the mapped error — with the
 start handoff atomic with the claim: a loser that wins before the connect path commits toward
 starting the driver SHALL suppress the start entirely (the driver's `start` is never invoked
-and nothing is cancelled); a loser that wins after the commit but before `start` returns SHALL
-neither cancel nor resume inside that window — the starting path finishes the parked loss after
-`start` returns, cancelling the started driver exactly once, only then resuming with the
-loser's error, and only after that completing any `close()` callers parked on the pending
-teardown — so the driver is never cancelled before its start side effect, no connection
-activity begins after a losing resume, and `close()` never returns while the committed start
-(or its cancel) is still pending; a loser that wins after `start` has returned performs
-the single cancel/release and resume itself. It SHALL handle
+and nothing is cancelled) and SHALL cancel the deadline again after `schedule` returns when
+the claim was consumed while the timer was arming (so a late-armed timer never survives — see
+the deadline requirement below); a loser that wins after the commit but before `start` returns
+SHALL neither cancel nor resume inside that window — the starting path finishes the parked
+loss after `start` returns, cancelling the started driver exactly once, only then resuming
+with the loser's error — so the driver is never cancelled before its start side effect and no
+connection activity begins after a losing resume; the in-flight-work flag spanning the whole
+attempt clears only after that handoff, so `close()` (which waits on it) never returns while
+the committed start or its teardown is still pending; a loser that wins after `start` has
+returned performs the single cancel/release and resume itself. It SHALL handle
 every `NWConnection` state explicitly — `.setup`/`.preparing` (progress), `.waiting`
 (non-terminal; record the error and keep waiting), `.ready` (success), `.failed` (mapped
 `POSIXError`), `.cancelled` (terminal acknowledgment of a requested cancel) — and SHALL enforce
@@ -143,15 +201,15 @@ connecting → `POSIXError(.ECONNABORTED)`; deadline expiry → `POSIXError(.ETI
   cancel — no connection activity begins after the losing resume
 - **AND** any `close()` call made while that teardown is pending — whether it is the loss's
   owner or arrived after another loser parked the loss — SHALL NOT return until the started
-  driver has been cancelled, so a parked committed start (or its cancel) can never fire after
-  `close()` has returned
+  driver has been cancelled and the attempt's in-flight work has completed, so a parked
+  committed start (or its cancel) can never fire after `close()` has returned
 
 #### Scenario: Concurrent closes during a pending committed-start teardown
 
 - **WHEN** two or more `close()` calls race the commit-to-start window (or each other) while
   the committed start's teardown is pending
-- **THEN** every `close()` caller waits for the same single teardown, the started driver is
-  cancelled exactly once, and the connect continuation is resumed exactly once with
+- **THEN** every `close()` caller waits for the same single completed teardown, the started
+  driver is cancelled exactly once, and the connect continuation is resumed exactly once with
   `POSIXError(.ECONNABORTED)`
 
 #### Scenario: Deadline expiry
@@ -165,6 +223,17 @@ connecting → `POSIXError(.ECONNABORTED)`; deadline expiry → `POSIXError(.ETI
   **nothing is cancelled**. The third phase — a loss landing after the commit but before `start`
   returns — is governed by the "Loss in the commit-to-start window" scenario above
 - **AND** a deadline that fires after `.ready` has won the claim is a side-effect-free no-op
+
+#### Scenario: A timer armed after an earlier loss is cancelled (no late-armed survivor)
+
+- **WHEN** a loser (close, task cancellation, or a deadline firing synchronously inside
+  `schedule`) consumes the connect claim and calls the scheduler's `cancel()` in the
+  store-to-schedule window, before `schedule` has recorded a timer, and `schedule` then
+  records itself as armed and returns
+- **THEN** the connect attempt's post-`schedule` claim re-check notices the consumed claim and
+  cancels the late-armed timer before finishing; the final scheduler state is unarmed, the
+  continuation resolves exactly once, and no timer remains armed after a terminal connect
+  outcome or a completed `close()` — timer self-expiry is never relied upon
 
 #### Scenario: Successful connect keeps the connection
 
@@ -208,7 +277,7 @@ the single stream exactly as over TCP.
 `receive()` SHALL return the next available inbound chunk as `Data`, buffering incrementally
 when data arrives faster than it is consumed. After `.ready`, the transport SHALL track a
 lock-guarded established-connection lifecycle with recorded causes (design D8):
-`ready → localClosing → closed`, or `ready → failed(error)`. The three teardown shapes are:
+`ready → closed`, or `ready → failed(error)`. The three teardown shapes are:
 **peer-originated graceful EOF** (server closes the stream) → `receive()` returns empty
 `Data`; **local close** — `close()` SHALL atomically record the local-close cause **before**
 calling `NWConnection.cancel()`, so the resulting `.cancelled` state event is never converted
@@ -265,22 +334,32 @@ NOT overwrite an already-recorded local-close result.
 - **NOTE** deterministic through the injected connection driver, which delivers post-ready
   state events on demand (design D7 seams; tasks 2.5)
 
-### Requirement: close is idempotent and releases resources
+### Requirement: close runs a first-caller-owned lifecycle and every caller observes completed teardown
 
-`close()` SHALL atomically record the local-close cause (design D8) **before** cancelling the
-QUIC connection, then cancel the connection, resume any parked `receive()` waiter with empty
-`Data` (the local-close EOF signal — an empty-`Data` bridge teardown signal, not a
-peer-originated graceful EOF — matching `TCPTransportApple` so the `TransportBridge` sees the
-identical teardown signal on both conformers), release all resources, and SHALL be safe to call multiple
-times and concurrently with in-flight operations. Because the cause is recorded first, the
-`.cancelled` state event produced by `close()`'s own `NWConnection.cancel()` SHALL never be
-treated as abnormal transport loss. `close()` SHALL NOT complete while a committed driver
-start's **parked-loss** teardown is still pending (the commit-to-start window, design D7):
-every `close()` call — first, repeated, or concurrent — waits for that teardown, so once any
-`close()` has returned, no parked start, cancel, or close-owned resource release remains
-outstanding. In the one committed-start case with no parked loss (`.ready` won while `start()`
-had not yet returned), no wait is needed: the start side effect has already happened and
-`close()` cancels the driver itself before returning (design D7).
+`close()` SHALL run an explicit close lifecycle (`open → closing → closed`, design D7/D8): the
+first caller atomically becomes the teardown owner, records the local-close cause **before**
+cancelling the QUIC connection, then — on a dedicated non-cooperative teardown queue — cancels
+the connection, resumes any parked `receive()` waiter with empty `Data` (the local-close EOF
+signal — an empty-`Data` bridge teardown signal, not a peer-originated graceful EOF — matching
+`TCPTransportApple` so the `TransportBridge` sees the identical teardown signal on both
+conformers), resolves the connect continuation when close won the connect claim, waits for any
+in-flight connect work (a committed `start()` that has not returned — including the
+ready-mid-start case — its post-start handoff, or the deadline-arming tail with its late-armed
+re-check), and only then transitions to fully closed and resumes every waiting caller. Because
+the cause is recorded first, the `.cancelled` state event produced by `close()`'s own
+`NWConnection.cancel()` SHALL never be treated as abnormal transport loss.
+
+`close()` SHALL be safe to call multiple times and concurrently with in-flight operations,
+with these mandatory invariants: only the owner performs cancellation/resource release; every
+caller arriving while teardown is running waits for that same completed teardown (a concurrent
+second close is NOT a mere no-op — it must not return before teardown finishes); only a call
+made after a prior close fully completed may return immediately as the terminal no-op; exactly
+one cancel and exactly one resumption per owned resource; and no lock is held across an await,
+a driver or deadline call, or a continuation resumption. Once any `close()` has returned, no
+start, receive-arm, parked teardown, close-owned resource release, or armed timer remains
+outstanding (the sole remnant is resolution-only: a `connect()` caught between its reservation
+and its continuation store aborts itself with `ECONNABORTED` afterwards, creating no driver or
+timer activity).
 
 The post-`close()` contract is deliberately asymmetric between the two directions, and SHALL use
 the same error and EOF signals as `TCPTransportApple` so `TransportBridge` sees the same teardown
@@ -337,10 +416,34 @@ must change.
 - **WHEN** `send(_:)` is called on a transport that was never connected
 - **THEN** it throws `POSIXError(.ENOTCONN)`
 
-#### Scenario: Double close
+#### Scenario: Concurrent close during established teardown waits for completion
 
-- **WHEN** `close()` is called twice
-- **THEN** the second call is a no-op and no crash or double-release occurs
+- **WHEN** two `close()` calls race while the first is tearing down an established connection
+  (driver cancellation still in progress)
+- **THEN** neither call returns before the driver cancellation has completed, the driver is
+  cancelled exactly once, and both callers then return
+
+#### Scenario: Concurrent close during a pre-commit connect abort waits for the attempt tail
+
+- **WHEN** two `close()` calls race while the first is aborting a connect attempt that has not
+  committed toward `driver.start()` (e.g. the deadline is still arming)
+- **THEN** the connect resolves exactly once with `POSIXError(.ECONNABORTED)`, the driver
+  never starts, both close callers wait for the attempt's in-flight work to finish (including
+  cancelling a late-armed timer), and only then return
+
+#### Scenario: Close during ready-mid-start waits for the start tail
+
+- **WHEN** `.ready` won the connect claim while `driver.start()` had not yet returned, and
+  `close()` is called
+- **THEN** `close()` cancels the ready driver (exactly once) but does not return until
+  `start()` has returned and the attempt's handoff completed; after `close()` returns, no
+  start tail or teardown operation remains outstanding
+
+#### Scenario: Close after a fully completed close is a prompt no-op
+
+- **WHEN** `close()` is called after a prior `close()` has fully completed its teardown
+- **THEN** the call returns promptly, performs no second teardown, and no crash or
+  double-release occurs
 
 ### Requirement: TLS trust is a mutually exclusive policy, secure by default
 

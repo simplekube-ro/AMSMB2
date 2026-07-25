@@ -32,7 +32,9 @@ enum QUICConnectionState: Sendable {
 /// Abstraction over the underlying QUIC connection so the connect state machine and the
 /// established-connection lifecycle are testable without a live handshake (design D7). The
 /// production implementation is a thin `NWConnection` wrapper; tests inject a scripted double.
-protocol QUICConnectionDriver: AnyObject {
+/// `Sendable` because the transport hands the driver across its start/teardown GCD queues;
+/// conformers guard their own state (`@unchecked Sendable` with an internal lock).
+protocol QUICConnectionDriver: AnyObject, Sendable {
     /// Starts the connection. State events are delivered to `onState`; inbound stream bytes (and a
     /// final empty `Data` on stream EOF) or a receive error are delivered to `onReceive`. Both
     /// handlers are invoked serially on the connection's private queue.
@@ -71,9 +73,15 @@ enum QUICResolvedTrust {
 
 /// An `SMBTransport` backed directly by `NWConnection` with `NWProtocolQUIC` (design D1/D2).
 ///
-/// One instance maps to one QUIC connection lifetime. After `close()` the instance is unusable;
-/// create a fresh one to reconnect. Availability floor is spelled out explicitly, including
-/// macCatalyst 15 (Package.swift declares `.macCatalyst(.v13)`).
+/// One instance maps to one QUIC connection lifetime, and `connect(host:port:)` is strictly
+/// **one-shot**: the first call atomically reserves the instance's single connect attempt, and
+/// every other call is rejected deterministically without creating a driver or any network
+/// activity — `POSIXError(.EALREADY)` while the attempt is in flight or after it failed (retry
+/// after a failed attempt is NOT supported; build a fresh transport, as `SMB2Client` does),
+/// `POSIXError(.EISCONN)` once connected, and `POSIXError(.ECONNABORTED)` after `close()`.
+/// After `close()` the instance is unusable; create a fresh one to reconnect. Availability
+/// floor is spelled out explicitly, including macCatalyst 15 (Package.swift declares
+/// `.macCatalyst(.v13)`).
 @available(iOS 15, macOS 12, macCatalyst 15, tvOS 15, watchOS 8, visionOS 1, *)
 public final class QUICTransportApple: SMBTransport, @unchecked Sendable {
     // MARK: - Injected collaborators
@@ -84,33 +92,47 @@ public final class QUICTransportApple: SMBTransport, @unchecked Sendable {
     let connectTimeout: TimeInterval
     private let driverFactory: (_ host: String, _ port: Int, _ trust: QUICResolvedTrust) -> any QUICConnectionDriver
     private let deadline: any ConnectDeadlineScheduler
-    /// Dedicated (non-cooperative) queue for `driver.start()` and the post-start handoff, so the
-    /// call never occupies a Swift cooperative-pool thread — a driver that blocks inside
-    /// `start()` (the deterministic race tests do) parks a GCD worker only, and the connect task
-    /// suspends on its continuation instead of pinning an executor thread (design D7).
+    /// Dedicated (non-cooperative) queue for the whole connect attempt after the continuation
+    /// store — deadline arming, the commit, `driver.start()`, and the post-start handoff — so
+    /// none of it ever occupies a Swift cooperative-pool thread: a driver or scheduler that
+    /// blocks inside `start()`/`schedule()` (the deterministic race tests do) parks a GCD
+    /// worker only, and the connect task suspends on its continuation meanwhile (design D7).
     private let startQueue = DispatchQueue(label: "org.amsmb2.quic.start")
+    /// Dedicated (non-cooperative) queue for the close owner's resource teardown (driver
+    /// cancellation, waiter resumption), awaited by `close()` — same rationale as `startQueue`.
+    private let teardownQueue = DispatchQueue(label: "org.amsmb2.quic.teardown")
 
     // MARK: - Lock-guarded state (design D3)
 
     private let lock = NSLock()
 
-    /// Connect-phase state. The continuation is taken by the single winning completion path.
+    /// Connect-phase state, doubling as the one-shot attempt reservation: `connect` may only
+    /// transition `.idle → .reserved` (atomically, before any driver exists), so exactly one
+    /// call ever owns the attempt; every other call is rejected by the state it observes
+    /// (`.reserved`/`.connecting` → `EALREADY`, `.ready` → `EISCONN`, `.failed` → `EALREADY`;
+    /// retry after failure is unsupported — one instance, one attempt). The continuation is
+    /// taken by the single winning completion path.
     private enum ConnectState {
         case idle
+        /// The single attempt is claimed; trust resolution/driver construction are running and
+        /// the continuation is not stored yet.
+        case reserved
         case connecting(CheckedContinuation<Void, any Error>)
         case ready
-        /// Connect resolved with a failure/cancel/close/deadline (claim consumed).
+        /// Attempt consumed unsuccessfully (failure/cancel/close/deadline/validation).
         case failed
     }
 
     private var connectState: ConnectState = .idle
+    /// Set by the task-cancellation handler; consumed by the continuation store on `startQueue`
+    /// (which runs outside the task context, so it cannot consult `Task.isCancelled` itself).
+    private var cancelRequested = false
 
     /// Established-connection lifecycle with recorded causes (design D8). Only meaningful after
-    /// `.ready` has won. `localClosing`/`closed` record a local-close cause so the resulting
-    /// `.cancelled` event is never misread as abnormal loss; `failed` is abnormal transport loss.
+    /// `.ready` has won. `closed` records the local-close cause so the resulting `.cancelled`
+    /// event is never misread as abnormal loss; `failed` is abnormal transport loss.
     private enum Lifecycle {
         case active
-        case localClosing
         case closed
         case failed
     }
@@ -140,20 +162,34 @@ public final class QUICTransportApple: SMBTransport, @unchecked Sendable {
     /// A losing outcome that won while `startPhase == .starting`; consumed exactly once by the
     /// starting path's post-`start()` handoff.
     private var pendingLoss: (continuation: CheckedContinuation<Void, any Error>, error: any Error)?
-    /// `true` from the moment a losing outcome is parked in `pendingLoss` until the post-start
-    /// handoff has cancelled the started driver and resumed the connect continuation. While set,
-    /// `close()` parks in `closeWaiters` instead of returning — `SMBTransport.close()` promises
-    /// all resources are released when it returns, so no driver start (or cancel) may still be
-    /// pending at that point (design D7).
-    private var teardownPending = false
-    /// `close()` callers parked until a pending committed-start teardown completes (design D7).
+    /// `true` from the continuation store until the connect attempt's `startQueue` block has
+    /// fully finished — deadline arming (including the late-armed-timer re-check), the commit,
+    /// `driver.start()`, and the complete post-start handoff. While set, the close owner parks
+    /// in `connectWorkWaiters` before finalizing: `SMBTransport.close()` promises all resources
+    /// are released when it returns, so no start, receive-arm, parked-loss teardown, or
+    /// late-armed timer may still be pending at that point (design D7).
+    private var connectWorkInFlight = false
+    /// Close owner(s) parked until the in-flight connect work completes (design D7).
+    private var connectWorkWaiters: [CheckedContinuation<Void, Never>] = []
+
+    /// Close lifecycle (design D7/D8). The first `close()` caller atomically becomes the
+    /// teardown owner (`.open → .closing`); callers arriving during `.closing` park in
+    /// `closeWaiters` and are resumed only after the owner has fully finished — resources
+    /// released, in-flight connect work drained — and transitioned to `.closed`. A call after
+    /// `.closed` returns immediately (the terminal no-op).
+    private enum CloseState: Equatable {
+        case open
+        case closing
+        case closed
+    }
+
+    private var closeState: CloseState = .open
+    /// `close()` callers parked while another caller owns the teardown (`closeState == .closing`).
     private var closeWaiters: [CheckedContinuation<Void, Never>] = []
     /// Last `.waiting` error, folded into the `ETIMEDOUT` description on deadline expiry.
     private var lastWaitingError: POSIXError?
     /// `true` once `.ready` won the connect claim — gates `receive()`'s never-connected `ENOTCONN`.
     private var everReady = false
-    /// Set by `close()`; makes `receive()` return empty `Data` and `close()` idempotent.
-    private var isClosed = false
 
     /// Inbound chunk FIFO (bytes arrived faster than consumed) + a single parked `receive()`.
     private var inboundChunks: [Data] = []
@@ -200,100 +236,169 @@ public final class QUICTransportApple: SMBTransport, @unchecked Sendable {
 
     // MARK: - SMBTransport: connect (design D7)
 
-    /// Establishes the QUIC connection as a self-contained one-shot state machine with a
+    /// Establishes the QUIC connection as a self-contained **one-shot** state machine with a
     /// deterministic, always-armed deadline (design D7). Does not rely on libsmb2's
     /// cancellation/timeout machinery, which is not installed during the eager transport connect.
+    ///
+    /// One-shot contract: the first call atomically reserves the instance's single connect
+    /// attempt **before** trust resolution or driver construction, so a rejected call performs
+    /// no work at all (no driver, no network activity) and can never overwrite the owning
+    /// attempt's continuation, driver, deadline, or start phase. Rejected calls fail promptly:
+    /// `EALREADY` while the attempt is in flight, `EISCONN` after success, `EALREADY` after a
+    /// failed attempt (retry is unsupported — one instance per connection lifetime; build a
+    /// fresh transport instead), `ECONNABORTED` after `close()`. An accepted attempt that fails
+    /// validation (e.g. `EINVAL` trust material) also consumes the one shot.
     public func connect(host: String, port: Int) async throws {
-        // Cancellation before start: no NWConnection is created.
+        // Cancellation before the reservation: nothing is consumed, no NWConnection is created.
         try Task.checkCancellation()
+
+        // One-shot attempt reservation (atomic; before any driver/trust work).
+        try lock.withLock {
+            guard closeState == .open else {
+                throw POSIXError(.ECONNABORTED, description: "QUICTransportApple: connect after close()")
+            }
+            switch connectState {
+            case .idle:
+                connectState = .reserved
+            case .reserved, .connecting:
+                throw POSIXError(.EALREADY, description: "QUICTransportApple: connect already in progress")
+            case .ready:
+                throw POSIXError(.EISCONN, description: "QUICTransportApple: already connected")
+            case .failed:
+                throw POSIXError(
+                    .EALREADY,
+                    description: "QUICTransportApple: one-shot connect attempt already consumed"
+                )
+            }
+        }
 
         // Eager, fail-closed trust resolution BEFORE any connection object exists (design D5):
         // invalid DER and the empty custom-roots set throw `EINVAL` before network activity.
-        let trust = try Self.resolveTrust(configuration.trustPolicy, host: host)
+        // A validation failure consumes the reserved attempt (one-shot).
+        let trust: QUICResolvedTrust
+        do {
+            trust = try Self.resolveTrust(configuration.trustPolicy, host: host)
+        } catch {
+            lock.withLock { connectState = .failed }
+            throw error
+        }
 
         let driver = driverFactory(host, port, trust)
 
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
-                // Store the continuation + driver under the lock, re-checking cancellation/close
-                // so a cancel that raced the store never leaves the continuation orphaned.
-                enum StartAction { case started, cancelled, closed }
-                let action: StartAction = lock.withLock {
-                    if isClosed {
-                        return .closed
-                    }
-                    if Task.isCancelled {
-                        return .cancelled
-                    }
-                    connectState = .connecting(continuation)
-                    self.driver = driver
-                    return .started
-                }
-                switch action {
-                case .closed:
-                    continuation.resume(throwing: POSIXError(.ECONNABORTED))
-                    return
-                case .cancelled:
-                    continuation.resume(throwing: CancellationError())
-                    return
-                case .started:
-                    break
-                }
-
-                // Arm the always-on deadline. Arming may itself resolve the connect (a scheduler
-                // that fires synchronously, or a real timer racing) — hence the claim re-check below.
-                deadline.schedule(after: connectTimeout) { [weak self] in
-                    self?.resolveConnect(.deadline)
-                }
-
-                // Commit toward starting the driver, atomically with the claim (design D7): if a
-                // close()/deadline/cancel winner consumed the claim in the window after the store
-                // lock released, it recorded the start as forbidden and the setup body starts
-                // nothing. Once `.starting` is committed, a loser that wins before `start()`
-                // returns parks its outcome instead of cancelling — the handoff below finishes
-                // it, so the driver is never cancelled before its start side effect and never
-                // started after a losing teardown.
-                let mayStart: Bool = lock.withLock {
-                    guard case .connecting = connectState else { return false }
-                    startPhase = .starting
-                    return true
-                }
-                guard mayStart else { return } // winner already resumed the continuation.
-                // The start + post-start handoff runs on the dedicated start queue (never a
-                // cooperative thread); the connect task suspends on the continuation meanwhile.
+                // The whole attempt after this point — store, deadline arming, commit, start,
+                // handoff — runs on the dedicated start queue (never a cooperative thread); the
+                // connect task suspends on the continuation meanwhile (design D7).
                 startQueue.async { [self] in
-                    driver.start(
-                        onState: { [weak self] state in self?.handleState(state) },
-                        onReceive: { [weak self] result in self?.handleReceive(result) }
-                    )
-                    // Post-start handoff: finish a loss that won while start was committed —
-                    // exactly one cancel of the started driver, the continuation resumes only
-                    // after it, and only then are parked `close()` callers completed (so a
-                    // returned `close()` proves no start or cancel is still pending).
-                    let loss = lock.withLock {
-                        () -> (continuation: CheckedContinuation<Void, any Error>, error: any Error)? in
-                        startPhase = .started
-                        defer { pendingLoss = nil }
-                        return pendingLoss
-                    }
-                    if let loss {
-                        deadline.cancel()
-                        driver.cancel()
-                        loss.continuation.resume(throwing: loss.error)
-                    }
-                    let waiters: [CheckedContinuation<Void, Never>] = lock.withLock {
-                        teardownPending = false
-                        let waiters = closeWaiters
-                        closeWaiters = []
-                        return waiters
-                    }
-                    for waiter in waiters {
-                        waiter.resume(returning: ())
-                    }
+                    runConnectAttempt(continuation, driver: driver)
                 }
             }
         } onCancel: {
+            // Order matters: set the flag first so a store that has not run yet aborts, then
+            // claim a stored continuation. Exactly one of the two acts.
+            lock.withLock { cancelRequested = true }
             resolveConnect(.taskCancelled)
+        }
+    }
+
+    /// The connect attempt body, serialized on `startQueue` (design D7): store the continuation
+    /// (re-checking close/cancellation so a racer never strands it), arm the deadline, commit
+    /// toward `driver.start()`, start, then perform the post-start handoff. `connectWorkInFlight`
+    /// spans this entire block once the store succeeds, so `close()` can wait for the full tail.
+    private func runConnectAttempt(
+        _ continuation: CheckedContinuation<Void, any Error>, driver: any QUICConnectionDriver
+    ) {
+        enum StoreAction { case proceed, closed, cancelled }
+        let action: StoreAction = lock.withLock {
+            guard closeState == .open else {
+                connectState = .failed
+                return .closed
+            }
+            guard !cancelRequested else {
+                connectState = .failed
+                return .cancelled
+            }
+            connectState = .connecting(continuation)
+            self.driver = driver
+            connectWorkInFlight = true
+            return .proceed
+        }
+        switch action {
+        case .closed:
+            continuation.resume(
+                throwing: POSIXError(.ECONNABORTED, description: "QUIC connect aborted by close()")
+            )
+            return
+        case .cancelled:
+            continuation.resume(throwing: CancellationError())
+            return
+        case .proceed:
+            break
+        }
+
+        // Arm the always-on deadline. Arming may itself resolve the connect (a scheduler that
+        // fires synchronously, or a real timer racing) — hence the claim re-check below.
+        deadline.schedule(after: connectTimeout) { [weak self] in
+            self?.resolveConnect(.deadline)
+        }
+
+        // Commit toward starting the driver, atomically with the claim (design D7): if a
+        // close()/deadline/cancel winner consumed the claim in the window after the store
+        // lock released, it recorded the start as forbidden and this body starts nothing.
+        // Once `.starting` is committed, a loser that wins before `start()` returns parks its
+        // outcome instead of cancelling — the handoff below finishes it, so the driver is
+        // never cancelled before its start side effect and never started after a losing
+        // teardown.
+        let mayStart: Bool = lock.withLock {
+            guard case .connecting = connectState else { return false }
+            startPhase = .starting
+            return true
+        }
+        guard mayStart else {
+            // The claim was consumed while (or before) the timer was arming, so the loser's
+            // `deadline.cancel()` may have run before `schedule` recorded the timer. Cancel
+            // again (idempotent) so no late-armed timer survives the terminal outcome.
+            deadline.cancel()
+            finishConnectWork()
+            return
+        }
+
+        driver.start(
+            onState: { [weak self] state in self?.handleState(state) },
+            onReceive: { [weak self] result in self?.handleReceive(result) }
+        )
+        // Post-start handoff: finish a loss that won while start was committed — exactly one
+        // cancel of the started driver, the continuation resumes only after it. `.started` is
+        // published in the same critical section that consumes the parked loss, so a loss
+        // arriving after it self-serves its own teardown.
+        let loss = lock.withLock {
+            () -> (continuation: CheckedContinuation<Void, any Error>, error: any Error)? in
+            startPhase = .started
+            defer { pendingLoss = nil }
+            return pendingLoss
+        }
+        if let loss {
+            deadline.cancel()
+            driver.cancel()
+            loss.continuation.resume(throwing: loss.error)
+        }
+        finishConnectWork()
+    }
+
+    /// Marks the connect attempt's `startQueue` block finished and resumes any close owner
+    /// parked on it (design D7): only after this may `close()` finalize, so a returned
+    /// `close()` proves no start, receive-arm, parked-loss teardown, or late-armed timer is
+    /// still outstanding.
+    private func finishConnectWork() {
+        let waiters: [CheckedContinuation<Void, Never>] = lock.withLock {
+            connectWorkInFlight = false
+            let waiters = connectWorkWaiters
+            connectWorkWaiters = []
+            return waiters
+        }
+        for waiter in waiters {
+            waiter.resume(returning: ())
         }
     }
 
@@ -333,7 +438,6 @@ public final class QUICTransportApple: SMBTransport, @unchecked Sendable {
             return LossDuty(continuation: continuation, error: error, driverToCancel: nil)
         case .starting:
             pendingLoss = (continuation, error) // the starting path finishes this loss.
-            teardownPending = true // close() must wait for that handoff before returning.
             driver = nil
             return nil
         case .started, .forbidden:
@@ -534,7 +638,7 @@ public final class QUICTransportApple: SMBTransport, @unchecked Sendable {
 
     public func send(_ bytes: Data) async throws {
         let driver: (any QUICConnectionDriver)? = lock.withLock {
-            (isClosed || !everReady) ? nil : self.driver
+            (closeState != .open || !everReady) ? nil : self.driver
         }
         guard let driver else {
             throw POSIXError(.ENOTCONN, description: "QUICTransportApple: not connected")
@@ -551,8 +655,9 @@ public final class QUICTransportApple: SMBTransport, @unchecked Sendable {
                         // TCPTransportApple's "drain buffer before EOF").
                         if !inboundChunks.isEmpty {
                             continuation.resume(returning: inboundChunks.removeFirst())
-                        } else if isClosed {
-                            // After close() → empty Data (the close contract wins over a prior error).
+                        } else if closeState != .open {
+                            // After (or during) close() → empty Data (the close contract wins
+                            // over a prior error).
                             continuation.resume(returning: Data())
                         } else if let error = receiveError {
                             continuation.resume(throwing: error) // abnormal loss (pre-close).
@@ -582,83 +687,128 @@ public final class QUICTransportApple: SMBTransport, @unchecked Sendable {
         )
     }
 
-    /// Closes the connection idempotently. Records the local-close cause under the lock **before**
-    /// `NWConnection.cancel()`, so the resulting `.cancelled` state event is never misread as
-    /// abnormal loss (design D8); resumes a parked `receive()` with empty `Data` (the local-close
-    /// EOF signal, matching `TCPTransportApple.signalClosed()`), and releases resources.
+    /// Closes the connection through the close lifecycle (`open → closing → closed`, design
+    /// D7/D8). The first caller atomically becomes the teardown **owner**; it records the
+    /// local-close cause under the lock **before** `NWConnection.cancel()` (so the resulting
+    /// `.cancelled` state event is never misread as abnormal loss), performs the resource
+    /// teardown on the dedicated teardown queue — cancel the driver exactly once, resume a
+    /// parked `receive()` with empty `Data` (the local-close EOF signal, matching
+    /// `TCPTransportApple.signalClosed()`), resolve the connect continuation if close won the
+    /// claim — then waits for any in-flight connect work (a committed `start()` that has not
+    /// returned, its handoff, or the deadline arming tail) to finish, and only then transitions
+    /// to `.closed` and resumes every concurrent caller.
     ///
-    /// `SMBTransport.close()` promises resources are released when it returns, so this never
-    /// completes while a committed `driver.start()` whose loss was parked is still awaiting its
-    /// teardown: every path — including repeated/concurrent `close()` calls — waits for the
-    /// post-start handoff to finish that teardown before returning (design D7). The one
-    /// committed-start case with no parked loss (`.ready` won while `start()` had not yet
-    /// returned) needs no wait: the start side effect has already happened — `.ready` was
-    /// emitted by it — and `close()` cancels the driver itself before returning, leaving only
-    /// the tail of `start()` running against a cancelled driver with cleared handlers.
+    /// `SMBTransport.close()` promises resources are released when it returns — for **every**
+    /// caller: a `close()` arriving while another caller owns the teardown waits for that same
+    /// teardown to complete; only a call made after a prior close fully completed returns
+    /// immediately. No lock is held across an await, a driver/deadline call, or a continuation
+    /// resumption, and each owned resource is cancelled/resumed exactly once.
+    ///
+    /// The one connect-phase remnant a returned `close()` may leave behind is resolution-only:
+    /// a `connect()` caught between its attempt reservation and its continuation store aborts
+    /// itself with `ECONNABORTED` when the store observes the closed lifecycle — it creates no
+    /// driver activity and arms no timer (the store aborts before both).
     public func close() async {
-        enum Action {
-            case none
-            case abortConnect(LossDuty)
-            case teardown(CheckedContinuation<Data, any Error>?, (any QUICConnectionDriver)?)
+        enum Entry {
+            case alreadyClosed
+            case waitForOwner
+            case own(abort: LossDuty?, receiveWaiter: CheckedContinuation<Data, any Error>?,
+                     driverToCancel: (any QUICConnectionDriver)?)
         }
-        let action: Action = lock.withLock {
-            if isClosed {
-                return .none
-            }
-            isClosed = true
-            if case .connecting(let continuation) = connectState {
-                // close() while connecting wins the connect claim → ECONNABORTED (design D7).
-                // A nil duty means the loss landed in the commit-to-start window and was parked
-                // for the starting path's handoff — close() performs no teardown itself, but
-                // waits below until that handoff has completed it.
-                guard let duty = consumeLossClaimLocked(
-                    continuation,
-                    error: POSIXError(.ECONNABORTED, description: "QUIC connect aborted by close()")
-                ) else {
-                    return .none
+        let entry: Entry = lock.withLock {
+            switch closeState {
+            case .closed:
+                return .alreadyClosed
+            case .closing:
+                return .waitForOwner
+            case .open:
+                closeState = .closing
+                if case .connecting(let continuation) = connectState {
+                    // close() while connecting wins the connect claim → ECONNABORTED (design
+                    // D7). A nil duty means the loss landed in the commit-to-start window and
+                    // was parked for the starting path's handoff — the owner performs no
+                    // connect teardown itself, but waits below until the handoff completed it.
+                    let duty = consumeLossClaimLocked(
+                        continuation,
+                        error: POSIXError(.ECONNABORTED, description: "QUIC connect aborted by close()")
+                    )
+                    return .own(abort: duty, receiveWaiter: nil, driverToCancel: nil)
                 }
-                return .abortConnect(duty)
+                // Established (or never-started/reserved): record the local-close cause
+                // BEFORE cancel (design D8).
+                lifecycle = .closed
+                let waiter = receiveWaiter
+                receiveWaiter = nil
+                let toCancel = driver
+                driver = nil
+                return .own(abort: nil, receiveWaiter: waiter, driverToCancel: toCancel)
             }
-            // Established (or never-started): record the local-close cause BEFORE cancel.
-            if lifecycle == .active {
-                lifecycle = .localClosing
-            }
-            lifecycle = .closed
-            let waiter = receiveWaiter
-            receiveWaiter = nil
-            let toCancel = driver
-            driver = nil
-            return .teardown(waiter, toCancel)
         }
-        switch action {
-        case .none:
-            break
-        case .abortConnect(let duty):
-            deadline.cancel()
-            duty.driverToCancel?.cancel()
-            duty.continuation.resume(throwing: duty.error)
-        case .teardown(let waiter, let toCancel):
-            toCancel?.cancel()
-            waiter?.resume(returning: Data()) // local-close EOF signal (empty Data).
-        }
-        // Wait for a pending committed-start teardown (this close's own parked loss, one parked
-        // earlier by cancellation/deadline, or one an earlier close() is already waiting on).
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            let parked: Bool = lock.withLock {
-                guard teardownPending else { return false }
-                closeWaiters.append(continuation)
-                return true
+
+        switch entry {
+        case .alreadyClosed:
+            return // terminal no-op: a prior close fully completed.
+        case .waitForOwner:
+            // Park until the owner's teardown has fully completed (resources released,
+            // in-flight connect work drained) and `.closed` was published.
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                let parked: Bool = lock.withLock {
+                    guard closeState == .closing else { return false } // owner finished meanwhile.
+                    closeWaiters.append(continuation)
+                    return true
+                }
+                if !parked {
+                    continuation.resume(returning: ())
+                }
             }
-            if !parked {
-                continuation.resume(returning: ()) // no pending teardown — nothing to wait for.
+            return
+        case .own(let abort, let receiveWaiter, let driverToCancel):
+            // Owner: perform the resource teardown on the dedicated teardown queue (never a
+            // cooperative thread) and wait for it to complete before proceeding.
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                teardownQueue.async { [self] in
+                    if let abort {
+                        deadline.cancel()
+                        abort.driverToCancel?.cancel()
+                        abort.continuation.resume(throwing: abort.error)
+                    }
+                    driverToCancel?.cancel()
+                    receiveWaiter?.resume(returning: Data()) // local-close EOF signal.
+                    continuation.resume(returning: ())
+                }
+            }
+            // Wait for in-flight connect work: a parked committed-start teardown (this close's
+            // own parked loss or one parked earlier by cancellation/deadline), a still-running
+            // `start()` tail (including ready-mid-start), or the deadline-arming tail with its
+            // late-armed-timer re-check.
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                let parked: Bool = lock.withLock {
+                    guard connectWorkInFlight else { return false }
+                    connectWorkWaiters.append(continuation)
+                    return true
+                }
+                if !parked {
+                    continuation.resume(returning: ())
+                }
+            }
+            // Fully closed: publish and release every concurrent caller.
+            let waiters: [CheckedContinuation<Void, Never>] = lock.withLock {
+                closeState = .closed
+                let waiters = closeWaiters
+                closeWaiters = []
+                return waiters
+            }
+            for waiter in waiters {
+                waiter.resume(returning: ())
             }
         }
     }
 
     /// Test observability (internal, like `connectTimeout`): how many `close()` callers are
-    /// currently parked awaiting a pending committed-start teardown.
+    /// currently parked — the owner awaiting in-flight connect work plus concurrent callers
+    /// awaiting the owner's completed teardown.
     var pendingCloseWaiterCount: Int {
-        lock.withLock { closeWaiters.count }
+        lock.withLock { closeWaiters.count + connectWorkWaiters.count }
     }
 
     // MARK: - Trust resolution (design D5)

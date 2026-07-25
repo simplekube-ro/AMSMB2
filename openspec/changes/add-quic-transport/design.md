@@ -401,6 +401,24 @@ libsmb2's cancellation and timeout machinery is installed, so the transport cann
 "Mirror `TCPTransportApple`" is also not sufficient — the TCP conformer delegates connect
 establishment to NIOTS, while QUIC drives `NWConnection` directly. The binding requirements:
 
+- **One-shot connect ownership — the attempt is reserved atomically before any work**:
+  `QUICTransportApple` is public, so repeated/concurrent `connect` calls are reachable by any
+  consumer and must be rejected, not merely documented away. The first call atomically
+  transitions the lock-guarded connect state `.idle → .reserved` **before** trust resolution
+  or driver construction; exactly one call ever owns the attempt. Every other call observes
+  the state and fails promptly without constructing a driver, arming a timer, or touching the
+  owning attempt's continuation/driver/deadline/lifecycle: `.reserved`/`.connecting` →
+  `POSIXError(.EALREADY)`; `.ready` → `POSIXError(.EISCONN)`; `.failed` →
+  `POSIXError(.EALREADY)` (**retry after a failed attempt is unsupported** — one instance per
+  connection lifetime, matching how `SMB2Client` builds a fresh transport per connect); after
+  `close()` → `POSIXError(.ECONNABORTED)` (the existing closed-transport contract, checked
+  first). An accepted attempt that fails eager validation (D5 trust `EINVAL`) also consumes
+  the one shot. Close or task cancellation racing the reservation/preparation phase (between
+  `.reserved` and the continuation store) cannot strand the reservation: the store re-checks
+  the close lifecycle and a `cancelRequested` flag set by `onCancel` under the same lock, and
+  aborts with `ECONNABORTED`/`CancellationError` (consuming the attempt) before any deadline
+  is armed or driver started — the only post-`close()` remnant is that resolution itself,
+  which touches no resource.
 - **Atomic outcome claim — selection AND duty assignment are one transition**: the connect
   attempt holds an `NSLock`-guarded state (`connecting(continuation)` → `ready` | `failed`),
   and every completion path funnels through a single internal
@@ -471,9 +489,16 @@ establishment to NIOTS, while QUIC drives `NWConnection` directly. The binding r
   attempts the claim; a winning claim causes the connection to be cancelled — directly or via
   the parked handoff below — and connect throws `POSIXError(.ETIMEDOUT)` (description includes
   the last `.waiting` error, if any). First of ready/failed/cancel/deadline wins via the atomic
-  claim; the timer is then cancelled exactly once by the party the claim assigned the duty to
-  (the winner itself, except in the parked commit-to-start case, where the starting path
-  cancels it).
+  claim; the timer is then cancelled by the party the claim assigned the duty to (the winner
+  itself, except in the parked commit-to-start case, where the starting path cancels it).
+  **Late-armed timers are cancelled too**: a loser can win the claim and call
+  `deadline.cancel()` in the store-to-schedule window, *before* `schedule` has recorded a
+  timer (a scheduler may even fire synchronously inside `schedule` before recording itself as
+  armed). The connect attempt therefore re-checks the claim after `schedule` returns: if the
+  claim was consumed, it calls `deadline.cancel()` again (idempotent — a second cancel of an
+  already-cancelled or never-armed timer is a no-op) before finishing. No timer remains armed
+  after a terminal connect outcome or a completed `close()`; there is no benign "bounded
+  self-expiry" tail.
 - **Error contract**: task cancellation → `CancellationError` (passes through
   `mapTransportConnectError` unchanged); `close()` while connecting →
   `POSIXError(.ECONNABORTED)`; deadline expiry → `POSIXError(.ETIMEDOUT)`; `.failed` →
@@ -509,47 +534,62 @@ establishment to NIOTS, while QUIC drives `NWConnection` directly. The binding r
   moving the cancel unconditionally back into the winning claim would reintroduce the
   cancel-before-start-side-effect defect this handoff exists to prevent.
 
-  **Close waiters — `close()` never returns before the parked teardown completes**: the parked
-  duty being executed only after `driver.start()` returns must not leak through `close()`'s
-  contract — `SMBTransport.close()` promises that all resources are released when it returns,
-  so a parked start (or its cancel) firing after `close()` has returned is a contract
-  violation, not an acceptable cost. The ownership invariant: **the starting path owns the single teardown;
-  a `close()` caller in that window owns nothing but a completion dependency on it.**
-  Mechanically, parking a loss (by `close()` itself, or by cancellation/deadline before
-  `close()` arrived) sets a `teardownPending` flag under the lock, and every `close()` call —
-  first, repeated, or concurrent — that observes the flag parks a waiter continuation in
-  `closeWaiters`; the starting path resumes those waiters only after it has cancelled the
-  started driver and resumed the connect continuation. Because `close()` is `async`, waiting
-  parks a continuation — no thread blocks and no lock is held across the wait, the resume, or
-  any driver call. Consequences: after any `close()` returns, no parked committed start (or
-  its cancel) remains outstanding — a driver start whose loss was parked can never fire after
-  `close()` has returned; the driver is cancelled at most once; the connect continuation
-  resumes exactly once with `ECONNABORTED` when close owns the loss; and concurrent/repeated
-  `close()` calls all observe completed teardown before returning. Task cancellation and
-  deadline expiry keep their existing rule — the connect continuation is not resumed until the
-  committed driver has been cancelled — but only `close()` additionally waits for the handoff,
-  because only `close()` carries the released-on-return promise.
+  **Close lifecycle — every `close()` caller observes completed teardown**:
+  `SMBTransport.close()` promises that all resources are released when it returns — for
+  *every* caller, in *every* teardown phase, not only the parked commit-to-start path. The
+  transport tracks an explicit close lifecycle under the lock: `.open → .closing → .closed`.
+  The first `close()` caller atomically becomes the **teardown owner** (`.open → .closing`);
+  in the same critical section it takes its duties (win the connect claim with `ECONNABORTED`,
+  or capture the established driver and parked receive waiter, recording the local-close cause
+  before any cancel per D8). It performs the resource teardown — deadline cancel, driver
+  cancel, connect-continuation/receive-waiter resumption — on a dedicated serial teardown
+  queue (`org.amsmb2.quic.teardown`) and awaits its completion; then it awaits any in-flight
+  connect work (below); only then does it publish `.closed` and resume every waiter parked in
+  `closeWaiters`. A `close()` arriving while the state is `.closing` parks a continuation in
+  `closeWaiters` and returns only after the owner's fully-completed teardown; a `close()`
+  after `.closed` returns immediately (the terminal no-op — *distinct from* a concurrent
+  close, which always waits). Because `close()` is `async`, all waiting parks continuations —
+  no thread blocks, and no lock is held across an await, a driver/deadline call, or any
+  continuation resumption. Each owned resource is cancelled and resumed exactly once (the
+  owner or the starting path's handoff, never both — the claim assignment decides).
 
-  The promise is scoped precisely: the one committed-start case with **no** parked loss —
-  `.ready` resolving the claim while `start()` has not yet returned — needs no waiter. There
-  the start side effect has already happened (`.ready` was emitted by it), and `close()`
-  cancels the driver itself, through the established-lifecycle branch, before returning; the
-  tail of `start()` then runs against a cancelled driver whose handlers were cleared, and can
-  neither start anything new nor deliver anywhere. So released-on-return means *no pending
-  teardown and no cancellable resource left*, not an unqualified "nothing executes afterward"
-  (the always-armed deadline timer's bounded self-expiry after a pre-schedule loss is the
-  other, equally benign, tail).
+  **In-flight connect work — close waits for the whole attempt tail**: once the continuation
+  store succeeds, a `connectWorkInFlight` flag (set in the same critical section as the store)
+  spans the *entire* remaining attempt: deadline arming (including the late-armed re-check),
+  the commit, `driver.start()`, and the complete post-start handoff. The close owner, after
+  its own resource teardown, parks on `connectWorkWaiters` until the attempt clears the flag
+  at the end of its `startQueue` block. This covers uniformly: a loss parked in the
+  commit-to-start window (by this close, or earlier by cancellation/deadline — the handoff
+  cancels the started driver exactly once and resumes the connect continuation before the flag
+  clears); **ready-mid-start** — `.ready` resolving the claim while `start()` has not yet
+  returned, where `close()` cancels the ready driver immediately through the established
+  branch but still waits for the in-flight `start()` tail to finish; and the deadline-arming
+  tail. Consequently, after any `close()` returns, no start, receive-arm, parked teardown, or
+  armed timer remains outstanding — released-on-return is unqualified again, with one
+  resolution-only exception: a `connect()` racing `close()` between its attempt reservation
+  and its continuation store aborts itself with `ECONNABORTED` when the store runs; it arms
+  nothing and starts nothing. Task cancellation and deadline expiry keep their existing rule —
+  the connect continuation is not resumed until the committed driver has been cancelled — but
+  only `close()` additionally waits for the full tail, because only `close()` carries the
+  released-on-return promise.
 
-  **Start runs on a dedicated queue**: the connect path invokes `driver.start()` and the
-  post-start handoff on a private serial `DispatchQueue` (`org.amsmb2.quic.start`), never on a
-  Swift cooperative-pool thread. Production cost is one queue hop before `NWConnection.start`;
-  the payoff is that the deterministic race tests can park inside `start()` (holding the
-  commit-to-start window open) while occupying only a GCD worker — the connect task itself is
-  suspended on its continuation — so the gated tests cannot starve the cooperative pool
-  regardless of its width (structurally: the only blocking wait sits on a GCD worker; the
-  suite also runs green with cooperative-pool overcommit disabled via
+  **The attempt runs on a dedicated queue**: after the reservation and driver construction,
+  the whole connect attempt — continuation store, deadline arming, commit, `driver.start()`,
+  post-start handoff — runs on a private serial `DispatchQueue` (`org.amsmb2.quic.start`),
+  never on a Swift cooperative-pool thread; the close owner's resource teardown likewise runs
+  on `org.amsmb2.quic.teardown`. Production cost is one queue hop per connect and per close;
+  the payoff is that the deterministic race tests can park inside `start()`, `cancel()`, or
+  `schedule()` (holding the commit-to-start window, an established teardown, or the
+  store-to-schedule window open) while occupying only a GCD worker — the connect task itself
+  is suspended on its continuation — so the gated tests cannot starve the cooperative pool
+  regardless of its width (structurally: every blocking wait sits on a GCD worker; the suite
+  also runs green with cooperative-pool overcommit disabled via
   `LIBDISPATCH_COOPERATIVE_POOL_STRICT=1`, as corroborating evidence), and their bounded
-  in-driver wait turns broken coordination into a visible failure instead of a hang.
+  in-double waits turn broken coordination into a visible failure instead of a hang. Because
+  the store runs outside the task context, task cancellation is bridged by the
+  `cancelRequested` flag: `onCancel` sets the flag first (so a store that has not run yet
+  aborts) and then attempts the claim (so a stored continuation resolves) — exactly one of the
+  two acts.
 
 **Deterministic testability — injected seams, no wall-clock, no TEST-NET dependence** (unit
 tests must not depend on how the local network stack treats unroutable addresses — routing,
@@ -607,9 +647,9 @@ wire. That is the existing, accepted contract for the TCP seam, and QUIC inherit
   `TCPTransportApple` — but because local `close()` itself calls `NWConnection.cancel()`
   (which then delivers a `.cancelled` state event), the distinction is implemented as an
   explicit, `NSLock`-guarded **established-connection lifecycle with recorded causes**:
-  `ready → localClosing → closed`, or `ready → failed(error)`. Normative semantics:
-  - **Local close**: `close()` atomically records the local-close cause (`localClosing`, then
-    `closed`) under the lock **before** calling `NWConnection.cancel()`, resumes a parked
+  `ready → closed`, or `ready → failed(error)`. Normative semantics:
+  - **Local close**: the close owner atomically records the local-close cause (`closed`)
+    under the lock **before** calling `NWConnection.cancel()`, resumes a parked
     `receive()` with empty `Data` (the bridge teardown signal), and releases resources. The
     `.cancelled` state event that its own `NWConnection.cancel()` subsequently delivers
     observes the recorded cause and is a **no-op acknowledgment** — it is never converted into

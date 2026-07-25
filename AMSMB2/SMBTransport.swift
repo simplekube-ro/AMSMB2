@@ -33,6 +33,13 @@ public protocol SMBTransport: Sendable {
     /// Establishes a connection to `host` on `port`.
     ///
     /// Throws `POSIXError` on failure (e.g. `.ECONNREFUSED`).
+    ///
+    /// An instance represents a single connection lifetime: callers create a
+    /// fresh transport per connection (as `SMB2Client` does) rather than
+    /// reusing one across connects. Conformers should document their own
+    /// rejection behavior for repeated calls — `QUICTransportApple` is
+    /// strictly one-shot and rejects every call after the first
+    /// deterministically (`EALREADY`/`EISCONN`/`ECONNABORTED`).
     func connect(host: String, port: Int) async throws
 
     /// Sends `bytes` to the remote peer.
@@ -45,6 +52,12 @@ public protocol SMBTransport: Sendable {
     func receive() async throws -> Data
 
     /// Closes the connection and releases all resources.
+    ///
+    /// When `close()` returns, the connection's resources are released — for
+    /// every caller: repeated and concurrent calls are safe, and a call made
+    /// while another close is still tearing down returns only after that
+    /// teardown has completed. Only a call made after a prior close fully
+    /// completed may return immediately as a no-op.
     func close() async
 }
 

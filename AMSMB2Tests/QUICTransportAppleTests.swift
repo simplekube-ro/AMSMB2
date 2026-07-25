@@ -151,11 +151,13 @@ final class GatedStartDriver: QUICConnectionDriver, @unchecked Sendable {
     private let entered = TestFlag()
     private let release = DispatchSemaphore(value: 0)
     private var _events: [String] = []
+    private var onState: (@Sendable (QUICConnectionState) -> Void)?
 
     func start(
-        onState _: @escaping @Sendable (QUICConnectionState) -> Void,
+        onState: @escaping @Sendable (QUICConnectionState) -> Void,
         onReceive _: @escaping @Sendable (Result<Data, POSIXError>) -> Void
     ) {
+        lock.withLock { self.onState = onState }
         entered.set()
         // Park before the start side effect; the test owns this window (bounded, see above).
         if release.wait(timeout: .now() + 10) == .timedOut {
@@ -176,6 +178,13 @@ final class GatedStartDriver: QUICConnectionDriver, @unchecked Sendable {
         release.signal() // signal() is async-safe (only wait() is not).
     }
 
+    /// Emits a state through the handler captured at `start()` entry (available even while the
+    /// start is still gated), so a gated connect can be driven to `.ready` after release.
+    func emit(_ state: QUICConnectionState) {
+        let handler = lock.withLock { onState }
+        handler?(state)
+    }
+
     /// Appends a test-owned marker (e.g. `"close-returned"`) to the same ordered event stream,
     /// so caller-visible completions can be ordered against `start`/`cancel`.
     func record(_ event: String) {
@@ -186,6 +195,219 @@ final class GatedStartDriver: QUICConnectionDriver, @unchecked Sendable {
 
     var events: [String] {
         lock.withLock { _events }
+    }
+}
+
+/// A minimal lock-guarded mutable box for values shared between test closures and assertions.
+final class LockedBox<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _value: Value
+
+    init(_ value: Value) {
+        self._value = value
+    }
+
+    func mutate(_ body: (inout Value) -> Void) {
+        lock.withLock { body(&_value) }
+    }
+
+    var value: Value {
+        lock.withLock { _value }
+    }
+}
+
+/// Records the terminal outcome of an async call (success or the thrown error) so tests can
+/// bound-wait on completion and inspect the error without awaiting a task that might hang.
+final class ErrorBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _error: (any Error)?
+    private var _completed = false
+
+    func complete(with error: (any Error)?) {
+        lock.withLock {
+            _error = error
+            _completed = true
+        }
+    }
+
+    var isCompleted: Bool {
+        lock.withLock { _completed }
+    }
+
+    var error: (any Error)? {
+        lock.withLock { _error }
+    }
+}
+
+/// A driver whose `cancel()` parks (bounded) until released — holds an ordinary established
+/// teardown open deterministically so a test can prove concurrent `close()` callers wait for
+/// completed teardown. The park occupies a GCD worker only (the transport performs close-owned
+/// cancellation on its dedicated teardown queue, never a Swift cooperative thread); the wait is
+/// **bounded** — on breakage a `"cancel-timeout"` event is recorded and `cancel()` returns, so
+/// a regression fails with a visible diagnostic instead of hanging the suite.
+final class GatedCancelDriver: QUICConnectionDriver, @unchecked Sendable {
+    private let lock = NSLock()
+    private let release = DispatchSemaphore(value: 0)
+    private var _events: [String] = []
+    private var onState: (@Sendable (QUICConnectionState) -> Void)?
+
+    func start(
+        onState: @escaping @Sendable (QUICConnectionState) -> Void,
+        onReceive _: @escaping @Sendable (Result<Data, POSIXError>) -> Void
+    ) {
+        lock.withLock {
+            self.onState = onState
+            _events.append("start")
+        }
+    }
+
+    func cancel() {
+        if release.wait(timeout: .now() + 10) == .timedOut {
+            lock.withLock { _events.append("cancel-timeout") }
+        }
+        lock.withLock { _events.append("cancel") }
+    }
+
+    func send(_: Data) async throws {}
+
+    // MARK: Test control
+
+    func emit(_ state: QUICConnectionState) {
+        let handler = lock.withLock { onState }
+        handler?(state)
+    }
+
+    func releaseCancel() {
+        release.signal()
+    }
+
+    func record(_ event: String) {
+        lock.withLock { _events.append(event) }
+    }
+
+    var events: [String] {
+        lock.withLock { _events }
+    }
+}
+
+/// A driver that emits `.ready` from **inside** `start()` and then parks (bounded) before
+/// returning — the ready-mid-start shape: the connect succeeds while the tail of `start()` is
+/// still executing. Tests use it to prove `close()` cancels the ready driver immediately but
+/// does not return until the in-flight `start()` tail has finished. Bounded like the other
+/// gated doubles; the park sits on the transport's dedicated start queue (a GCD worker).
+final class ReadyMidStartDriver: QUICConnectionDriver, @unchecked Sendable {
+    private let lock = NSLock()
+    private let release = DispatchSemaphore(value: 0)
+    private var _events: [String] = []
+
+    func start(
+        onState: @escaping @Sendable (QUICConnectionState) -> Void,
+        onReceive _: @escaping @Sendable (Result<Data, POSIXError>) -> Void
+    ) {
+        lock.withLock { _events.append("start-entered") }
+        onState(.ready) // .ready wins while start() is still executing.
+        if release.wait(timeout: .now() + 10) == .timedOut {
+            lock.withLock { _events.append("start-timeout") }
+        }
+        lock.withLock { _events.append("start-returned") }
+    }
+
+    func cancel() {
+        lock.withLock { _events.append("cancel") }
+    }
+
+    func send(_: Data) async throws {}
+
+    // MARK: Test control
+
+    func releaseStart() {
+        release.signal()
+    }
+
+    func record(_ event: String) {
+        lock.withLock { _events.append(event) }
+    }
+
+    var events: [String] {
+        lock.withLock { _events }
+    }
+}
+
+/// A scheduler that parks inside `schedule()` (bounded) after signalling entry, then records
+/// the timer as armed and returns — modelling a real scheduler whose arm-and-record loses the
+/// store-to-schedule race against a loser's early `cancel()`. `schedule()` runs on the
+/// transport's dedicated start queue, so the park never blocks a cooperative thread.
+final class GatedArmingScheduler: ConnectDeadlineScheduler, @unchecked Sendable {
+    private let lock = NSLock()
+    private let entered = TestFlag()
+    private let release = DispatchSemaphore(value: 0)
+    private var _armed = false
+    private var _cancelCount = 0
+    private var _timedOut = false
+
+    func schedule(after _: TimeInterval, fire _: @escaping @Sendable () -> Void) {
+        entered.set()
+        if release.wait(timeout: .now() + 10) == .timedOut {
+            lock.withLock { _timedOut = true }
+        }
+        lock.withLock { _armed = true } // the timer arms late, after any early cancel().
+    }
+
+    func cancel() {
+        lock.withLock {
+            _armed = false
+            _cancelCount += 1
+        }
+    }
+
+    // MARK: Test control
+
+    func releaseSchedule() {
+        release.signal()
+    }
+
+    var didEnterSchedule: Bool { entered.isSet }
+
+    var isArmed: Bool {
+        lock.withLock { _armed }
+    }
+
+    var scheduleTimedOut: Bool {
+        lock.withLock { _timedOut }
+    }
+
+    var cancelCount: Int {
+        lock.withLock { _cancelCount }
+    }
+}
+
+/// A scheduler whose `schedule()` synchronously fires the loss callback FIRST — so the loss
+/// path's `cancel()` runs while no timer is recorded — and only then records itself as armed
+/// (the exact finding-3 store-to-schedule race). The transport's post-schedule claim re-check
+/// must notice the consumed claim and cancel the late-armed timer.
+final class SelfFiringArmingScheduler: ConnectDeadlineScheduler, @unchecked Sendable {
+    private let lock = NSLock()
+    private var _armed = false
+    private var _cancelCount = 0
+
+    func schedule(after _: TimeInterval, fire: @escaping @Sendable () -> Void) {
+        fire() // the loss resolves (and cancels) before any timer exists…
+        lock.withLock { _armed = true } // …then the timer arms late.
+    }
+
+    func cancel() {
+        lock.withLock {
+            _armed = false
+            _cancelCount += 1
+        }
+    }
+
+    var isArmed: Bool {
+        lock.withLock { _armed }
+    }
+
+    var cancelCount: Int {
+        lock.withLock { _cancelCount }
     }
 }
 
@@ -882,6 +1104,413 @@ final class QUICTransportAppleTests: XCTestCase, @unchecked Sendable {
         } catch let posix as POSIXError {
             XCTAssertEqual(posix.code, .EIO)
         }
+    }
+
+    // MARK: - Helpers: bounded connect/close probes (no unbounded awaits on possibly-hung tasks)
+
+    /// Runs `connect` in a child task, capturing the terminal outcome in an `ErrorBox`.
+    /// Tests bound-wait on `outcome.isCompleted` instead of awaiting a task that a regression
+    /// could leave suspended forever.
+    private func launchConnect(
+        _ transport: QUICTransportApple, host: String = "h", port: Int = 443
+    ) -> (task: Task<Void, Never>, outcome: ErrorBox) {
+        let outcome = ErrorBox()
+        let task = Task {
+            do {
+                try await transport.connect(host: host, port: port)
+                outcome.complete(with: nil)
+            } catch {
+                outcome.complete(with: error)
+            }
+        }
+        return (task, outcome)
+    }
+
+    /// Runs `close()` in a child task; `marker` runs after close returns (before the flag).
+    private func launchClose(
+        _ transport: QUICTransportApple, marker: (@Sendable () -> Void)? = nil
+    ) -> (task: Task<Void, Never>, done: TestFlag) {
+        let done = TestFlag()
+        let task = Task {
+            await transport.close()
+            marker?()
+            done.set()
+        }
+        return (task, done)
+    }
+
+    /// Joins `task` only when `completed` is true; otherwise cancels and abandons it — the
+    /// bounded wait that produced `completed == false` has already failed the test with a
+    /// diagnostic, and awaiting a task a regression left suspended would hang the suite.
+    private func reap(_ task: Task<Void, Never>, ifCompleted completed: Bool) async {
+        if completed {
+            await task.value
+        } else {
+            task.cancel()
+        }
+    }
+
+    /// Bound-waits for `outcome` to complete, then asserts it failed with the given POSIX code.
+    private func expectPromptPOSIX(
+        _ outcome: ErrorBox, _ code: POSIXError.Code, _ label: String,
+        file: StaticString = #filePath, line: UInt = #line
+    ) async {
+        await waitUntil({ outcome.isCompleted }, "\(label) must complete promptly", file: file, line: line)
+        guard outcome.isCompleted else { return } // waitUntil already failed with a diagnostic.
+        guard let posix = outcome.error as? POSIXError else {
+            XCTFail(
+                "\(label): expected POSIXError(.\(code.rawValue)), got \(String(describing: outcome.error))",
+                file: file, line: line
+            )
+            return
+        }
+        XCTAssertEqual(posix.code, code, label, file: file, line: line)
+    }
+
+    // MARK: - One-shot connect ownership (P1)
+
+    /// Two concurrent `connect` calls: the first owns the single attempt; the second fails
+    /// promptly with `EALREADY` without constructing a driver, and the first completes
+    /// unaffected. WHY: `QUICTransportApple` is public and documented as one instance per
+    /// connection lifetime — without an atomic reservation a second call would overwrite the
+    /// first continuation and driver, suspending the first caller forever.
+    func testConcurrentSecondConnectFailsEALREADYAndFirstCompletes() async throws {
+        let drivers = LockedBox<[ScriptedQUICDriver]>([])
+        let transport = QUICTransportApple(
+            configuration: SMBQUICConfiguration(),
+            connectTimeout: 30,
+            driverFactory: { _, _, _ in
+                let driver = ScriptedQUICDriver()
+                drivers.mutate { $0.append(driver) }
+                return driver
+            },
+            deadline: ManualDeadlineScheduler()
+        )
+
+        let (firstTask, first) = launchConnect(transport)
+        await waitUntil({ drivers.value.first?.didStart == true }, "first driver started")
+
+        let (secondTask, second) = launchConnect(transport)
+        await expectPromptPOSIX(second, .EALREADY, "second concurrent connect")
+        XCTAssertEqual(drivers.value.count, 1, "the rejected call must not construct a driver")
+
+        drivers.value.first?.emit(.ready)
+        await waitUntil({ first.isCompleted }, "first connect completes")
+        if first.isCompleted {
+            XCTAssertNil(first.error, "the owning connect must succeed unaffected")
+        }
+        XCTAssertEqual(drivers.value.first?.cancelCount, 0, "no cancel on the owning attempt")
+        await reap(firstTask, ifCompleted: first.isCompleted)
+        await reap(secondTask, ifCompleted: second.isCompleted)
+    }
+
+    /// `connect` after `.ready` fails promptly with `EISCONN`; the established driver remains
+    /// installed and usable (no replacement, no leak, no start of a second driver).
+    func testConnectAfterReadyFailsEISCONNAndKeepsDriverUsable() async throws {
+        let drivers = LockedBox<[ScriptedQUICDriver]>([])
+        let transport = QUICTransportApple(
+            configuration: SMBQUICConfiguration(),
+            connectTimeout: 30,
+            driverFactory: { _, _, _ in
+                let driver = ScriptedQUICDriver()
+                drivers.mutate { $0.append(driver) }
+                return driver
+            },
+            deadline: ManualDeadlineScheduler()
+        )
+        let (firstTask, first) = launchConnect(transport)
+        await waitUntil({ drivers.value.first?.didStart == true }, "driver started")
+        drivers.value.first?.emit(.ready)
+        await waitUntil({ first.isCompleted }, "first connect completes")
+        await reap(firstTask, ifCompleted: first.isCompleted)
+
+        let (secondTask, second) = launchConnect(transport)
+        await expectPromptPOSIX(second, .EISCONN, "connect after ready")
+        await reap(secondTask, ifCompleted: second.isCompleted)
+        XCTAssertEqual(drivers.value.count, 1, "the rejected call must not construct a driver")
+
+        try await transport.send(Data([0x0a]))
+        XCTAssertEqual(
+            drivers.value.first?.sentChunks, [Data([0x0a])],
+            "the original established driver remains installed and usable"
+        )
+    }
+
+    /// `connect` while the first attempt sits in the commit-to-start gap fails with `EALREADY`
+    /// and cannot overwrite the first attempt's continuation or driver: after the gate is
+    /// released the first attempt still completes with its own driver, started exactly once.
+    func testSecondConnectInCommitToStartGapFailsEALREADYAndCannotOverwrite() async throws {
+        let driver = GatedStartDriver()
+        let factoryCalls = LockedBox<Int>(0)
+        let transport = QUICTransportApple(
+            configuration: SMBQUICConfiguration(),
+            connectTimeout: 30,
+            driverFactory: { _, _, _ in
+                factoryCalls.mutate { $0 += 1 }
+                return driver
+            },
+            deadline: ManualDeadlineScheduler()
+        )
+
+        let (firstTask, first) = launchConnect(transport)
+        await waitUntil({ driver.didEnterStart }, "first attempt committed toward start")
+
+        let (secondTask, second) = launchConnect(transport)
+        await expectPromptPOSIX(second, .EALREADY, "connect during the commit-to-start gap")
+        await reap(secondTask, ifCompleted: second.isCompleted)
+        XCTAssertEqual(factoryCalls.value, 1, "the rejected call must not construct a driver")
+
+        driver.releaseStart()
+        driver.emit(.ready)
+        await waitUntil({ first.isCompleted }, "first connect completes after release")
+        if first.isCompleted {
+            XCTAssertNil(first.error, "the owning attempt still completes with its own driver")
+        }
+        await reap(firstTask, ifCompleted: first.isCompleted)
+        XCTAssertEqual(
+            driver.events, ["start"],
+            "exactly one driver start; the rejected call started nothing and cancelled nothing"
+        )
+    }
+
+    /// `connect` after `close()` preserves the closed-transport contract (`ECONNABORTED`) and
+    /// performs no work at all: the driver factory is never invoked.
+    func testConnectAfterCloseFailsECONNABORTEDWithoutCreatingDriver() async {
+        let factoryCalls = LockedBox<Int>(0)
+        let transport = QUICTransportApple(
+            configuration: SMBQUICConfiguration(),
+            connectTimeout: 30,
+            driverFactory: { _, _, _ in
+                factoryCalls.mutate { $0 += 1 }
+                return ScriptedQUICDriver()
+            },
+            deadline: ManualDeadlineScheduler()
+        )
+        await transport.close()
+
+        let (task, outcome) = launchConnect(transport)
+        await expectPromptPOSIX(outcome, .ECONNABORTED, "connect after close")
+        await reap(task, ifCompleted: outcome.isCompleted)
+        XCTAssertEqual(factoryCalls.value, 0, "a rejected connect must not create a driver")
+    }
+
+    /// Retry after a failed first attempt is NOT supported: the transport is strictly one-shot
+    /// (one instance per connection lifetime; SMB2Client builds a fresh transport per connect).
+    /// A second call after failure fails promptly with `EALREADY` and constructs nothing.
+    func testConnectAfterFailedAttemptFailsEALREADYNoRetry() async {
+        let drivers = LockedBox<[ScriptedQUICDriver]>([])
+        let transport = QUICTransportApple(
+            configuration: SMBQUICConfiguration(),
+            connectTimeout: 30,
+            driverFactory: { _, _, _ in
+                let driver = ScriptedQUICDriver()
+                drivers.mutate { $0.append(driver) }
+                return driver
+            },
+            deadline: ManualDeadlineScheduler()
+        )
+        let (firstTask, first) = launchConnect(transport)
+        await waitUntil({ drivers.value.first?.didStart == true }, "driver started")
+        drivers.value.first?.emit(.failed(POSIXError(.ECONNREFUSED)))
+        await waitUntil({ first.isCompleted }, "first connect fails")
+        if first.isCompleted {
+            XCTAssertEqual((first.error as? POSIXError)?.code, .ECONNREFUSED)
+        }
+        await reap(firstTask, ifCompleted: first.isCompleted)
+
+        let (secondTask, second) = launchConnect(transport)
+        await expectPromptPOSIX(second, .EALREADY, "connect after a failed attempt")
+        await reap(secondTask, ifCompleted: second.isCompleted)
+        XCTAssertEqual(drivers.value.count, 1, "no second driver is ever constructed")
+        XCTAssertEqual(drivers.value.first?.cancelCount, 1, "first attempt torn down exactly once")
+    }
+
+    // MARK: - Close lifecycle: every concurrent close waits for completed teardown (P1)
+
+    /// Ordinary established teardown held open: the second concurrent `close()` must NOT return
+    /// before the first caller's teardown (driver cancellation) has completed. WHY:
+    /// `SMBTransport.close()` promises all resources are released when it returns — for every
+    /// caller, not only the teardown owner.
+    func testConcurrentCloseDuringEstablishedTeardownWaitsForCompletedTeardown() async throws {
+        let driver = GatedCancelDriver()
+        let transport = QUICTransportApple(
+            configuration: SMBQUICConfiguration(),
+            connectTimeout: 30,
+            driverFactory: { _, _, _ in driver },
+            deadline: ManualDeadlineScheduler()
+        )
+        let (connectTask, connectOutcome) = launchConnect(transport)
+        await waitUntil({ driver.events.contains("start") }, "driver started")
+        driver.emit(.ready)
+        await waitUntil({ connectOutcome.isCompleted }, "connect completes")
+        XCTAssertNil(connectOutcome.error)
+        await reap(connectTask, ifCompleted: connectOutcome.isCompleted)
+
+        let (close1, done1) = launchClose(transport, marker: { driver.record("close-a-returned") })
+        let (close2, done2) = launchClose(transport, marker: { driver.record("close-b-returned") })
+        await waitUntil(
+            { transport.pendingCloseWaiterCount == 1 },
+            "the non-owning close caller parks until the owner's teardown completes"
+        )
+        XCTAssertFalse(done1.isSet, "the owning close must not return while cancel() is gated")
+        XCTAssertFalse(done2.isSet, "the concurrent close must not return before teardown completes")
+        XCTAssertEqual(driver.events, ["start"], "cancel has not completed yet — closes must wait")
+
+        driver.releaseCancel()
+        await waitUntil({ done1.isSet && done2.isSet }, "both closes return after teardown")
+        await reap(close1, ifCompleted: done1.isSet)
+        await reap(close2, ifCompleted: done2.isSet)
+        let events = driver.events
+        XCTAssertEqual(
+            Array(events.prefix(2)), ["start", "cancel"],
+            "exactly one cancel, completed before any close returns"
+        )
+        XCTAssertEqual(
+            Set(events.dropFirst(2)), ["close-a-returned", "close-b-returned"],
+            "both close callers return only after the completed teardown"
+        )
+        XCTAssertEqual(events.filter { $0 == "cancel" }.count, 1, "exactly one cancel")
+    }
+
+    /// Pre-commit connect abort with two concurrent closes: both close callers wait for the
+    /// full connect-attempt tail (including the late-arming deadline), the connect resolves
+    /// exactly once with `ECONNABORTED`, the driver never starts, and no timer stays armed
+    /// after close returns.
+    func testConcurrentClosesDuringPreCommitAbortWaitAndCancelLateArmedDeadline() async {
+        let scheduler = GatedArmingScheduler()
+        let driver = ScriptedQUICDriver()
+        let transport = QUICTransportApple(
+            configuration: SMBQUICConfiguration(),
+            connectTimeout: 30,
+            driverFactory: { _, _, _ in driver },
+            deadline: scheduler
+        )
+        let (connectTask, connectOutcome) = launchConnect(transport)
+        await waitUntil({ scheduler.didEnterSchedule }, "attempt parked inside schedule() — pre-commit")
+
+        let (close1, done1) = launchClose(transport)
+        let (close2, done2) = launchClose(transport)
+        await expectPromptPOSIX(connectOutcome, .ECONNABORTED, "pre-commit abort by close")
+        await waitUntil(
+            { transport.pendingCloseWaiterCount == 2 },
+            "both close callers park until the connect-attempt tail finishes"
+        )
+        XCTAssertFalse(done1.isSet, "owner close must wait for the attempt tail")
+        XCTAssertFalse(done2.isSet, "concurrent close must wait for the same tail")
+
+        scheduler.releaseSchedule()
+        await waitUntil({ done1.isSet && done2.isSet }, "both closes return after the tail finishes")
+        await reap(close1, ifCompleted: done1.isSet)
+        await reap(close2, ifCompleted: done2.isSet)
+        await reap(connectTask, ifCompleted: connectOutcome.isCompleted)
+        XCTAssertFalse(scheduler.isArmed, "no timer may remain armed after close() returned")
+        XCTAssertFalse(driver.didStart, "pre-commit abort suppresses the start")
+        XCTAssertEqual(driver.cancelCount, 0, "nothing was started → nothing is cancelled")
+        XCTAssertFalse(scheduler.scheduleTimedOut, "test coordination stayed within bounds")
+    }
+
+    /// A `close()` made after a prior close fully completed returns promptly and performs no
+    /// second teardown (the terminal no-op case — distinct from a concurrent close, which waits).
+    func testCloseAfterCompletedCloseIsPromptNoOpWithoutSecondTeardown() async throws {
+        let (transport, driver) = try await connectedTransport()
+        await transport.close()
+        XCTAssertEqual(driver.cancelCount, 1, "first close performs the single teardown")
+        await transport.close() // after full completion — must be a prompt no-op.
+        XCTAssertEqual(driver.cancelCount, 1, "no second teardown")
+    }
+
+    // MARK: - Late-armed deadline is cancelled after an earlier loss (P2)
+
+    /// The finding-3 race in its purest shape: `schedule()` fires the loss synchronously before
+    /// recording the timer, the loss path's `cancel()` finds no timer, then the timer arms late.
+    /// The post-schedule claim re-check must cancel it; the continuation resolves exactly once.
+    func testDeadlineSelfFireBeforeArmIsCancelledAfterLoss() async {
+        let scheduler = SelfFiringArmingScheduler()
+        let driver = ScriptedQUICDriver()
+        let transport = QUICTransportApple(
+            configuration: SMBQUICConfiguration(),
+            connectTimeout: 5,
+            driverFactory: { _, _, _ in driver },
+            deadline: scheduler
+        )
+        let (task, outcome) = launchConnect(transport)
+        await expectPromptPOSIX(outcome, .ETIMEDOUT, "self-firing deadline")
+        await reap(task, ifCompleted: outcome.isCompleted)
+        await waitUntil({ !scheduler.isArmed }, "late-armed timer is cancelled by the claim re-check")
+        XCTAssertFalse(scheduler.isArmed, "final scheduler state must be unarmed")
+        XCTAssertFalse(driver.didStart, "consumed claim suppresses the start")
+        XCTAssertEqual(driver.cancelCount, 0, "nothing started → nothing cancelled")
+    }
+
+    /// Task cancellation winning while the timer is still arming: the loss cancels a not-yet
+    /// recorded timer; once `schedule()` finally arms, the post-schedule re-check cancels it.
+    func testTaskCancellationDuringScheduleCancelsLateArmedTimer() async {
+        let scheduler = GatedArmingScheduler()
+        let driver = ScriptedQUICDriver()
+        let transport = QUICTransportApple(
+            configuration: SMBQUICConfiguration(),
+            connectTimeout: 30,
+            driverFactory: { _, _, _ in driver },
+            deadline: scheduler
+        )
+        let (task, outcome) = launchConnect(transport)
+        await waitUntil({ scheduler.didEnterSchedule }, "attempt parked inside schedule()")
+        task.cancel()
+        await waitUntil({ outcome.isCompleted }, "cancellation resolves the connect")
+        if outcome.isCompleted {
+            XCTAssertTrue(
+                outcome.error is CancellationError,
+                "expected CancellationError, got \(String(describing: outcome.error))"
+            )
+        }
+        await reap(task, ifCompleted: outcome.isCompleted)
+
+        scheduler.releaseSchedule()
+        await waitUntil({ !scheduler.isArmed }, "late-armed timer is cancelled by the claim re-check")
+        XCTAssertFalse(scheduler.isArmed, "no timer may survive a terminal connect outcome")
+        XCTAssertFalse(driver.didStart, "consumed claim suppresses the start")
+        XCTAssertFalse(scheduler.scheduleTimedOut, "test coordination stayed within bounds")
+    }
+
+    // MARK: - Close waits for the in-flight start() tail, including ready-mid-start (P2)
+
+    /// Ready-mid-start: `.ready` wins while `start()` is still executing; `close()` cancels the
+    /// ready driver immediately but must NOT return until the gated `start()` tail has finished
+    /// and teardown finalized. The final event snapshot is exhaustive (all tasks joined, gate
+    /// released, no further path into the driver), proving no event occurs after close returns.
+    func testCloseDuringReadyMidStartWaitsForStartTail() async {
+        let driver = ReadyMidStartDriver()
+        let transport = QUICTransportApple(
+            configuration: SMBQUICConfiguration(),
+            connectTimeout: 30,
+            driverFactory: { _, _, _ in driver },
+            deadline: ManualDeadlineScheduler()
+        )
+        let (connectTask, connectOutcome) = launchConnect(transport)
+        await waitUntil({ connectOutcome.isCompleted }, "connect resolves via ready-mid-start")
+        XCTAssertNil(connectOutcome.error, "ready wins: connect succeeds while start() is gated")
+        await reap(connectTask, ifCompleted: connectOutcome.isCompleted)
+
+        let (closeTask, closeDone) = launchClose(
+            transport, marker: { driver.record("close-returned") }
+        )
+        await waitUntil(
+            { transport.pendingCloseWaiterCount == 1 }, "close parked awaiting the start() tail"
+        )
+        XCTAssertFalse(closeDone.isSet, "close must not return while start() is still executing")
+        XCTAssertEqual(
+            driver.events, ["start-entered", "cancel"],
+            "close cancels the ready driver immediately but keeps waiting for the tail"
+        )
+
+        driver.releaseStart()
+        await waitUntil({ closeDone.isSet }, "close returns after the start() tail finishes")
+        await reap(closeTask, ifCompleted: closeDone.isSet)
+        XCTAssertEqual(
+            driver.events, ["start-entered", "cancel", "start-returned", "close-returned"],
+            "start() returns, teardown finalizes, only then does close return — nothing after"
+        )
+        XCTAssertEqual(driver.events.filter { $0 == "cancel" }.count, 1, "exactly one cancel")
     }
 
     // MARK: - Helper: a transport driven to .ready

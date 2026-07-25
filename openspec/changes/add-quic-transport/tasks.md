@@ -361,3 +361,61 @@ TDD applies throughout: each task starts by writing/updating the tests for its s
       `quic-connection-policy` (overflow-never-traps scenario, endpoint-level rejection),
       `docs/ARCHITECTURE.md`, proposal.md, and source comments; the stale APPROVED verdict
       marked superseded pending a fresh review
+
+## 8. State-machine ownership repair (fifth review pass)
+
+- [x] 8.1 P1 — one-shot connect ownership: `connect` atomically reserves the instance's single
+      attempt (`.idle → .reserved` under the lock, before trust resolution or driver
+      construction); rejected calls fail promptly and construct nothing — `EALREADY` while the
+      attempt is in flight or after a failed attempt (retry unsupported: one instance per
+      connection lifetime), `EISCONN` after `.ready`, `ECONNABORTED` after `close()` (checked
+      first) — and can never overwrite the owning attempt's continuation, driver, deadline, or
+      start phase. Close/cancellation racing the reservation-to-store phase abort the attempt
+      at the store (a `cancelRequested` flag bridges task cancellation onto the start queue).
+      Deterministic tests: concurrent double connect (owner completes, loser prompt-fails),
+      connect after ready (EISCONN, original driver still usable), connect racing the
+      commit-to-start gap (no overwrite, one start), connect after close (factory never
+      invoked), retry-after-failure (EALREADY, no second driver), exactly-once start and
+      terminal resolution throughout; all joins bounded so a regression fails instead of
+      hanging
+- [x] 8.2 P1 — general close lifecycle (`open → closing → closed`): the first `close()` caller
+      atomically becomes the teardown owner; it performs the resource teardown on a dedicated
+      teardown queue (`org.amsmb2.quic.teardown`), waits for in-flight connect work, and only
+      then publishes `.closed` and resumes every parked caller — so EVERY concurrent close
+      caller, in every teardown phase (established teardown, pre-commit abort, parked
+      commit-to-start loss, cancellation-parked loss), observes completed teardown; only a
+      close after full completion returns immediately. Replaces the narrow
+      `isClosed`/`teardownPending` pair; the dead `.localClosing` lifecycle case (review O2)
+      removed. Deterministic tests: gated-cancel established teardown with two concurrent
+      closes (neither returns early, one cancel), gated-arming pre-commit abort with two
+      concurrent closes, existing parked-loss and cancellation-parked-loss gap tests, prompt
+      no-op after completed close
+- [x] 8.3 P2 — late-armed deadline cancelled: the connect attempt re-checks the claim after
+      `deadline.schedule` returns and cancels the (idempotent) scheduler again when the claim
+      was consumed while the timer was arming — no timer survives a terminal connect outcome or
+      a completed close; the "bounded self-expiry is benign" scoping (review O1) is retracted.
+      Deterministic tests: a scheduler that fires the loss synchronously before recording
+      itself armed (final state unarmed, one resolution), task cancellation during a gated
+      `schedule()` (late-armed timer cancelled after release), close during a gated
+      `schedule()` (covered by the pre-commit-abort close test)
+- [x] 8.4 P2 — close waits for the in-flight `start()` tail independent of parked losses:
+      `connectWorkInFlight` spans the whole attempt on the start queue (store → deadline arming
+      → commit → `start()` → handoff) and the close owner parks on it before finalizing — the
+      ready-mid-start case (`.ready` wins while `start()` has not returned) now cancels the
+      ready driver immediately but returns only after the tail finishes; the prior "needs no
+      wait" scoping is retracted. Deterministic test: a driver that emits `.ready` inside
+      `start()` then parks — close does not return while gated, releases yield
+      `start-entered → cancel → start-returned → close-returned` with exhaustive final events
+- [x] 8.5 Whole-attempt executor discipline: the connect attempt after the continuation store
+      runs entirely on the dedicated start queue (never a cooperative thread), which is also
+      what makes the pre-commit and store-to-schedule windows deterministically testable with
+      bounded GCD-parked doubles; `QUICConnectionDriver` is `Sendable` (conformers lock their
+      state); QUIC transport suite green with `LIBDISPATCH_COOPERATIVE_POOL_STRICT=1`
+- [x] 8.6 Artifacts reconciled: design D7 (one-shot reservation, close lifecycle, in-flight
+      work span, late-armed re-check, retracted self-expiry/ready-mid-start scoping), design
+      D8 (`ready → closed` lifecycle), `quic-transport-apple` spec (one-shot requirement +
+      scenarios; close-lifecycle requirement replacing "second call is a no-op"; late-armed
+      deadline scenario; ready-mid-start scenario), `SMBTransport` protocol docs (single
+      connection lifetime per instance; close released-on-return for every caller),
+      `docs/ARCHITECTURE.md`, source comments, proposal.md; the round-8 APPROVED verdict marked
+      superseded pending a fresh project-architect review

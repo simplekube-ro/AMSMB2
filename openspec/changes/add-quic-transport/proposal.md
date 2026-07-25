@@ -6,7 +6,7 @@ The pluggable-transport milestone (RandomPlayer #344/#345, AMSMB2 #28) landed th
 
 ## What Changes
 
-- Add `QUICTransportApple`, a new `SMBTransport` conformer backed by Network.framework QUIC (`NWProtocolQUIC`) — system QUIC, nothing to ship, App-Store-safe. Availability-gated (`@available(iOS 15, macOS 12, macCatalyst 15, tvOS 15, watchOS 8, visionOS 1, *)`; Package.swift's floors — including `.macCatalyst(.v13)` — are unchanged); older OS versions fail with `ENOTSUP`. Its `connect` is a self-contained, deadline-bounded, cancellable state machine over `NWConnection` in which outcome *selection* and cleanup-*duty assignment* are a single atomic, lock-protected transition, while the assigned effects (cancelling the deadline timer, cancelling the connection, resuming the continuation) are performed outside the lock by the party the transition named — which, for a loss landing in the commit-to-start window, is the starting path rather than the winner, with every `close()` call waiting for that parked teardown to complete before returning — so a returned `close()` guarantees no parked driver start or cancel remains outstanding (design D7) — it cannot rely on libsmb2's timeout machinery, which is not yet installed during the eager transport connect; the deadline comes from a dedicated `SMBQUICConfiguration.connectTimeout` (default 30 s, design D10), independent of `SMB2Manager.timeout`'s "zero/negative disables" contract. On the client side, `SMB2Client.connectWithBridge` guards the entire interval from before the eager `bridge.connect` through seam installation with a lock-protected bridge-ownership handoff (design D12): exactly one owner is responsible for closing the bridge at every point — the eager-completion reconciliation after `bridge.connect` returns (which closes the still-local bridge exactly once on every cancellation or failure outcome and normalizes a cancellation win to `CancellationError`, regardless of the conformer's internal cancellation error — `TCPTransportApple` maps cancellation to `POSIXError(.ECANCELED)`, the QUIC machine throws `CancellationError`), the cancellation handler while the bridge is locally owned, or the installed seam's `teardownSeam()` — and `smb2_set_transport`/`smb2_connect_share_async` never begin once cancellation has won.
+- Add `QUICTransportApple`, a new `SMBTransport` conformer backed by Network.framework QUIC (`NWProtocolQUIC`) — system QUIC, nothing to ship, App-Store-safe. Availability-gated (`@available(iOS 15, macOS 12, macCatalyst 15, tvOS 15, watchOS 8, visionOS 1, *)`; Package.swift's floors — including `.macCatalyst(.v13)` — are unchanged); older OS versions fail with `ENOTSUP`. Its `connect` is a self-contained, deadline-bounded, cancellable state machine over `NWConnection` in which outcome *selection* and cleanup-*duty assignment* are a single atomic, lock-protected transition, while the assigned effects (cancelling the deadline timer, cancelling the connection, resuming the continuation) are performed outside the lock by the party the transition named — which, for a loss landing in the commit-to-start window, is the starting path rather than the winner. `connect` is strictly one-shot (the first call atomically reserves the instance's single attempt; later calls fail promptly with `EALREADY`/`EISCONN`/`ECONNABORTED` and perform no work), and `close()` runs a first-caller-owned lifecycle (`open → closing → closed`) in which every concurrent caller waits for the completed teardown — including the in-flight `start()` tail (ready-mid-start) and the deadline-arming tail with its late-armed-timer cancel — so a returned `close()` guarantees no driver start, cancel, receive-arm, or armed timer remains outstanding (design D7) — it cannot rely on libsmb2's timeout machinery, which is not yet installed during the eager transport connect; the deadline comes from a dedicated `SMBQUICConfiguration.connectTimeout` (default 30 s, design D10), independent of `SMB2Manager.timeout`'s "zero/negative disables" contract. On the client side, `SMB2Client.connectWithBridge` guards the entire interval from before the eager `bridge.connect` through seam installation with a lock-protected bridge-ownership handoff (design D12): exactly one owner is responsible for closing the bridge at every point — the eager-completion reconciliation after `bridge.connect` returns (which closes the still-local bridge exactly once on every cancellation or failure outcome and normalizes a cancellation win to `CancellationError`, regardless of the conformer's internal cancellation error — `TCPTransportApple` maps cancellation to `POSIXError(.ECANCELED)`, the QUIC machine throws `CancellationError`), the cancellation handler while the bridge is locally owned, or the installed seam's `teardownSeam()` — and `smb2_set_transport`/`smb2_connect_share_async` never begin once cancellation has won.
 - Wire mapping follows the Microsoft/Samba interop behavior (verified against Samba's client implementation, `source3/libsmb/smbsock_connect.c`): ALPN token `"smb"`, TLS 1.3, one QUIC connection with a **single bidirectional stream used as a byte pipe**. The stream carries the exact same framed SMB2 byte stream as direct TCP (4-byte transport length prefix included) — libsmb2 keeps doing all SMB framing/auth inside the tunnel; the transport stays a dumb pipe, same as `TCPTransportApple`.
 - Connection policy (per #346 — "don't get these wrong"):
   - QUIC is **explicit opt-in** — never auto-selected; `.automatic` continues to mean TCP.
@@ -43,6 +43,63 @@ The pluggable-transport milestone (RandomPlayer #344/#345, AMSMB2 #28) landed th
 - **Downstream**: unblocks RandomPlayer #347 (adopt pluggable transports in RandomPlayer).
 
 ## Review
+
+**Verdict: APPROVED** (project-architect, 2026-07-25, round 9 — issued as APPROVED WITH
+CONDITIONS by a fresh independent review of the complete live worktree after the fifth
+remediation pass, then upgraded to APPROVED by the same reviewer after confirming the single
+should-fix condition cleared first-hand against the live file: the one-word doc softening was
+verified in place, the diff confirmed byte-identical to the reviewed scope apart from that
+word (no executable change), and the QUIC transport suite re-run 41/0. The
+reviewer treated all prior verdicts as leads only, traced all four repaired races first-hand
+against the live code — one-shot connect reservation (no stranded reservation, no continuation
+overwrite, `cancelRequested` and the store act exactly once), the close lifecycle
+(`open → closing → closed`; waiter park re-checks under the lock so no waiter is stranded by
+the owner's drain; no deadlock across `startQueue`/`teardownQueue`; exactly one cancel/resume
+per owned resource), the late-armed deadline re-check (verified for the synchronous self-fire
+shape, the gated-arming shape, and a third close-between-store-and-schedule shape), and
+ready-mid-start close (cancels the ready driver immediately, returns only after the `start()`
+tail and handoff; late driver callbacks all absorbed) — inspected all eleven new tests
+substantively (each proves both the error contract and the no-work half via factory counts and
+event-ordering oracles; every gated park sits on a GCD worker holding no lock; all waits
+bounded with visible-timeout diagnostics), verified the artifact reconciliation line by line
+(all four round-8 waivers explicitly retracted, no guarantee narrowed; the one disclosed
+remnant — a reservation-phase `connect` resolving `ECONNABORTED` after close returns — is
+resolution-only and disclosed in source, design, and spec), and re-ran the verification
+suite itself: QUIC transport suite 41/0 with and without
+`LIBDISPATCH_COOPERATIVE_POOL_STRICT=1`, full suite 271/0 with 67 server-gated skips,
+`openspec validate --strict` clean.)
+
+One condition was attached — **no must-fix defects**:
+
+- **C1 (should fix)**: `SMBTransport.connect`'s new doc sentence "Conformers document their
+  own rejection behavior for repeated calls" over-claimed for `TCPTransportApple`, which does
+  not document repeated-call behavior. *Fixed in the same pass* by softening to "Conformers
+  should document…" (the alternative — documenting a rejection contract on
+  `TCPTransportApple` — would over-claim, since the TCP conformer has a latent repeated-connect
+  overwrite recorded as a non-blocking observation for a follow-up change). **Confirmed
+  cleared by the same reviewer** against the live worktree (2026-07-25), who endorsed the
+  chosen option over the alternative and verified the recorded verdict block itself for
+  faithfulness (accurate on every load-bearing point; nothing overstated or invented).
+
+Non-blocking observations recorded by the reviewer (all pre-existing or outside this change's
+scope): `TransportBridge.close()` fire-and-forgets `transport.close()` (bridge-level, not
+propagated to the libsmb2 trampoline); `TCPTransportApple` shares the latent repeated-connect
+overwrite this pass fixed for QUIC (follow-up candidate); `NWConnectionQUICDriver.armReceive`
+re-arms once against a cancelled connection (bounded); concurrent double `receive()` overwrites
+the parked waiter (single-consumer pump by design); an inert never-started driver object may be
+abandoned when close aborts at the store; the defensive `.forbidden` arm in
+`consumeLossClaimLocked` is unreachable; the prompt-no-op close test proves "no second
+teardown" but not promptness.
+
+> **STATUS: SUPERSEDED (2026-07-25, round 9 recorded above).** The APPROVED verdict below is
+> unsound for the current worktree: it waived as non-blocking defects that are being fixed in
+> the fifth remediation pass — the public double-`connect()` continuation/driver overwrite
+> (O6, wrongly scoped as "unreachable via SMB2Client"), the concurrent-`close()` early return
+> during ordinary established teardown and pre-commit abort, the late-armed deadline timer
+> surviving `close()` (O1, wrongly recorded as benign self-expiry), and the ready-mid-start
+> `start()` tail still running after `close()` returned. A fresh project-architect review of
+> the completed pass will be recorded above this block; until then the change has **no valid
+> approval**.
 
 **Verdict: APPROVED** (project-architect, 2026-07-25 — issued as APPROVED WITH CONDITIONS by a
 fresh independent review of the complete live worktree after the fourth remediation pass, then
