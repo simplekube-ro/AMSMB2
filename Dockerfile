@@ -12,8 +12,9 @@ USER nonroot
 WORKDIR /home/nonroot/src/app
 VOLUME /home/nonroot/src/app
 
-COPY AMSMB2 ./AMSMB2
-COPY AMSMB2Tests ./AMSMB2Tests
-COPY Package.swift ./
+COPY --chown=nonroot:nonroot AMSMB2 ./AMSMB2
+COPY --chown=nonroot:nonroot AMSMB2Tests ./AMSMB2Tests
+COPY --chown=nonroot:nonroot Dependencies ./Dependencies
+COPY --chown=nonroot:nonroot Package.swift Package.resolved ./
 
 ENTRYPOINT ["swift", "test"]

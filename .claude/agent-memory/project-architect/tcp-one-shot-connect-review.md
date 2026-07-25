@@ -1,15 +1,43 @@
 ---
 name: tcp-one-shot-connect-review
-description: fix-tcp-one-shot-connect review outcome (APPROVED WITH CONDITIONS 2026-07-25) + reusable evidence techniques and a Network.framework test-timing gotcha
+description: fix-tcp-one-shot-connect — current verdict APPROVED WITH CONDITIONS (2026-07-25, conditions cleared) on the D5/D6/D7 remediation; the earlier APPROVED was retracted same day (the "non-blocking" close/publication race was merge-blocking); plus reusable evidence techniques and a Network.framework test-timing gotcha
 metadata:
   type: project
 ---
 
-`fix-tcp-one-shot-connect` (branch feat/add-quic-transport, unstaged worktree) reviewed
-2026-07-25 → APPROVED WITH CONDITIONS, then **upgraded to APPROVED** the same day after
-first-hand verification that both conditions were cleared. Implementation
-(`AMSMB2/TCPTransportApple.swift` `ConnectAttempt` reservation) verified sound and
-mutation-tested; both conditions were artifact/doc-only:
+**CURRENT VERDICT: APPROVED WITH CONDITIONS** (fresh adversarial review, 2026-07-25, of the
+remediated implementation — atomic publication claim D5 + owned close lifecycle D6/D7 + test
+seams D8): no merge-blocking defect; two Low doc/bookkeeping conditions, both addressed the
+same day (tasks 3.5/3.6 evidence; D5 scope sentence). The remediation was mutation-tested
+with clean attribution (M1 pre-fix publication → only the two publication tests fail; M2
+pre-fix close → only the two close-lifecycle tests fail). Two dependency facts verified in
+NIOTS source during that review, durable for future reviews: (a) a second
+`NIOTSEventLoopGroup` shutdown fails fast with `EventLoopError.shutdown` — it cannot hang
+`deinit`; (b) `NIOTSConnectionBootstrap.connect` self-closes the channel on any
+connect/initializer failure (`.flatMapErrorThrowing { conn.close(promise: nil); throw $0 }`)
+and invokes `channelInitializer` before `register()`/connect.
+
+**SUPERSEDED PRIOR VERDICT — do not treat the pre-remediation TCP implementation as sound.**
+`fix-tcp-one-shot-connect` (branch feat/add-quic-transport) was reviewed 2026-07-25 →
+APPROVED WITH CONDITIONS, upgraded to APPROVED the same day. That verdict was then
+**retracted**: it had recorded the close/publication race as a *non-blocking observation*
+("behavior identical to the old code"), but an adversarial review correctly graded it
+merge-blocking against the strengthened `SMBTransport.close()` released-on-return-for-every-
+caller contract, together with a second defect the review missed entirely:
+
+- **Publication race**: close/cancel landing between the post-`get()` `Task.isCancelled`
+  re-check and the publication lock → the success path installed a closed channel, overwrote
+  terminal state with `.connected`, returned success, and repopulated `_channel` after
+  `close()` had returned.
+- **No owned close lifecycle**: the first `close()` set `_isClosed` before awaiting teardown;
+  a concurrent caller ran an independent `shutdownGracefully()` (its "already shutting down"
+  error swallowed by `try?`) and could return before the owner finished.
+
+**Review lesson**: a race whose behavior is "identical to the old code" is NOT automatically
+non-blocking — grade it against the *current* documented contract, which the same branch had
+just strengthened for every conformer. The original `ConnectAttempt` reservation itself
+(one-shot rejection mapping) remains verified sound and mutation-tested; the conditions below
+were artifact/doc-only:
 1. Moderate — the delta spec's MODIFIED requirement rewrote pre-existing prose (dropped
    "support cancellation" and the incremental-drain/bridge rationale) and added an unbacked
    "Round-trip bytes" scenario. OpenSpec MODIFIED merges intelligently and *preserves*

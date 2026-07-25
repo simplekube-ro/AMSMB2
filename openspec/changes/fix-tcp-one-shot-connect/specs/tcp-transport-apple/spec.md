@@ -44,3 +44,59 @@ the attempt state).
 - **WHEN** `connect` is called after `close()`
 - **THEN** it throws `POSIXError(.ENOTCONN)` (the pre-existing closed-transport error),
   regardless of whether an attempt had run before the close
+
+Success publication SHALL additionally be an **atomic claim** under the state lock: the
+critical section that installs the channel and records `.connected` SHALL first re-check the
+terminal events with precedence close-then-cancellation. If `close()` won before publication,
+`connect` SHALL NOT install the channel, SHALL NOT return success, and SHALL throw
+`POSIXError(.ENOTCONN)`; if task cancellation won before publication, `connect` SHALL NOT
+install the channel and SHALL throw `POSIXError(.ECANCELED)`. No terminal close/cancellation
+state may be overwritten by `.connected`, the losing path SHALL close/release the connecting
+channel exactly once (ownership transfer under the lock), and once `close()` has returned the
+channel slot SHALL never be repopulated.
+
+`close()` SHALL run a first-caller-**owned** lifecycle `open → closing(waiters) → closed`:
+exactly one caller owns channel closure, receiver unblocking, connect-tail draining, and
+event-loop-group shutdown (group shutdown last); callers arriving during `.closing` SHALL
+park and return only after that owner's fully-completed teardown; only a caller arriving
+after `.closed` SHALL return immediately as the terminal no-op. Teardown failures MAY be
+swallowed (close is non-throwing) but SHALL NOT let any waiter return before the teardown
+completed. A `close()` during an in-flight or publication-gated connect SHALL prevent any
+later channel publication and SHALL wait until the connect tail can no longer create or
+retain resources. No lock may be held across an `await`, a NIO call, or a continuation
+resumption, and every waiter SHALL be resumed exactly once. These interleavings SHALL be
+proven by deterministic tests gated on internal seams — not by sleeps, TEST-NET endpoints,
+or wall-clock assumptions.
+
+#### Scenario: Close wins the race immediately before channel publication
+
+- **WHEN** a successful bootstrap is gated immediately before the publication critical
+  section and `close()` wins the race
+- **THEN** `connect` does not return success (it throws `POSIXError(.ENOTCONN)`), the channel
+  is not installed, the never-published channel is closed exactly once, and `close()` returns
+  only after the gated connect tail has fully drained
+
+#### Scenario: Task cancellation wins the race immediately before channel publication
+
+- **WHEN** a successful bootstrap is gated immediately before the publication critical
+  section and the enclosing task's cancellation wins the race
+- **THEN** `connect` throws `POSIXError(.ECANCELED)`, no channel remains installed, and the
+  never-published channel's teardown occurs exactly once
+
+#### Scenario: Concurrent close callers wait for the owner's completed teardown
+
+- **WHEN** two `close()` calls race while the owner's teardown is gated mid-way
+- **THEN** both callers remain suspended while the gate holds, exactly one caller entered the
+  teardown, and releasing the gate completes that single teardown and resumes both callers
+
+#### Scenario: Close after a fully-completed close is a terminal no-op
+
+- **WHEN** `close()` is called after a prior `close()` has fully completed its teardown
+- **THEN** it returns promptly without entering the teardown a second time
+
+#### Scenario: Close racing a publication-gated connect satisfies the owned lifecycle
+
+- **WHEN** `close()` races a connect that is gated immediately before publication
+- **THEN** the close owner remains suspended until the connect tail has drained, the connect
+  does not publish, and both the close lifecycle and the atomic-publication contract hold on
+  the same run

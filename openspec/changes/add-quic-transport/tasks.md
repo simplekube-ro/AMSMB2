@@ -237,7 +237,17 @@ TDD applies throughout: each task starts by writing/updating the tests for its s
       README (opt-in usage example with the security caveats)
 - [x] 5.3 Pre-archive sweep: dead-code check (every new symbol has a call site outside its
       file), SwiftFormat, full `swift test --disable-sandbox` green, `make linuxtest` green
-      (platform-neutral configuration compiles and `.quic` → `ENOTSUP` on Linux), macCatalyst
+      (platform-neutral configuration compiles and `.quic` → `ENOTSUP` on Linux)
+      — **CORRECTION (2026-07-25): the `make linuxtest` green claim was not obtained through
+      the Make target as written**: `docker run -v .:/home/nonroot/src/app` fails because
+      Docker parses `.` as an invalid named volume, and `make cleanlinuxtest` fails because
+      the image lacked `Dependencies/libsmb2`. The Linux suite itself is green only via the
+      equivalent manual invocation (absolute-path `:ro` mount + `--scratch-path`). The
+      Makefile/Dockerfile were repaired in `fix-tcp-one-shot-connect` task 3.4 (quoted
+      `$(CURDIR)` read-only mount + `--scratch-path /tmp/amsmb2-build`; the image now COPYs
+      `Dependencies` and `Package.resolved` with `--chown=nonroot`), and the actual targets
+      re-ran green 2026-07-25: `make linuxtest` exit 0 (137 tests, 51 skipped, 0 failures on
+      aarch64-unknown-linux-gnu) and `make cleanlinuxtest` exit 0 (same counts), macCatalyst
       build check (`xcodebuild build -destination 'generic/platform=macOS,variant=Mac Catalyst'`
       or equivalent) plus inspection that QUIC availability annotations name macCatalyst 15.
       Also run the authoritative D11 header grep: generate the Objective-C interface
@@ -416,6 +426,11 @@ TDD applies throughout: each task starts by writing/updating the tests for its s
       D8 (`ready → closed` lifecycle), `quic-transport-apple` spec (one-shot requirement +
       scenarios; close-lifecycle requirement replacing "second call is a no-op"; late-armed
       deadline scenario; ready-mid-start scenario), `SMBTransport` protocol docs (single
-      connection lifetime per instance; close released-on-return for every caller),
+      connection lifetime per instance; close released-on-return for every caller — **note
+      (2026-07-25): when this was recorded, `TCPTransportApple.close()` did NOT satisfy the
+      strengthened for-every-caller promise (a concurrent close could return before the
+      owner's teardown finished, and a close racing the publication window could see
+      `_channel` repopulated after close returned); the TCP conformer is brought into
+      compliance by the `fix-tcp-one-shot-connect` adversarial-review remediation**),
       `docs/ARCHITECTURE.md`, source comments, proposal.md; the round-8 APPROVED verdict marked
       superseded pending a fresh project-architect review

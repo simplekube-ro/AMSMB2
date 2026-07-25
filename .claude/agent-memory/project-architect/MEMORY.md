@@ -5,8 +5,8 @@
 - seam-connect-ordering.md — root cause of broken Apple seam (detached connect + premature `ext.connect` return-0) and architect decision: Approach A (eager connect), Apple seam-only, with binding teardown/encapsulation mandates.
 
 ## QUIC transport
-- quic-transport-review.md — add-quic-transport gate history + verified D7/port/ENOTCONN code facts; 7th review 2026-07-25 = APPROVED (conditions cleared).
-- tcp-one-shot-connect-review.md — fix-tcp-one-shot-connect APPROVED 2026-07-25 (conditions cleared); delta-spec must append not restate; mutation-check recipe; 127.0.0.1:1 never fast-refuses on NIOTS.
+- quic-transport-review.md — add-quic-transport gate history + verified D7/port/ENOTCONN code facts; 9th review 2026-07-25 = APPROVED; CORRECTED: pre-remediation TCP close/connect was NOT sound (publication race + no owned close lifecycle — merge-blocking, fixed in fix-tcp-one-shot-connect §3).
+- tcp-one-shot-connect-review.md — fix-tcp-one-shot-connect: first APPROVED retracted same day (the "non-blocking" close/publication race was merge-blocking; grade races against the current contract, not old behavior); remediation (D5 atomic publication + D6/D7 owned close) reviewed 2026-07-25 = APPROVED WITH CONDITIONS (two Low, cleared); NIOTS facts: double group shutdown fails fast, bootstrap self-closes failed connects; delta-spec must append not restate; mutation-check recipe; 127.0.0.1:1 never fast-refuses on NIOTS.
 
 ## Concurrency / Swift 6
 - swift6-strict-concurrency-context.md — swift:6.1 Linux hard-errors on @Sendable captures macOS only warns on; local cbPtr construction + nonisolated(unsafe) for must-cross handler & queueKey. FINAL REVIEW 2026-06-27: 5 fixes correct & race-safe (retain/release 1:1, no UAF/double-free); confirmed FIRST-HAND macOS Context.swift recompile clean + make linuxtest exit 0 (114 tests/50 skip/0 fail). C2b test-portability fixes (2 test files) accepted into this change. proposal.md Non-Goal still wrongly says "confined to Context.swift" — must reconcile before archive.

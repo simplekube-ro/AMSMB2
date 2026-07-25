@@ -31,9 +31,33 @@ follow-up):
   strictly one-shot, including the deliberate divergence in the post-`close()` code
   (`ECONNABORTED` on QUIC vs `ENOTCONN` on TCP — each conformer's pre-existing closed
   contract); the TCP doc comment states the full rejection contract.
-- No injected seams are added: the deterministic tests use the file's established patterns
-  (refused localhost port, TEST-NET-1 pending connect, and an ephemeral `NWListener` for the
-  established case).
+- For the original one-shot contract, no injected seams are added: those deterministic tests
+  use the file's established patterns (refused localhost port, TEST-NET-1 pending connect,
+  and an ephemeral `NWListener` for the established case).
+- **(Adversarial-review remediation, 2026-07-25)** Success publication becomes an **atomic
+  claim** under the state lock: the same critical section that installs `_channel` and
+  `.connected` first re-checks the terminal events, with precedence close-then-cancellation.
+  If `close()` won before publication, the channel is not installed and `connect` throws
+  `POSIXError(.ENOTCONN)` (the conformer's closed contract); if task cancellation won, it
+  throws `POSIXError(.ECANCELED)`. No terminal close/cancellation state can be overwritten by
+  `.connected`, and the losing side closes/releases the channel exactly once (ownership
+  transfer: whoever takes the channel reference out of the lock-guarded state closes it).
+- **(Adversarial-review remediation, 2026-07-25)** `close()` gains a first-caller-**owned**
+  lifecycle `open → closing(waiters) → closed`, mirroring `QUICTransportApple`: exactly one
+  caller owns channel closure, receiver unblocking, connect-tail draining, and event-loop-group
+  shutdown; callers arriving during `.closing` park and are resumed only after the owner's
+  fully-completed teardown; only a call after `.closed` is a terminal no-op. The owner drains
+  any in-flight connect work before shutting the group down and publishing `.closed`, so once
+  `close()` returns, `_channel` can never be repopulated and no connect tail can create or
+  retain resources. No lock is held across an `await`, a NIO call, or a continuation
+  resumption; every waiter is resumed exactly once.
+- **(Adversarial-review remediation, 2026-07-25)** Minimal internal test seams are added to
+  make both races deterministically provable without sleeps or TEST-NET timing: an optional
+  pre-publication gate awaited immediately before the publication critical section, an
+  optional close-teardown gate awaited by the owner before the group shutdown, and internal
+  observability accessors (installed-channel flag, parked-close-waiter count, aborted-connect
+  channel-close count). All seams are `internal`, `nil`/inert in production, and follow the
+  QUIC conformer's established seam precedent (design D8).
 
 ## Capabilities
 
@@ -48,7 +72,153 @@ follow-up):
 
 ## Review
 
-**Verdict: APPROVED** (project-architect, 2026-07-25 — issued as APPROVED WITH CONDITIONS by
+**VERDICT: APPROVED WITH CONDITIONS** (project-architect, 2026-07-25 — genuinely fresh
+adversarial review of the complete live diff at HEAD `c99ace5` + unstaged changes; no prior
+verdict, reviewer summary, or memory claim was relied upon). Both conditions are Low severity
+and documentation/bookkeeping only. No merge-blocking defect was found: the reviewer
+re-derived every check-then-act pair, enumerated every closer of a connect channel, hunted
+deadlocks and waiter stranding, and mutation-tested the new tests in an isolated copy.
+
+Findings (recorded verbatim from the review):
+
+1. **(Verified sound — no defect) Atomic publication claim closes the race that superseded
+   the previous verdict.** The terminal re-check and the publication are one critical
+   section: `_closeState != .open` → `.closeWon`; then `_connectCancelled || Task.isCancelled`
+   → `.cancellationWon`; else install. Close-before-cancel precedence is correct and
+   necessary because `close()` also sets the cancel latch — latch-first would misreport a
+   plain close as `ECANCELED`. Publication into a terminal state is impossible because
+   `close()` claims `.closing` and takes the channel in the same critical section, so
+   `_channel` can never be repopulated after `close()` returned. `Task.isCancelled` read
+   inside `lock.withLock` is valid (task-local read, no suspension, no re-entrancy).
+2. **(Verified sound — no defect) Exactly-once closure of a never-published channel, by
+   ownership transfer.** Four closers exist and all funnel through
+   `takeConnectingChannelLocked()`, which nils the slot under the lock: the
+   `channelInitializer` cancel-latch path (closes a channel it never stored), `onCancel`,
+   the `close()` owner, and the losing publication claim. The `.published` branch transfers
+   ownership to `_channel` in the same section. The bare `defer { _connectingChannel = nil }`
+   drops a reference without closing, which is correct: verified in the dependency source
+   that `NIOTSConnectionBootstrap.connect` ends in `.flatMapErrorThrowing { conn.close(...);
+   throw $0 }`, so a failed connect future needs no closer — design D7's claim is factually
+   correct, not assumed.
+3. **(Verified sound — no defect) Owned close lifecycle: no stranding, no double-resume, no
+   lock across await.** Every park re-checks state under the lock before appending, so a
+   caller cannot park after the state it waits on has already been published; both waiter
+   arrays are drained-and-emptied under the lock with resumption strictly outside it. The
+   owner cannot exit early: every teardown call is `try?`-swallowed and non-cancellable, so
+   `.closed` is always published and waiters always resume exactly once. Defer ordering is
+   as documented: `finishConnectWork` is declared first and therefore runs last — a resumed
+   close owner provably sees a tail that can no longer create or retain resources.
+4. **(Verified sound — no defect) Deadlock analysis.** The close owner awaits
+   `channel.close().get()`, then the connect tail, then the group shutdown, holding no lock
+   across any of them. The connect tail is prompt by construction on every path. The
+   reservation and the closed-guard are one critical section, so `connectWorkInFlight` can
+   never be set after `close()` claimed `.closing` — a close that parks always has a real
+   tail to wait for. A rejected `connect` caller cannot clear the owner's flag because the
+   `defer` is declared after the throwing guard.
+5. **(Verified sound — no defect) `deinit` safety net remains correct under the new
+   lifecycle.** A second `syncShutdownGracefully()` after a completed `close()` does not
+   hang: `NIOTSEventLoop.closeGently()` fails promptly with `EventLoopError.shutdown` when
+   the loop is already closed, and `NIOTSEventLoop.execute` still enqueues after close by
+   design, so the completion callback always fires and `try?` swallows the error.
+6. **(Verified sound — no defect) Contract preservation.** One-shot rejections are
+   byte-identical in mapping; `receive()` post-close empty-`Data` keys off
+   `_closeState != .open`, observably identical to the old `_isClosed`; the close lifecycle
+   matches `SMBTransport.close()`'s documented contract verbatim. No public API surface
+   changed: all five seams are `internal` and each has a call site in the test suite.
+7. **(Verified — test honesty confirmed by mutation, not by inspection.)** In an isolated
+   worktree copy (reviewed checkout hash-verified unchanged), mutation M1 (pre-fix
+   publication) failed exactly the two publication-race tests (5 assertion failures);
+   mutation M2 (pre-fix close: latch-then-teardown, no owner) failed exactly the two
+   close-lifecycle-dependent tests (`entryCount 2 ≠ 1`, `3 ≠ 1`, close-returned-early).
+   Attribution is clean in both directions. Assertions are on real behavior; the tests run
+   in 0.013 s total with no sleeps, no TEST-NET endpoints, and bounded `waitUntil` polling
+   of lock-guarded state only.
+8. **CONDITION — Low (artifact bookkeeping).** tasks.md 3.5/3.6 were still unchecked though
+   the verification ran and this review is the 3.6 deliverable; check them with evidence.
+9. **CONDITION — Low (documentation of an unspecified error path).** The
+   close-vs-cancellation precedence applies only to the post-success publication claim; a
+   `close()` aborting a not-yet-succeeded connect routes through the `catch` and surfaces
+   whatever `mapError` yields (typically `ENOTCONN`, but `EIO`/`ETIMEDOUT`/`ECANCELED` are
+   reachable). Add one sentence to design.md D5 scoping the guarantee (documentation alone
+   satisfies this condition).
+10. **Observation — no action required.** `close()` may remain suspended up to the connect
+    tail's natural bound (`connectTimeoutSeconds`) in a pathological abort case — the
+    intended cost of the released-on-return contract; invisible to the only production
+    caller (`TransportBridge.close()` fire-and-forgets).
+11. **Observation — no action required.** The drain covers connect work and the suspended
+    receiver but not an in-flight `send()`; safe because the owner closes and awaits the
+    channel before the group shutdown, and NIO fails outstanding write promises on close.
+12. **Observation.** The `:ro` mount makes a stale `Package.resolved` fail loudly in the
+    container instead of silently rewriting the host checkout; `cleanlinuxtest` relies on
+    the `Dependencies/libsmb2` submodule being checked out at image-build time (no
+    `.dockerignore`, unfiltered COPY).
+13. **Memory records** were reviewed as accurate; to be updated with this verdict and two
+    verified dependency facts (second NIOTS group shutdown fails fast — cannot hang
+    `deinit`; `NIOTSConnectionBootstrap.connect` self-closes the channel on any
+    connect/initializer failure and runs `channelInitializer` before `register()`).
+
+Reviewer's first-hand verification log: full read of `TCPTransportApple.swift` (686 lines)
+and the complete 12-file diff (774 insertions, 61 deletions); dependency-source reads for
+the three load-bearing NIO claims; TCP suite 17/0 (once plain, 3× under
+`LIBDISPATCH_COOPERATIVE_POOL_STRICT=1`); full suite 278 tests / 67 skipped / 0 failures;
+mutation runs M1/M2 in an isolated copy with clean attribution; `make linuxtest` run
+first-hand (exit 0, 137 tests / 51 skipped / 0 failures, aarch64-unknown-linux-gnu);
+`openspec validate --strict` valid for both changes with the delta confirmed append-only
+against the main spec; `git diff --check` clean; no files modified by the review.
+
+Reviewer's rationale: the remediation is architecturally correct, not merely test-passing —
+both defects are eliminated at the level of the state model (atomic publication claim;
+first-caller-owned close lifecycle mirroring the approved QUIC conformer), every
+check-then-act pair is a single critical section, no lock is held across an await/NIO
+call/resumption, and the ownership-transfer discipline makes exactly-once channel teardown
+a structural property. Neither condition blocks merge; both should land before
+`/opsx:archive`.
+
+**Condition disposition (same pass, 2026-07-25):** C8 — tasks 3.5/3.6 checked with their
+evidence; C9 — the D5 scope paragraph added to design.md; item 13 — both memory records
+updated with the verdict and the two dependency facts.
+
+**Reviewer confirmation (same reviewer, 2026-07-25): CONFIRMED CLEARED — the verdict stands
+at APPROVED WITH CONDITIONS, both conditions cleared.** Verified first-hand:
+`TCPTransportApple.swift` and `TCPTransportAppleTests.swift` byte-identical (sha256) to the
+reviewed/approved state, so no re-testing was required; C8 evidence accurate (the recorded
+intermediate `make linuxtest` flake is provably unrelated — the failing test's file is
+untouched by this diff, which contributes zero compiled code on Linux); C9's scope paragraph
+draws exactly the intended D5-versus-D6 line; memory records carry the verdict and the NIOTS
+facts verbatim; both `openspec validate --strict` runs re-confirmed valid. Nothing
+outstanding blocks `/opsx:verify` → `/opsx:archive`.
+
+---
+
+**Prior verdict history — SUPERSEDED** (2026-07-25). The APPROVED verdict below was
+retracted: it explicitly classified the close/publication race ("a pre-existing close/publish
+race window between the post-`get()` cancellation re-check and the channel publish") as a
+non-blocking observation. A subsequent adversarial review found that classification wrong on
+two counts, both merge-blocking against the strengthened `SMBTransport.close()` contract
+(released-on-return for every caller):
+
+1. **Success-publication race**: a `close()` or task cancellation landing after the
+   `Task.isCancelled` re-check but before the publication lock closes the connecting channel,
+   yet the success path still installs the closed channel into `_channel`, overwrites the
+   terminal state with `.connected`, and returns success — so `_channel` is repopulated after
+   `close()` has returned.
+2. **No owned close lifecycle**: the first `close()` caller sets `_isClosed` *before* awaiting
+   channel/group teardown; a concurrent caller observes `_isClosed`, starts an independent
+   `shutdownGracefully()` whose "already shutting down" error is swallowed by `try?`, and can
+   return before the owner's teardown completes — violating the seam promise that every
+   `close()` caller returns only after the same completed teardown.
+
+The remediation (this change, extended): atomic terminal-event-versus-success publication
+with close/cancellation precedence (design D5), a first-caller-owned close lifecycle
+`open → closing(waiters) → closed` with a connect-tail drain (design D6/D7), exactly-once
+channel closure by ownership transfer (design D7), and deterministic race tests through
+minimal internal seams (design D8). The required genuinely fresh project-architect review
+ran 2026-07-25 — its verdict (APPROVED WITH CONDITIONS) is recorded above; the text below is
+retained as history only.
+
+---
+
+**Verdict: APPROVED — SUPERSEDED, see above** (project-architect, 2026-07-25 — issued as APPROVED WITH CONDITIONS by
 a fresh independent review of the proposal together with the completed live implementation,
 then upgraded to APPROVED by the same reviewer after confirming both conditions cleared
 first-hand against the live worktree: C1 verified byte-for-byte (the delta's requirement body

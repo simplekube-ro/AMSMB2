@@ -46,7 +46,7 @@ that verdict is correctly marked SUPERSEDED in proposal.md.
 - No lock is held across any gated park in the test doubles ⇒ no cooperative-pool deadlock;
   `LIBDISPATCH_COOPERATIVE_POOL_STRICT=1` green is corroborating, not the proof.
 
-## Known benign residuals (non-blocking, mostly pre-existing)
+## Known residuals — CORRECTED 2026-07-25: the TCP ones were NOT all benign
 
 - `TransportBridge.close()` fire-and-forgets `transport.close()`, so the strengthened
   released-on-return promise is not propagated to libsmb2's close trampoline.
@@ -54,8 +54,23 @@ that verdict is correctly marked SUPERSEDED in proposal.md.
   NWConnection completes with error/isComplete).
 - `receiveWaiter` is overwritten if two `receive()` calls park concurrently (bridge is
   single-consumer).
-- `TCPTransportApple.connect` has the same latent repeated-connect overwrite the QUIC pass just
-  fixed; out of scope for this change.
+- ~~`TCPTransportApple.connect` has the same latent repeated-connect overwrite the QUIC pass
+  just fixed; out of scope for this change.~~ **CORRECTION**: the repeated-connect overwrite
+  was fixed by `fix-tcp-one-shot-connect`, but the old `TCPTransportApple` was still NOT
+  sound against the strengthened seam contract: (1) a close/cancel racing the window between
+  the post-`get()` cancellation re-check and the publication lock let connect install a
+  closed channel, overwrite terminal state with `.connected`, and repopulate `_channel` after
+  `close()` returned; (2) `close()` had no owned lifecycle — a concurrent caller could return
+  before the owner's teardown completed (independent `shutdownGracefully()`, error swallowed
+  by `try?`). Both graded merge-blocking by adversarial review; remediation tracked in
+  `fix-tcp-one-shot-connect` §3 (atomic publication claim + `open → closing → closed`
+  owner/waiter lifecycle mirroring the QUIC conformer). Do not cite the pre-remediation TCP
+  close/connect implementation as a sound reference. **Remediation reviewed 2026-07-25:
+  APPROVED WITH CONDITIONS (two Low doc/bookkeeping conditions, addressed same day);
+  mutation-tested with clean attribution — both in-tree conformers now implement the same
+  one-shot-connect + owned-close contract. See [[tcp-one-shot-connect-review]] for the
+  verified NIOTS dependency facts (double group shutdown fails fast; bootstrap self-closes
+  failed connects).**
 
 ## Earlier gate history (condensed)
 
