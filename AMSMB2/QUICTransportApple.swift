@@ -15,14 +15,27 @@ import Security
 
 // MARK: - Connection driver seam (design D7)
 
+/// How a `.waiting` state should be treated by the connect state machine.
+///
+/// This is preserved translation information from the `NWError` case (see
+/// `QUICConnectionState.waiting`), not a policy decision.
+enum QUICWaitClass: Sendable {
+    /// A condition a later path change could heal (no route, DNS, refused, …).
+    case transient
+    /// A condition no path change can heal — a TLS handshake/trust rejection.
+    case fatal
+}
+
 /// A `NWConnection`-shaped state delivered to the transport, with any `NWError` already mapped to
 /// `POSIXError` (so the test double can script states without Network.framework types).
 enum QUICConnectionState: Sendable {
     case setup
     case preparing
-    /// Non-terminal: the connection is waiting (e.g. no route yet). Carries the mapped error for
-    /// diagnostics; only cancellation or the deadline ends a stuck wait (design D7).
-    case waiting(POSIXError)
+    /// The connection is waiting (e.g. no route yet, or the TLS handshake was rejected). Carries
+    /// the mapped error for diagnostics plus its `QUICWaitClass` — the one bit of the `NWError`
+    /// case that `asQUICPOSIXError()` would otherwise erase (design D1). What to do with the class
+    /// is policy and lives in `QUICTransportApple.handleState`.
+    case waiting(POSIXError, QUICWaitClass)
     case ready
     case failed(POSIXError)
     /// Terminal acknowledgment of a requested cancel.
@@ -510,9 +523,14 @@ public final class QUICTransportApple: SMBTransport, @unchecked Sendable {
         switch state {
         case .setup, .preparing:
             return // progress; no action.
-        case .waiting(let error):
-            lock.withLock { lastWaitingError = error }
+        case .waiting(let error, .transient):
+            lock.withLock { lastWaitingError = error } // diagnostic for the deadline's message.
             return // non-terminal: keep waiting (design D7).
+        case .waiting(let error, .fatal):
+            // Recorded for the fatal class too (design D4): if the deadline claims the outcome
+            // between this record and the claim below, its message still names the TLS status.
+            lock.withLock { lastWaitingError = error }
+            handleFailed(error) // claim the outcome exactly as `.failed` does (design D2).
         case .ready:
             resolveConnect(.ready)
         case .failed(let error):
@@ -981,14 +999,16 @@ final class NWConnectionQUICDriver: QUICConnectionDriver, @unchecked Sendable {
 
     /// Maps `NWConnection.State` to the driver-neutral `QUICConnectionState`, converting any
     /// `NWError` to `POSIXError` (the transport never sees a raw Network.framework error).
-    private static func mapState(_ state: NWConnection.State) -> QUICConnectionState {
+    static func mapState(_ state: NWConnection.State) -> QUICConnectionState {
         switch state {
         case .setup:
             return .setup
         case .preparing:
             return .preparing
         case .waiting(let error):
-            return .waiting(error.asQUICPOSIXError())
+            // Only a TLS handshake/trust rejection is unhealable by a path change (design D1).
+            let waitClass: QUICWaitClass = if case .tls = error { .fatal } else { .transient }
+            return .waiting(error.asQUICPOSIXError(), waitClass)
         case .ready:
             return .ready
         case .failed(let error):
@@ -1035,14 +1055,19 @@ final class DispatchDeadlineScheduler: ConnectDeadlineScheduler, @unchecked Send
 @available(iOS 15, macOS 12, macCatalyst 15, tvOS 15, watchOS 8, visionOS 1, *)
 extension NWError {
     /// Maps a Network.framework error to `POSIXError` (never a raw `NWError`; CLAUDE.md convention).
-    fileprivate func asQUICPOSIXError() -> POSIXError {
+    func asQUICPOSIXError() -> POSIXError {
         switch self {
         case .posix(let code):
             return POSIXError(code)
         case .dns:
             return POSIXError(.EHOSTUNREACH, description: "QUIC DNS resolution failed: \(self)")
-        case .tls:
-            return POSIXError(.EPROTO, description: "QUIC TLS error: \(self)")
+        case .tls(let status):
+            // The Security status travels as an underlying error so callers can identify a
+            // trust rejection without parsing the description (design D3).
+            return POSIXError(.EPROTO, userInfo: [
+                NSLocalizedDescriptionKey: "QUIC TLS error: \(self)",
+                NSUnderlyingErrorKey: NSError(domain: NSOSStatusErrorDomain, code: Int(status)),
+            ])
         case .wifiAware:
             return POSIXError(.ENETUNREACH, description: "QUIC Wi-Fi Aware error: \(self)")
         @unknown default:

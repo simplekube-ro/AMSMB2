@@ -10,6 +10,7 @@
 #if canImport(Network)
 
 import Foundation
+import Network
 import XCTest
 @testable import AMSMB2
 
@@ -545,7 +546,10 @@ final class QUICTransportAppleTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(driver.sentChunks, [Data([0x01])])
     }
 
-    /// `.waiting` is non-terminal (progress continues), then `.ready` still succeeds.
+    /// Spec "Transient waiting is non-terminal": a transient `.waiting` must neither fail the
+    /// connect nor disarm the deadline — only cancellation, `close()`, or the deadline itself
+    /// ends a wait. WHY: classifying `.waiting` (this change) must not regress the transient
+    /// class into the new fail-fast path; the still-armed deadline is what bounds a stuck wait.
     func testWaitingIsNonTerminalThenReadySucceeds() async throws {
         let driver = ScriptedQUICDriver()
         let scheduler = ManualDeadlineScheduler()
@@ -555,9 +559,15 @@ final class QUICTransportAppleTests: XCTestCase, @unchecked Sendable {
         await waitUntil({ driver.didStart }, "driver started")
         driver.emit(.setup)
         driver.emit(.preparing)
-        driver.emit(.waiting(POSIXError(.ENETDOWN)))
+        driver.emit(.waiting(POSIXError(.ENETDOWN), .transient))
+        XCTAssertEqual(
+            scheduler.cancelCount, 0, "a transient wait leaves the connect deadline armed"
+        )
+        XCTAssertEqual(driver.cancelCount, 0, "a transient wait claims nothing and cancels nothing")
+
         driver.emit(.ready)
         try await task.value // did not fail on .waiting.
+        XCTAssertEqual(scheduler.cancelCount, 1, "the winning .ready cancels the deadline once")
     }
 
     /// `.failed` during connect maps to the `POSIXError` and cancels/releases the connection.
@@ -579,6 +589,32 @@ final class QUICTransportAppleTests: XCTestCase, @unchecked Sendable {
             XCTFail("expected POSIXError, got \(error)")
         }
         XCTAssertEqual(driver.cancelCount, 1, "a losing outcome cancels the connection exactly once")
+    }
+
+    /// Spec "Fatal waiting fails fast": a fatal `.waiting` (a TLS handshake/trust rejection)
+    /// claims the connect outcome as failure through the same atomic claim as `.failed`.
+    /// WHY: a trust rejection is deterministic — waiting it out to `connectTimeout` is pure
+    /// latency and reports `ETIMEDOUT`, making an untrusted certificate indistinguishable from
+    /// an unreachable server. The deadline must be cancelled (not awaited), the started driver
+    /// cancelled exactly once, and the continuation resumed exactly once.
+    func testFatalWaitingFailsFastWithMappedError() async {
+        let driver = ScriptedQUICDriver()
+        let scheduler = ManualDeadlineScheduler()
+        let transport = makeTransport(driver, scheduler)
+
+        let (task, outcome) = launchConnect(transport)
+        await waitUntil({ driver.didStart }, "driver started")
+        driver.emit(.waiting(POSIXError(.EPROTO), .fatal))
+
+        await expectPromptPOSIX(outcome, .EPROTO, "fatal waiting")
+        XCTAssertEqual(scheduler.cancelCount, 1, "the deadline is cancelled exactly once, never awaited")
+        XCTAssertEqual(driver.cancelCount, 1, "the started driver is cancelled exactly once")
+
+        // Late events on a finished attempt are no-ops: no second cancel, no second resume.
+        driver.emit(.failed(POSIXError(.ECONNRESET)))
+        task.cancel()
+        await reap(task, ifCompleted: outcome.isCompleted)
+        XCTAssertEqual(driver.cancelCount, 1, "no second cancel from post-claim events")
     }
 
     /// Cancellation before start: the connect throws `CancellationError` and never starts the
@@ -621,7 +657,7 @@ final class QUICTransportAppleTests: XCTestCase, @unchecked Sendable {
 
         let task = Task { try await transport.connect(host: "h", port: 443) }
         await waitUntil({ driver.didStart }, "driver started")
-        driver.emit(.waiting(POSIXError(.ETIMEDOUT))) // driver holds .waiting.
+        driver.emit(.waiting(POSIXError(.ETIMEDOUT), .transient)) // driver holds .waiting.
         task.cancel()
 
         do {
@@ -924,6 +960,35 @@ final class QUICTransportAppleTests: XCTestCase, @unchecked Sendable {
         )
     }
 
+    /// Spec "Fatal waiting in the commit-to-start window is a parked loss": a fatal `.waiting`
+    /// delivered after the transport committed toward `start()` but before the start side effect
+    /// must behave exactly like a `.failed` in that window. WHY: routing fatal waits through
+    /// `handleFailed` (design D2) is only safe if it inherits the parked-loss handoff —
+    /// cancelling inside the window would cancel a driver before its start side effect.
+    func testFatalWaitingInCommitToStartGapCancelsAfterStartExactlyOnce() async {
+        let driver = GatedStartDriver()
+        let transport = makeGatedTransport(driver, ManualDeadlineScheduler())
+
+        let task = Task { try await transport.connect(host: "h", port: 443) }
+        await waitUntil({ driver.didEnterStart }, "transport committed toward start")
+        driver.emit(.waiting(POSIXError(.EPROTO), .fatal)) // loser parked inside the window.
+        XCTAssertEqual(driver.events, [], "no cancel may precede the driver's start side effect")
+
+        driver.releaseStart()
+        do {
+            try await task.value
+            XCTFail("a fatal wait in the commit-to-start gap must fail the connect")
+        } catch let posix as POSIXError {
+            XCTAssertEqual(posix.code, .EPROTO)
+        } catch {
+            XCTFail("expected POSIXError(.EPROTO), got \(error)")
+        }
+        XCTAssertEqual(
+            driver.events, ["start", "cancel"],
+            "start committed first → started driver cancelled exactly once, after start"
+        )
+    }
+
     /// Failure-versus-cancel: whichever is emitted first wins; the other is a no-op. Here the
     /// failure wins and the late cancel performs nothing extra.
     func testFailureWinsRaceLateCancelIsNoOp() async {
@@ -978,7 +1043,7 @@ final class QUICTransportAppleTests: XCTestCase, @unchecked Sendable {
 
         let task = Task { try await transport.connect(host: "h", port: 443) }
         await waitUntil({ driver.didStart }, "driver started")
-        driver.emit(.waiting(POSIXError(.EHOSTUNREACH)))
+        driver.emit(.waiting(POSIXError(.EHOSTUNREACH), .transient))
         scheduler.fireNow()
 
         do {
@@ -994,6 +1059,33 @@ final class QUICTransportAppleTests: XCTestCase, @unchecked Sendable {
             XCTFail("expected POSIXError(.ETIMEDOUT), got \(error)")
         }
         XCTAssertEqual(driver.cancelCount, 1, "deadline cancels the connection once")
+    }
+
+    /// Spec "Deadline expiry" + "No double resume": a fatal `.waiting` that arrives after the
+    /// deadline has already claimed the outcome is a side-effect-free no-op — the `ETIMEDOUT`
+    /// stands, the driver is not cancelled a second time, and the continuation is not resumed
+    /// again. WHY: fatal waits now claim the outcome, so they must still lose cleanly to a claim
+    /// already consumed by the deadline (Network.framework re-emits `.waiting(.tls)`). The
+    /// load-bearing check is implicit: a second resume would trap in `CheckedContinuation` and
+    /// crash the run — the explicit assertions guard the single cancel and the standing
+    /// `ETIMEDOUT`.
+    func testFatalWaitingAfterDeadlineIsNoOp() async {
+        let driver = ScriptedQUICDriver()
+        let scheduler = ManualDeadlineScheduler()
+        let transport = makeTransport(driver, scheduler, connectTimeout: 12)
+
+        let (task, outcome) = launchConnect(transport)
+        await waitUntil({ driver.didStart }, "driver started")
+        scheduler.fireNow()
+        await expectPromptPOSIX(outcome, .ETIMEDOUT, "deadline expiry")
+        XCTAssertEqual(driver.cancelCount, 1, "the deadline cancels the connection once")
+
+        driver.emit(.waiting(POSIXError(.EPROTO, description: "QUIC TLS error: -9808"), .fatal))
+        await reap(task, ifCompleted: outcome.isCompleted)
+        XCTAssertEqual(
+            (outcome.error as? POSIXError)?.code, .ETIMEDOUT, "the deadline's outcome stands"
+        )
+        XCTAssertEqual(driver.cancelCount, 1, "the losing fatal wait performs no side effect")
     }
 
     /// A deadline that fires AFTER `.ready` has won is a side-effect-free no-op.
@@ -1075,6 +1167,25 @@ final class QUICTransportAppleTests: XCTestCase, @unchecked Sendable {
             XCTFail("abnormal loss must throw")
         } catch let posix as POSIXError {
             XCTAssertEqual(posix.code, .ENETRESET)
+        }
+    }
+
+    /// Spec "Fatal waiting fails fast" (second bullet): a fatal `.waiting` landing after `.ready`
+    /// won the claim never re-enters connect completion — it is routed like any post-ready
+    /// `.failed`, i.e. abnormal transport loss delivered to a parked `receive()` (design D8).
+    /// WHY: re-entering connect completion would resume an already-consumed continuation (a
+    /// trap); silently ignoring it would leave a session whose TLS layer reported failure looking
+    /// healthy until the next I/O hung.
+    func testPostReadyFatalWaitingIsAbnormalLoss() async throws {
+        let (transport, driver) = try await connectedTransport()
+        async let parked = transport.receive()
+        try? await Task.sleep(nanoseconds: 5_000_000)
+        driver.emit(.waiting(POSIXError(.EPROTO), .fatal))
+        do {
+            _ = try await parked
+            XCTFail("post-ready fatal waiting must surface as abnormal loss")
+        } catch let posix as POSIXError {
+            XCTAssertEqual(posix.code, .EPROTO)
         }
     }
 
@@ -1584,6 +1695,81 @@ final class QUICTransportApplePublicInitTests: XCTestCase {
         } catch {
             XCTFail("expected POSIXError(.EINVAL), got \(error)")
         }
+    }
+}
+
+// MARK: - NWError → POSIXError mapping and `.waiting` classification
+
+/// Direct tests of the production translation layer. WHY: the scripted-driver tests inject
+/// `QUICConnectionState` values and therefore never exercise `mapState`/`asQUICPOSIXError` — the
+/// two lines that actually decide, in production, that a TLS rejection is `EPROTO` and fatal.
+/// Spec: "TLS error mapping carries the status" and "Fatal waiting fails fast".
+@available(iOS 15, macOS 12, macCatalyst 15, tvOS 15, watchOS 8, visionOS 1, *)
+final class NWErrorQUICMappingTests: XCTestCase {
+    /// A TLS error maps to `EPROTO` carrying the Security `OSStatus` under `NSUnderlyingErrorKey`,
+    /// so callers can identify a trust rejection without parsing description text.
+    func testTLSErrorMapsToEPROTOWithUnderlyingOSStatus() throws {
+        let mapped = NWError.tls(-9808).asQUICPOSIXError()
+        XCTAssertEqual(mapped.code, .EPROTO, "a TLS rejection is EPROTO, never ETIMEDOUT")
+
+        let underlying = try XCTUnwrap(
+            (mapped as NSError).userInfo[NSUnderlyingErrorKey] as? NSError,
+            "the OSStatus must travel as an underlying NSError"
+        )
+        XCTAssertEqual(underlying.domain, NSOSStatusErrorDomain)
+        XCTAssertEqual(underlying.code, -9808)
+        XCTAssertTrue(
+            (mapped as NSError).localizedDescription.contains("-9808"),
+            "the description names the numeric status for logs"
+        )
+    }
+
+    /// `mapState` classifies `.waiting` by `NWError` case: only `.tls` is fatal. WHY: the class is
+    /// the single production decision that makes a trust rejection fail fast; deriving it from the
+    /// mapped `POSIXError` would be wrong (other sources also produce `EPROTO`).
+    func testMapStateClassifiesOnlyTLSWaitsAsFatal() throws {
+        guard case .waiting(let tlsError, let tlsClass) = NWConnectionQUICDriver.mapState(
+            .waiting(.tls(-9808))
+        ) else {
+            return XCTFail("a .waiting NWConnection state must stay a .waiting seam state")
+        }
+        XCTAssertEqual(tlsClass, .fatal, "no path change can heal a TLS rejection")
+        XCTAssertEqual(tlsError.code, .EPROTO)
+        let underlying = try XCTUnwrap(
+            (tlsError as NSError).userInfo[NSUnderlyingErrorKey] as? NSError
+        )
+        XCTAssertEqual(underlying.domain, NSOSStatusErrorDomain)
+        XCTAssertEqual(underlying.code, -9808)
+
+        guard case .waiting(let refusedError, let refusedClass) = NWConnectionQUICDriver.mapState(
+            .waiting(.posix(.ECONNREFUSED))
+        ) else {
+            return XCTFail("a .waiting NWConnection state must stay a .waiting seam state")
+        }
+        XCTAssertEqual(refusedClass, .transient, "a refused connection may succeed on a new path")
+        XCTAssertEqual(refusedError.code, .ECONNREFUSED)
+
+        guard case .waiting(_, let dnsClass) = NWConnectionQUICDriver.mapState(
+            .waiting(.dns(DNSServiceErrorType(kDNSServiceErr_NoSuchName)))
+        ) else {
+            return XCTFail("a .waiting NWConnection state must stay a .waiting seam state")
+        }
+        XCTAssertEqual(dnsClass, .transient, "DNS failures are retryable")
+    }
+
+    /// `.failed(.tls(_))` keeps its existing shape — the classification changes `.waiting` only.
+    /// WHY: callers get one `EPROTO` + `NSUnderlyingErrorKey` contract regardless of whether
+    /// Network.framework reports the rejection as `.waiting` or `.failed`; a divergence here would
+    /// make the documented "certificate not trusted" flow depend on which state the OS chose.
+    func testMapStateFailedTLSKeepsMappedErrorShape() throws {
+        guard case .failed(let error) = NWConnectionQUICDriver.mapState(.failed(.tls(-9808))) else {
+            return XCTFail("a .failed NWConnection state must stay a .failed seam state")
+        }
+        XCTAssertEqual(error.code, .EPROTO)
+        let underlying = try XCTUnwrap(
+            (error as NSError).userInfo[NSUnderlyingErrorKey] as? NSError
+        )
+        XCTAssertEqual(underlying.code, -9808)
     }
 }
 
