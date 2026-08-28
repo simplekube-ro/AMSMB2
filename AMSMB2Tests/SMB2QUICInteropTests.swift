@@ -30,6 +30,8 @@
 //  the connect deadline (`ETIMEDOUT`) even though the server is healthy (loopback smbclient keeps
 //  working). This is a rig networking artifact, not an SMB/QUIC fault; see docs/INTEROP-QUIC.md
 //  trap #5. All 14 tests pass individually / in small batches against the patched rig.
+//  (A *TLS trust rejection* is no longer part of that symptom: it now fails fast with
+//  `POSIXError(.EPROTO)`, so `ETIMEDOUT` here means only "endpoint unreachable/unresponsive".)
 //
 //  Env: SMB_QUIC_SERVER, SMB_QUIC_SHARE (default "share"), SMB_QUIC_USER (default "smbtest"),
 //  SMB_QUIC_PASSWORD (default "quictest1"), SMB_QUIC_CA_DER (DER path of the lab CA).
@@ -109,9 +111,10 @@ final class SMB2QUICInteropTests: XCTestCase, @unchecked Sendable {
     }
 
     /// Proves the rig is reachable and serving QUIC via a known-good `.customRoots` connect;
-    /// `throw XCTSkip` if it can't. Used to gate trust-REJECTION tests: a QUIC trust failure
-    /// surfaces as the connect deadline (`.ETIMEDOUT`) — the same code an unreachable rig gives —
-    /// so without this control a down rig would false-green a rejection assertion.
+    /// `throw XCTSkip` if it can't. Still gates the trust-REJECTION tests: a trust rejection is now
+    /// a distinct code (`.EPROTO`, never `.ETIMEDOUT`), but a down rig would make those tests skip
+    /// on an unrelated failure or, worse, report a connect error unrelated to trust — the control
+    /// keeps a rejection assertion meaningful.
     private func requireRigReachable() async throws {
         let control = try makeManager(trustPolicy: .customRoots([caDER]), connectTimeout: 15)
         do {
@@ -280,19 +283,19 @@ final class SMB2QUICInteropTests: XCTestCase, @unchecked Sendable {
     /// (d) `.system` trust → REJECTED: the server certificate chains only to the lab CA, which is
     /// not in the system store, so the handshake fails — proving system-trust enforcement.
     func testTrustSystemRejectsLabCert() async throws {
-        // A verify-failed QUIC handshake does NOT fail fast — NWConnection keeps it in `.waiting`
-        // until the connect deadline, so a trust rejection surfaces as `.ETIMEDOUT`, the same code
-        // an unreachable rig produces. To keep an unreachable rig from false-greening, a
-        // reachability control (a known-good `.customRoots` connect) must succeed first; if it
-        // can't, we skip rather than assert.
+        // A verify-failed QUIC handshake fails fast with `.EPROTO` (never the `.ETIMEDOUT`
+        // deadline), so the code alone distinguishes a trust rejection from an unreachable rig.
+        // The reachability control still runs so a down rig skips instead of asserting.
         try await requireRigReachable()
         let manager = try makeManager(trustPolicy: .system, connectTimeout: 8)
+        let started = Date()
         do {
             try await manager.connectShare(name: shareName)
             XCTFail(".system trust must reject a cert that chains only to the lab CA")
-        } catch is POSIXError {
-            // Expected: the handshake never validates → connect fails at the deadline. The
-            // reachability control above proves this is a trust rejection, not an unreachable rig.
+        } catch {
+            assertQUICTLSRejection(
+                error, "system trust", elapsed: Date().timeIntervalSince(started)
+            )
         }
     }
 
@@ -310,17 +313,50 @@ final class SMB2QUICInteropTests: XCTestCase, @unchecked Sendable {
         guard let unrelated = Self.selfSignedDER(commonName: "unrelated.invalid") else {
             throw XCTSkip("openssl unavailable — cannot generate an unrelated anchor")
         }
-        // See testTrustSystemRejectsLabCert: a verify-failed QUIC handshake surfaces as the connect
-        // deadline (`.ETIMEDOUT`), indistinguishable by code from an unreachable rig — so a
-        // reachability control gates the assertion.
+        // See testTrustSystemRejectsLabCert: the rejection is `.EPROTO`, not the connect deadline;
+        // a reachability control still gates the assertion against a down rig.
         try await requireRigReachable()
         let manager = try makeManager(trustPolicy: .customRoots([unrelated]), connectTimeout: 8)
+        let started = Date()
         do {
             try await manager.connectShare(name: shareName)
             XCTFail("an unrelated custom anchor must reject the server certificate")
-        } catch is POSIXError {
-            // Expected: chain does not anchor to the supplied root → connect fails at the deadline.
+        } catch {
+            assertQUICTLSRejection(
+                error, "unrelated anchor", elapsed: Date().timeIntervalSince(started)
+            )
         }
+    }
+
+    /// Asserts the live trust-rejection contract: `POSIXError(.EPROTO)` carrying the Security
+    /// `OSStatus` as an `NSOSStatusErrorDomain` underlying error, so a caller can offer a
+    /// "certificate not trusted" flow without parsing description text. The elapsed time is
+    /// logged, not asserted — `.EPROTO` alone proves the non-deadline path (the deadline can only
+    /// ever produce `.ETIMEDOUT`), and a wall-clock bound would only add flake on a loaded rig.
+    private func assertQUICTLSRejection(
+        _ error: any Error, _ label: String, elapsed: TimeInterval,
+        file: StaticString = #filePath, line: UInt = #line
+    ) {
+        let seconds = String(format: "%.3f", elapsed)
+        print("QUIC trust rejection (\(label)) surfaced in \(seconds)s: \(error)")
+        guard let posix = error as? POSIXError else {
+            XCTFail("\(label): expected POSIXError(.EPROTO), got \(error)", file: file, line: line)
+            return
+        }
+        XCTAssertEqual(
+            posix.code, .EPROTO, "\(label): a TLS rejection is EPROTO", file: file, line: line
+        )
+        let underlying = (posix as NSError).userInfo[NSUnderlyingErrorKey] as? NSError
+        XCTAssertEqual(
+            underlying?.domain, NSOSStatusErrorDomain,
+            "\(label): the Security OSStatus must travel as an underlying error",
+            file: file, line: line
+        )
+        XCTAssertNotEqual(
+            underlying?.code ?? 0, 0,
+            "\(label): the underlying OSStatus must be a real (non-zero) status",
+            file: file, line: line
+        )
     }
 
     // MARK: - 4.3 D8 lifecycle observations (opt-in; set SMB_QUIC_OBSERVE=1)

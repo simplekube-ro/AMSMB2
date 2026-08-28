@@ -646,7 +646,7 @@ Platform-neutral SMB-over-QUIC configuration — it holds **no Security.framewor
 
 **`connectTimeout`** — the dedicated QUIC connect deadline in seconds (default **30**). Finite and positive only: `NaN`, `±infinity`, `0`, and negative values throw `POSIXError(.EINVAL)`; values above **3600** clamp to 3600. It is **independent of `SMB2Manager.timeout`** (whose "zero-or-negative disables" contract is unchanged and continues to feed the per-operation `smb2_set_timeout`); the QUIC connect deadline cannot be disabled.
 
-> A verify-failed QUIC handshake (`.system` against an untrusted cert, or `.customRoots` with a non-matching anchor) does not fail fast — `NWConnection` keeps it waiting until `connectTimeout`, so the failure surfaces as `POSIXError(.ETIMEDOUT)`. Use a shorter `connectTimeout` if you need snappier trust-failure feedback.
+> A verify-failed QUIC handshake (`.system` against an untrusted cert, or `.customRoots` with a non-matching anchor) **fails fast**, bounded by the handshake itself rather than by `connectTimeout`: it surfaces as `POSIXError(.EPROTO)` carrying the Security `OSStatus` under `userInfo[NSUnderlyingErrorKey]` (an `NSError` in `NSOSStatusErrorDomain`). `connectTimeout` therefore bounds an unreachable or unresponsive endpoint, which surfaces as `POSIXError(.ETIMEDOUT)` — a trust rejection and an unreachable server are distinguishable by error code alone, with no description-string parsing. The one exception is a `connectTimeout` shorter than the handshake itself: if the deadline expires before the TLS outcome is reported, the deadline wins and the caller sees `ETIMEDOUT` (its description names the last TLS status, but there is no `NSUnderlyingErrorKey`).
 
 ---
 
@@ -660,6 +660,8 @@ Opt into QUIC by setting `SMB2Manager.transportKind = .quic` (optionally with a 
 - **Non-numeric hostnames only** — every numeric IPv4/IPv6 target (in any form) is rejected with `POSIXError(.EINVAL)` before any transport exists. `localhost`, single-label names, and other non-numeric names are accepted even though they may later fail resolution. Rejection **precedes and is independent of** the TLS trust policy — `.insecureNoVerification` does not bypass it.
 - **UDP/443 default** — an explicit port in the server string is honored; otherwise QUIC defaults to 443 (TCP defaults to 445).
 - **No silent fallback** — a `.quic` connect failure is surfaced to you; the library never retries over TCP on its own.
+
+**Connect error codes:** `EINVAL` (numeric target host, invalid DER anchor, empty `.customRoots([])`, invalid `connectTimeout`, explicit port outside 1...65535), `ENOTSUP` (below the availability floor, or Linux), `EPROTO` (TLS handshake/trust rejection — prompt, with the Security `OSStatus` under `NSUnderlyingErrorKey`), `ETIMEDOUT` (the `connectTimeout` deadline — an unreachable or unresponsive endpoint; a TLS rejection surfaces here only if the deadline expires before the handshake outcome is reported), `ECONNABORTED` (`close()` during connect), and `CancellationError` for task cancellation.
 
 **Snapshot / copy / serialization semantics:**
 
@@ -712,8 +714,9 @@ All operations throw `POSIXError` on failure. Common codes:
 | 45 | `ENOTSUP` | Unsupported — selecting `.quic` below the QUIC availability floor or on a platform without `Network` (Linux). On Linux this surfaces as `EOPNOTSUPP` (same errno; `.ENOTSUP` is not a distinct `POSIXErrorCode` there). |
 | 53 | `ECONNABORTED` | Transport (QUIC) `close()` called while a connect was in flight |
 | 57 | `ENOTCONN` | Not connected (call `connectShare` first) |
-| 60 | `ETIMEDOUT` | Operation or connect timed out — including the QUIC connect deadline (`SMBQUICConfiguration.connectTimeout`); note a QUIC TLS-trust rejection also surfaces here |
+| 60 | `ETIMEDOUT` | Operation or connect timed out — including the QUIC connect deadline (`SMBQUICConfiguration.connectTimeout`), i.e. an unreachable or unresponsive endpoint. A QUIC TLS rejection is `EPROTO` instead, unless the deadline expires before the handshake outcome is reported |
 | 61 | `ECONNREFUSED` | Connection refused by the peer (e.g., transport connect failure) |
+| 100 | `EPROTO` | QUIC TLS handshake failure — most commonly the server certificate failing the configured trust policy or hostname verification, but any other handshake rejection (e.g. an ALPN mismatch) as well. Reported promptly, ahead of the connect deadline; the Security `OSStatus` under `userInfo[NSUnderlyingErrorKey]` (an `NSError` in `NSOSStatusErrorDomain`) identifies the cause |
 
 Task cancellation surfaces as `CancellationError` (not a `POSIXError`) — see [Task Cancellation](#task-cancellation).
 

@@ -182,16 +182,54 @@ fallback), and the TLS trust matrix (custom root correct + SAN short name → su
 - **No premature idle teardown / keepalive tuning needed.** Multi-MB transfers and interleaved
   connect/op/disconnect cycles complete within `NWProtocolQUIC` defaults; the connect deadline
   (`SMBQUICConfiguration.connectTimeout`) and libsmb2's servicing timers govern the rest.
-- **TLS trust rejection surfaces as the connect deadline (`ETIMEDOUT`), not a fast TLS error.** A
-  verify-failed QUIC handshake (`.system` against the lab cert, or `.customRoots` with an unrelated
-  anchor) does not transition `NWConnection` promptly to `.failed`; it stays in `.waiting` until
-  `connectTimeout` fires, so the caller sees `POSIXError(.ETIMEDOUT)`. Practical consequence: a
-  trust rejection and an unreachable server are indistinguishable by error code — the
-  interop rejection tests therefore run a known-good reachability control first and skip (rather
-  than false-green) if the rig is down. Callers that need snappier trust-failure feedback should
-  set a shorter `connectTimeout`.
+- **TLS trust rejection: RESOLVED — it now fails fast with `EPROTO`.** Network.framework still
+  reports a verify-failed QUIC handshake (`.system` against the lab cert, or `.customRoots` with an
+  unrelated anchor) as the *non-terminal* `.waiting(.tls(status))` rather than `.failed`, so it
+  originally waited out `connectTimeout` and surfaced as `POSIXError(.ETIMEDOUT)` —
+  indistinguishable by code from an unreachable server. The transport now classifies `.waiting` at
+  the connection-driver seam: a `.tls` wait is **fatal** and claims the connect outcome immediately,
+  every other wait stays transient and deadline-bounded. A trust rejection is therefore
+  `POSIXError(.EPROTO)`, reported as soon as the handshake fails, carrying the Security `OSStatus`
+  as an `NSOSStatusErrorDomain` `NSError` under `userInfo[NSUnderlyingErrorKey]`. `ETIMEDOUT` from
+  a QUIC connect now means "endpoint unreachable/unresponsive" — or a `connectTimeout` shorter
+  than the handshake itself, in which case the deadline still wins. The interop rejection tests
+  still run a known-good reachability control first, so a down rig skips rather than reporting an
+  unrelated connect error.
 - The wrong-hostname trust case is manual-only (see the test-run section); the unit suite proves
   it in `evaluateCustomRootsTrust`.
+
+### Windows Server 2022 (2026-08-28)
+
+Second interop target: `win2k22.kaveman.intra`, share `Share`, SMB-over-QUIC with a **self-signed**
+server certificate (the leaf is its own anchor).
+
+- `.customRoots([leaf .cer])` and `.insecureNoVerification` connect successfully; `.system` is
+  rejected with Security status `-9808` (`errSSLBadCert`), since a self-signed leaf chains to no
+  system root.
+- Throughput: a 1.1 GB read completes at ~34 MB/s over QUIC versus ~38 MB/s over TCP against the
+  same host, with identical MD5 — QUIC is within ~10% of TCP, and the payload round-trips byte-exact.
+
+Live trust matrix after the fail-fast change (scratch harness against the same host, credentials
+`testuser`, the server's own `.cer` fetched from the share as the `.customRoots` anchor):
+
+| Policy | Outcome |
+|---|---|
+| `.system` | rejected in **0.20 s** (was: full `connectTimeout`) — `POSIXError(.EPROTO)` (errno 100), description `QUIC TLS error: -9808: bad certificate format`, `userInfo[NSUnderlyingErrorKey]` = `NSOSStatusErrorDomain -9808` |
+| `.customRoots([server .cer])` | connected in 0.06 s, directory listing OK |
+| `.insecureNoVerification` | connected in 0.07 s; 1.1 GB read in 33.1 s (33.4 MB/s), MD5 `4e63a5b7cec8a34f9dfb938f755b5dfe` |
+| `.tcp` (control) | connected in 0.15 s; same file in 31.1 s (35.5 MB/s), identical MD5 |
+
+The certificate is self-signed (`CN=win2k22.kaveman.intra`, SAN `DNS:win2k22.kaveman.intra,
+DNS:192.168.20.164`), so `.customRoots` uses the leaf itself as the sole anchor.
+
+The interop suite itself also runs against this host (`SMB_QUIC_SERVER=win2k22.kaveman.intra
+SMB_QUIC_SHARE=Share SMB_QUIC_CA_DER=<the server .cer>`): `testTrustSystemRejectsLabCert` and
+`testTrustUnrelatedAnchorRejected` pass with `EPROTO` / `-9808` surfacing in 0.018 s and 0.013 s;
+`testTrustCustomRootCorrectHostSucceeds` and `testTrustInsecureSucceeds` pass.
+`testTrustCustomRootShortNameSucceeds` is Samba-rig-specific (its default short name is
+`ubuntu-brix`, and this certificate's SAN carries no short name) — dialling that unreachable name
+still produces the transient-wait `ETIMEDOUT`, i.e. an unreachable host and a trust rejection
+are now different codes on a real server.
 
 ### D8 disconnect / server-close observations (2026-07-24)
 

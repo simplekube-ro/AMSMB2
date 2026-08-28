@@ -1,19 +1,18 @@
 # Project Architect Memory
 
-## Transport rollout (add-pluggable-tcp-transport)
-- transport-rollout-t9-split.md — T9 must GUARD-not-delete the legacy DispatchSource path (Linux keeps it); legacy code is currently unguarded; over-deletion breaks Linux invisibly.
-- seam-connect-ordering.md — root cause of broken Apple seam (detached connect + premature `ext.connect` return-0) and architect decision: Approach A (eager connect), Apple seam-only, with binding teardown/encapsulation mandates.
+## OpenSpec workflow & review-gate precedent
+- [OpenSpec review-gate verdict matching](openspec-review-gate-verdicts.md) — hook match is textual; quoting the revision verdict in findings blocks apply even under an APPROVED verdict.
+- [Re-gate precedent: fix-swift6-concurrency scope expansions](regate-fix-swift6-concurrency.md) — how scope creep during apply was ruled on.
+- [quic-transport review history](quic-transport-review.md) — add-quic-transport gate history + verified code facts; 9th review 2026-07-25 APPROVED.
+- [tcp-one-shot-connect review](tcp-one-shot-connect-review.md) — APPROVED WITH CONDITIONS 2026-07-25; earlier APPROVED retracted same day; Network.framework test-timing gotcha.
 
-## QUIC transport
-- quic-transport-review.md — add-quic-transport gate history + verified D7/port/ENOTCONN code facts; 9th review 2026-07-25 = APPROVED; CORRECTED: pre-remediation TCP close/connect was NOT sound (publication race + no owned close lifecycle — merge-blocking, fixed in fix-tcp-one-shot-connect §3).
-- tcp-one-shot-connect-review.md — fix-tcp-one-shot-connect: first APPROVED retracted same day (the "non-blocking" close/publication race was merge-blocking; grade races against the current contract, not old behavior); remediation (D5 atomic publication + D6/D7 owned close) reviewed 2026-07-25 = APPROVED WITH CONDITIONS (two Low, cleared); NIOTS facts: double group shutdown fails fast, bootstrap self-closes failed connects; delta-spec must append not restate; mutation-check recipe; 127.0.0.1:1 never fast-refuses on NIOTS.
+## Transport seam
+- [Seam connect-ordering fix decision](seam-connect-ordering.md) — root cause + decision for fix-seam-connect-ordering.
+- [Transport rollout T9 Apple/Linux split](transport-rollout-t9-split.md) — legacy DispatchSource path is unguarded; T9 must guard-not-delete for Linux.
 
-## Concurrency / Swift 6
-- swift6-strict-concurrency-context.md — swift:6.1 Linux hard-errors on @Sendable captures macOS only warns on; local cbPtr construction + nonisolated(unsafe) for must-cross handler & queueKey. FINAL REVIEW 2026-06-27: 5 fixes correct & race-safe (retain/release 1:1, no UAF/double-free); confirmed FIRST-HAND macOS Context.swift recompile clean + make linuxtest exit 0 (114 tests/50 skip/0 fail). C2b test-portability fixes (2 test files) accepted into this change. proposal.md Non-Goal still wrongly says "confined to Context.swift" — must reconcile before archive.
-- regate-fix-swift6-concurrency.md — RE-GATE 2026-06-30: C2b test-portability ACCEPTED (inside acceptance bar B); agent scaffolding out-of-scope (record-only, merged + user-requested, no revert). Archive BLOCKED until spec.md "Edits confined to Context.swift" scenario + design.md deviations are corrected for honesty (false as shipped: test files/Dockerfile/tooling all changed).
+## C interop & concurrency invariants
+- [CBData retain/release ownership contract](cbdata-ownership-contract.md) — exactly-once balance rule for the per-op passRetained CBData.
+- [Swift 6 strict concurrency in Context.swift](swift6-strict-concurrency-context.md) — Linux hard-errors where macOS warns; sanctioned fix patterns.
 
-## C interop / lifetime ownership
-- cbdata-ownership-contract.md — exactly-once balance rule: never release the passRetained CBData after a PDU is queued; libsmb2 fires every pending cb at smb2_destroy_context; connect path balances via c_data->cb chain; disconnect() leaks-until-deinit (bounded, not a crash). Basis for fix-cbdata-cancel-race-uaf review.
-
-## Stream / upload
-- stream-premature-eof.md — AsyncInputStream 5 MiB upload truncation (`.atEnd` on transient drain). Fix = producerFinished + would-block `-1` + consumer Task.yield retry. Gate guardrails: G1 set `_streamError` (never assigned!), G2 error on `streamStatus==.error`, G3 narrow would-block (.open/.reading only), G4 delete orphaned readData, G5 consumer only sees AsyncInputStream.
+## Known bug classes
+- [AsyncInputStream premature-EOF fix](stream-premature-eof.md) — root cause + gate guardrails for the 5 MiB streamed-upload truncation.
