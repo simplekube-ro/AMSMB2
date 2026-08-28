@@ -87,6 +87,80 @@ class SMB2DisconnectTimeoutTests: SMBIntegrationTestCase, @unchecked Sendable {
         }
     }
 
+    /// WHEN a non-graceful `disconnectShare` happens while a large read is in flight against a
+    /// real server
+    /// THEN the client is deallocated once the read's failure has been observed and the live
+    /// callback-object count returns to its baseline.
+    ///
+    /// This is the pool-teardown scenario from GitHub issue #49: before
+    /// fix-disconnect-reclaims-context, `disconnect()` left the pending read's `CBData` registered
+    /// with libsmb2, and the `CBData.dataHandler` wrapper's strong `self` capture made the whole
+    /// client — context, event-loop queue, buffers — unreclaimable forever.
+    ///
+    /// `smb.timeout = 3` bounds the per-operation timer that captures the (already emptied)
+    /// `CBData` strongly, so the `liveCount` poll below has a deterministic upper bound.
+    func testNonGracefulDisconnectMidReadReleasesClient() async throws {
+        let file = fileName()
+        let smb = SMB2Manager(url: server, credential: credential)!
+        // 32 MiB, not 4: the read must still be in flight when the disconnect lands, otherwise
+        // nothing is pending and the test would pass even against the unfixed code.
+        let data = randomData(size: 32 * 1024 * 1024)
+
+        addTeardownBlock { [self] in
+            smb.timeout = 60
+            try? await smb.connectShare(name: self.share, encrypted: self.encrypted)
+            try? await smb.removeFile(atPath: file)
+        }
+
+        try await smb.connectShare(name: share, encrypted: encrypted)
+        try await smb.write(data: data, toPath: file, progress: nil)
+
+        let baseline = SMB2Client.CBData.liveCount
+        smb.timeout = 3
+
+        let readStarted = expectation(description: "read started")
+        readStarted.assertForOverFulfill = false
+        let readTask = Task {
+            try await smb.contents(
+                atPath: file,
+                progress: { _, _ -> Bool in
+                    readStarted.fulfill()
+                    return true
+                }
+            )
+        }
+        await fulfillment(of: [readStarted], timeout: 20)
+
+        weak let weakClient = try smb.smbClient
+
+        try await smb.disconnectShare(gracefully: false)
+
+        var readFailed = false
+        do {
+            _ = try await readTask.value
+        } catch {
+            // Expected — the disconnect failed the in-flight read.
+            readFailed = true
+        }
+        XCTAssertTrue(
+            readFailed,
+            "read completed before the disconnect landed — the mid-read scenario was not exercised"
+        )
+
+        // The per-operation timeout timer holds the emptied CBData shell for up to `timeout`
+        // seconds even after the fix, so wait rather than asserting instantly. `<=`, not `==`:
+        // the count is process-global and other suites can drop below this baseline meanwhile.
+        let reclaimed = await waitUntil(timeout: 8) { SMB2Client.CBData.liveCount <= baseline }
+        XCTAssertTrue(
+            reclaimed,
+            "disconnect() must reclaim every pending callback object "
+                + "(live count \(SMB2Client.CBData.liveCount), baseline \(baseline))"
+        )
+
+        let released = await waitUntil(timeout: 2) { weakClient == nil }
+        XCTAssertTrue(released, "a non-graceful disconnect mid-read must not leave the client alive")
+    }
+
     func testOperationsFailAfterDisconnect() async throws {
         let smb = SMB2Manager(url: server, credential: credential)!
         try await smb.connectShare(name: share, encrypted: encrypted)

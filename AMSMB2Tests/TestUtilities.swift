@@ -29,6 +29,20 @@ func folderName(postfix: String = "", name: String = #function) -> String {
     "\(name.trimmingCharacters(in: .init(charactersIn: "()")))\(postfix)"
 }
 
+/// Waits until `condition` holds or `timeout` seconds elapse, returning whether it held.
+///
+/// Sleep-based (never a busy-spin) so the event-loop queue and the Swift concurrency pool keep
+/// running while the test waits. Deliberately NOT named `poll` — that would shadow the C `poll(2)`
+/// imported through `SMB2` / `Darwin`.
+func waitUntil(timeout: TimeInterval = 5, condition: () -> Bool) async -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+        if condition() { return true }
+        try? await Task.sleep(nanoseconds: 5_000_000)
+    }
+    return condition()
+}
+
 // MARK: - Integration Test Base Class
 
 class SMBIntegrationTestCase: XCTestCase, @unchecked Sendable {
