@@ -1,24 +1,28 @@
-# Agent Memory Index
+# swift-platform-developer memory (AMSMB2)
 
-- [feedback_response_style.md](feedback_response_style.md) — No emojis; no trailing summaries; share absolute file paths only
-- [project_change_notify_bug.md](project_change_notify_bug.md) — monitorItem/Change Notify crashes due to async callback lifetime bug in Swift wrapper; test skipped with fix notes
-- [patterns_c_interop_cbdata.md](patterns_c_interop_cbdata.md) — CBData lifetime / Unmanaged retain patterns for libsmb2 callbacks
-- [patterns_dispatch_queue_reentry.md](patterns_dispatch_queue_reentry.md) — Detecting re-entrant eventLoopQueue calls with DispatchSpecificKey
-- [libsmb2_fork_api_changes.md](libsmb2_fork_api_changes.md) — Fork submodule SHA, dreamcast exclude, C struct renames, new transport API symbols
-- [patterns_c_char_pointer_import.md](patterns_c_char_pointer_import.md) — `char *` → non-optional UnsafeMutablePointer (no .map); `const char *` → optional UnsafePointer (has .map). Use bitPattern bridge for null-safe access on mutable fields.
-- [patterns_swift6_c_function_refs.md](patterns_swift6_c_function_refs.md) — C function aliases as global `let` fail Swift 6 concurrency; fix: move inside test methods as local `let functionRef: @Sendable (...) -> T = cFunction`.
-- [patterns_nio_package_deps.md](patterns_nio_package_deps.md) — SwiftNIO + NIOTransportServices Apple-only Package.swift pattern (`.when(platforms:)` guard), resolved versions, D1 naming trap (never use SMB2_TRANSPORT_TCP for seam).
-- XCTestCase subclasses: never add `@unchecked Sendable` unless the subclass actually crosses isolation boundaries — the conformance is inherited implicitly and the annotation adds noise. Drop `throws` from test functions that only use `try?` in defer blocks (the function itself never throws).
-- [patterns_actor_cancellable_receive.md](patterns_actor_cancellable_receive.md) — Actor-based suspend-until-data pattern using withTaskCancellationHandler + withCheckedThrowingContinuation; race-safe via Task.isCancelled check inside continuation body.
-- [patterns_transport_seam.md](patterns_transport_seam.md) — T4 transport seam: SMBTransport protocol + SMBTransportKind enum (AMSMB2/SMBTransport.swift); MockTransport actor double in test target; branch stack for TCP transport milestone.
-- [patterns_transport_bridge.md](patterns_transport_bridge.md) — T5 TransportBridge: NSLock-in-async gotcha (use sync helpers), MockTransport loopback contention (separate pump startup for tests), Unmanaged lifetime discipline, `#if canImport(Network)` guard, lock ALL mutable state including Task refs, double-start guard pattern, ByteFIFO inlined (not separate type).
-- [patterns_ext_close_once.md](patterns_ext_close_once.md) — T6 root crash: smb2_destroy_context calls ext_close twice (top-level + negotiate_cb→smb2_close_context); fix is once-semantics in C (clear ext.close/ext.userdata before invoking). Also: smb2_set_timeout required to activate scheduleSeamTimeout / smb2_get_timeout. flushOutboundForSeam needs re-arm on 32-pass cap. scheduleSeamTimeout due-now branch needs 1ms floor not async (CPU spin risk).
-- [patterns_nio_tcp_transport.md](patterns_nio_tcp_transport.md) — T7 TCPTransportApple: NWError needs .wifiAware case (not covered by @unknown default on Xcode 14+ SDKs where it is a *known* case); NIOTS connect retries loopback ~10s (use .connectTimeout()); EventLoopFuture.get() not cooperatively cancellable (use onCancel: future.whenSuccess { $0.close(promise:nil) }); resume continuations OUTSIDE the NSLock (capture inside, resume outside); InboundBufferingHandler @unchecked Sendable with NSLock guards all state; connectTimeoutSeconds: Int not TimeAmount to keep NIO out of public API; connect() catch block must check Task.isCancelled before Self.mapError() — onCancel-triggered ChannelError would otherwise surface as ENOTCONN not ECANCELED; inboundHandler.receive() errors must be wrapped in do-catch + Self.mapError() at the TCPTransportApple.receive() call site (handler itself stays NIO-agnostic); _isClosed guard in receive() must return Data() not throw (SMBTransport EOF contract); InboundBufferingHandler can be instantiated standalone (no channel) for direct unit-testing of the async receive()/cancellation onCancel path via @testable import.
-- [patterns_transport_rollout_t8_t9.md](patterns_transport_rollout_t8_t9.md) — T8 SMB_TRANSPORT env toggle on SMBIntegrationTestCase + seam acceptance tests; T9 guard-not-delete: legacy SocketMonitor/pollUntilComplete/legacy-connect moved under `#else` of `#if canImport(Network)` (Linux-only), Apple flips to seam default. Apple-green ≠ Linux-green.
-- [patterns_async_input_stream_eof.md](patterns_async_input_stream_eof.md) — fix-stream-premature-eof: `AsyncInputStream.read()` set `.atEnd` on transient drain (no producer-completion check) → streamed upload truncated at `5242880`. Fix: `producerFinished` flag (set only on natural iterator exhaustion, under bufferLock) gates both `.atEnd` transitions; `-1` would-block else; consumer `write(client:from:toPath:)` retries via `await Task.yield()`. G1: `catch` must set `_streamError` (was never assigned). `readData` extension deleted (dead). zsh trap: `env $E swift test` does NOT word-split in zsh → whole string becomes SMB_SERVER → URL nil → ALL integration tests crash at TestUtilities.swift:35; pass vars inline.
-- [patterns_swift6_linux_strict_concurrency.md](patterns_swift6_linux_strict_concurrency.md) — fix-swift6-concurrency: swift:6.1 Linux promotes strict-concurrency *warnings* → *errors* (macOS-green ≠ Linux-compiles). Block-local `cbPtr` construction + function-scope `nonisolated(unsafe) let confinedHandler = handler` for `@Sendable` eventLoopQueue.async runners; `DispatchSpecificKey` Sendable divergence needs `#if canImport(Darwin)` split. Linux test-target gotchas: URLCredential→FoundationNetworking, NSEC_PER_SEC Int vs UInt64, NSKeyedUnarchiver `.raiseException` SIGTRAP kills the suite (guard Apple-only).
-- [patterns_quic_interop_batch_d.md](patterns_quic_interop_batch_d.md) — add-quic-transport Batch D live interop: Apple↔lxin/quic active_connection_id_limit=64 incompat (RFC 9000 §18.2, rig DKMS clamp patch), 3-stack discriminator (OpenSSL s_client -quic), docker userland UDP-proxy wedge caveat, env-gated SMB2QUICInteropTests, framing confirmed.
-- [patterns_quic_batch_c.md](patterns_quic_batch_c.md) — add-quic-transport Batch C: SMB2Manager transportKind/quicConfiguration API, connectLock snapshot semantics (D6), private-string coding + quic-never-serialized, copy(with:), D11 ObjC-runtime verification test, Linux ENOTSUP→EOPNOTSUPP bridge gotcha.
-- [patterns_quic_batch_b.md](patterns_quic_batch_b.md) — add-quic-transport Batch B: QUICTransportApple D7 atomic connect claim + D8 recorded-cause lifecycle, injected QUICConnectionDriver/ConnectDeadlineScheduler seams, D5 TLS trust + evaluateCustomRootsTrust, runtime openssl test-cert generation (398-day cap gotcha), ExistentialAny/async-semaphore gotchas.
-- [patterns_quic_batch_a.md](patterns_quic_batch_a.md) — add-quic-transport Batch A: SMBQUICConfiguration (platform-neutral), isNumericHost (Linux SOCK_STREAM enum gotcha), connect() validate-before-construct, D12 BridgeOwnershipHandoff (claim-assigns-duty, row-C ECANCELED→CancellationError normalization, gated-transport testing), `hasInstalledSeamBridge` test accessor.
-- [patterns_seam_connect_ordering.md](patterns_seam_connect_ordering.md) — fix-seam-connect-ordering: old kickConnect fired connect detached + returned 0 → ext_connect started NEGOTIATE before _channel existed → ENOTCONN/EPERM. Fix: eager `bridge.connect()` awaited in connectWithBridge BEFORE smb2_set_transport; ext.connect trampoline returns `connectStatus()` (isPreConnected?0:-ECONNREFUSED), no second connect. parseSeamEndpoint mirrors ext_connect parsing. Early-failure guards must `bridge.close()` the live channel. Seam fd is ALWAYS -1 → use `isConnected` not `fileDescriptor != -1` (fixed smbClient accessor). Found pre-existing AsyncInputStream.read() premature-.atEnd race (Stream.swift:174) — out of scope.
+## Build / test
+- Always `--disable-sandbox`. Full suite baseline (no server env): **285 tests, 67 skipped, 0 failures**.
+- Targeted: `swift test --disable-sandbox --filter <ClassName>/<testName>`.
+
+## QUIC transport (AMSMB2/QUICTransportApple.swift)
+- Driver-neutral seam `QUICConnectionState` (design D7) — no Network.framework types cross it.
+  `QUICWaitClass { transient, fatal }` rides on `.waiting(POSIXError, QUICWaitClass)`; it is
+  *preserved translation information* from the `NWError` case, policy lives in `handleState`.
+- `NWConnection` reports a TLS/trust rejection as **`.waiting(.tls(status))`**, never `.failed`.
+  `mapState` classifies `.tls` → `.fatal`; `handleState` routes fatal waits into `handleFailed`,
+  which already covers connect-claim / commit-to-start parked loss / post-ready abnormal loss.
+- TLS errors map to `POSIXError(.EPROTO)` with `NSUnderlyingErrorKey` =
+  `NSError(domain: NSOSStatusErrorDomain, code: Int(status))`. `"\(NWError.tls(-9808))"` already
+  prints the numeric status, so `NSLocalizedDescriptionKey: "QUIC TLS error: \(self)"` suffices.
+- `NWError.tls(OSStatus)` / `.posix` / `.dns(DNSServiceErrorType(kDNSServiceErr_NoSuchName))` are all
+  constructible in tests with just `import Network` (dnssd comes along) — no seam shim needed;
+  relax access to `internal` and use `@testable import AMSMB2`.
+
+## Test doubles (AMSMB2Tests/QUICTransportAppleTests.swift)
+- `ScriptedQUICDriver.emit(_:)`, `ManualDeadlineScheduler` (fires only on `fireNow()`, `cancelCount`),
+  `GatedStartDriver` (captures `onState` **before** parking, so states can be emitted *inside* the
+  commit-to-start window; `didEnterStart`/`releaseStart()`/`events`).
+- For RED steps use `launchConnect` + `expectPromptPOSIX` + `reap` so a failing expectation is a
+  bounded ~4.5 s failure, not a hung suite.
+- `ManualDeadlineScheduler.fireNow()` resolves synchronously, so anything emitted after it loses the
+  claim — the deadline's `ETIMEDOUT` description is built at claim time and cannot pick up later text.
