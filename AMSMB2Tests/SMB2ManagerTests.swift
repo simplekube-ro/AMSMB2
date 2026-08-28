@@ -43,6 +43,25 @@ class SMB2ManagerTests: SMBIntegrationTestCase, @unchecked Sendable {
         XCTAssert(swiftShares.contains(where: { $0.name == self.share }))
     }
 
+    /// Regression guard (fix-disconnect-reclaims-context, D-4 reuse audit): `listShares()` routes
+    /// through `with(shareName:)`, which `setClient`s a temporary client, disconnects it, and never
+    /// clears the manager's reference. `disconnect()` is now terminal (the context is destroyed),
+    /// so the manager's `client` points at a context-less instance afterwards. `needsReconnect`
+    /// MUST therefore see `fileDescriptor == -1` and build a fresh client on the next
+    /// `connectShare` — otherwise every operation after a share enumeration would fail with
+    /// `ENOTCONN` against the dead client.
+    func testConnectShareAfterListSharesUsesFreshClient() async throws {
+        let smb = SMB2Manager(url: server, credential: credential)!
+
+        let shares = try await smb.listShares()
+        XCTAssert(shares.contains(where: { $0.name == self.share }))
+
+        try await smb.connectShare(name: share, encrypted: encrypted)
+        try await smb.echo()
+        // Both calls throw ENOTCONN if the manager kept using the disconnected client.
+        _ = try await smb.contentsOfDirectory(atPath: "/")
+    }
+
     func testFileSystemAttributes() async throws {
         let smb = SMB2Manager(url: server, credential: credential)!
         try await smb.connectShare(name: share, encrypted: encrypted)

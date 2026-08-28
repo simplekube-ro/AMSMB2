@@ -1,28 +1,27 @@
 # swift-platform-developer memory (AMSMB2)
 
 ## Build / test
-- Always `--disable-sandbox`. Full suite baseline (no server env): **285 tests, 67 skipped, 0 failures**.
-- Targeted: `swift test --disable-sandbox --filter <ClassName>/<testName>`.
 
-## QUIC transport (AMSMB2/QUICTransportApple.swift)
-- Driver-neutral seam `QUICConnectionState` (design D7) — no Network.framework types cross it.
-  `QUICWaitClass { transient, fatal }` rides on `.waiting(POSIXError, QUICWaitClass)`; it is
-  *preserved translation information* from the `NWError` case, policy lives in `handleState`.
-- `NWConnection` reports a TLS/trust rejection as **`.waiting(.tls(status))`**, never `.failed`.
-  `mapState` classifies `.tls` → `.fatal`; `handleState` routes fatal waits into `handleFailed`,
-  which already covers connect-claim / commit-to-start parked loss / post-ready abnormal loss.
-- TLS errors map to `POSIXError(.EPROTO)` with `NSUnderlyingErrorKey` =
-  `NSError(domain: NSOSStatusErrorDomain, code: Int(status))`. `"\(NWError.tls(-9808))"` already
-  prints the numeric status, so `NSLocalizedDescriptionKey: "QUIC TLS error: \(self)"` suffices.
-- `NWError.tls(OSStatus)` / `.posix` / `.dns(DNSServiceErrorType(kDNSServiceErr_NoSuchName))` are all
-  constructible in tests with just `import Network` (dnssd comes along) — no seam shim needed;
-  relax access to `internal` and use `@testable import AMSMB2`.
+- Always `--disable-sandbox`: `swift build --disable-sandbox`, `swift build --disable-sandbox --build-tests`,
+  `swift test --disable-sandbox --filter <Suite>/<test>`.
+- `swift build` prints a giant frontend command line on failure — grep for `error:` instead of
+  reading the tail.
+- Full unit run baseline (no `SMB_SERVER`/`SMB_QUIC_SERVER`): ~291 executed, ~69 skipped,
+  0 failures. All skips are server-gated; a non-server-gated skip is a real problem.
+- No Docker on this host: `make integrationtest` / `make linuxtest` cannot run here. Record that
+  rather than claiming a pass.
 
-## Test doubles (AMSMB2Tests/QUICTransportAppleTests.swift)
-- `ScriptedQUICDriver.emit(_:)`, `ManualDeadlineScheduler` (fires only on `fireNow()`, `cancelCount`),
-  `GatedStartDriver` (captures `onState` **before** parking, so states can be emitted *inside* the
-  commit-to-start window; `didEnterStart`/`releaseStart()`/`events`).
-- For RED steps use `launchConnect` + `expectPromptPOSIX` + `reap` so a failing expectation is a
-  bounded ~4.5 s failure, not a hung suite.
-- `ManualDeadlineScheduler.fireNow()` resolves synchronously, so anything emitted after it loses the
-  claim — the deadline's `ETIMEDOUT` description is built at claim time and cannot pick up later text.
+## Swift 6 gotchas hit in this repo
+
+- A `static var` counter guarded by an `NSLock` still needs `nonisolated(unsafe)` under Swift 6
+  ("not concurrency-safe because it is nonisolated global shared mutable state"). Acceptable when
+  EVERY access goes through the lock — say so in a comment. Precedent: `CBData.liveCount`.
+- Capturing a mutable `var client: SMB2Client?` in a `Task { }` is rejected; capture by value with
+  `Task { [client] in ... }`, then `client = nil` later to drop the last reference (pattern used
+  throughout `SMB2CBDataLifetimeTests` / `SMB2DisconnectReclaimTests`).
+- Test files need `import SMB2` to call `smb2_*` C symbols; they are not re-exported through
+  `@testable import AMSMB2`.
+
+## Context.swift lifetime model
+
+See [disconnect-reclaim.md](disconnect-reclaim.md) for the CBData / context ownership rules.
