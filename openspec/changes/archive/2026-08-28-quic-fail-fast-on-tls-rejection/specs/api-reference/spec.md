@@ -1,9 +1,5 @@
-# api-reference Specification
+## MODIFIED Requirements
 
-## Purpose
-Provide a complete, AI-parseable API reference (`docs/API.md`) that documents every public type and method of AMSMB2, organized by domain, with consistent machine-readable structure and error-condition documentation so developers and AI coding assistants can look up signatures, parameters, return types, and error behavior.
-
-## Requirements
 ### Requirement: All public types documented
 
 The API reference SHALL document every public type: `SMB2Manager`, `SMB2Client`, `SMB2FileHandle`, `AsyncInputStream`, `SMB2FileChangeType`, `SMB2FileChangeAction`, `SMB2FileChangeInfo`, `SMBTransport`, `SMBTransportKind`, `TCPTransportApple`, `QUICTransportApple`, and `SMBQUICConfiguration`. For the transport seam types, the reference SHALL document that transport selection is exposed through `SMB2Manager.transportKind` (default `.automatic` → TCP), the QUIC availability floor on every Apple platform (iOS 15 / macOS 12 / macCatalyst 15 / tvOS 15 / watchOS 8 / visionOS 1) and the Linux behavior (`.quic` → `ENOTSUP`; configuration types exist but are inert), and the QUIC connection policy (explicit opt-in, all numeric hosts rejected — non-numeric hostnames only, so `localhost` and single-label names are accepted even though they may later fail resolution; rejection precedes and is independent of the TLS trust policy, and `.insecureNoVerification` does not bypass it — UDP/443 default, no silent fallback, secure-by-default TLS with the mutually exclusive `TrustPolicy`, and the dedicated `SMBQUICConfiguration.connectTimeout` — default 30 s, finite positive values only with `EINVAL` on `NaN`/infinite/zero/negative and clamping above 3600 s, independent of `SMB2Manager.timeout`'s zero-or-negative-disables contract). The reference SHALL also document the settings' snapshot semantics (changes never affect an in-flight or established connection), that `copy()` preserves `transportKind` and `quicConfiguration` while archiving round-trips only `transportKind`, that the new transport/configuration surface is Swift-only and intentionally absent from the Objective-C interface while the existing Objective-C API is unchanged (design D11), and that local disconnect is best-effort (the DISCONNECT PDU's wire delivery is not guaranteed).
@@ -19,30 +15,6 @@ The API reference SHALL document every public type: `SMB2Manager`, `SMB2Client`,
 #### Scenario: QUIC policy and errors are documented
 - **WHEN** a developer looks up SMB-over-QUIC usage
 - **THEN** they SHALL find the error conditions (`EINVAL` for numeric-host targets, invalid DER anchors, an empty `.customRoots([])` anchor set, invalid `connectTimeout` values, and an explicit port outside 1...65535; `ENOTSUP` below the availability floor or on Linux; `ETIMEDOUT` for the `connectTimeout` connect deadline (unreachable or unresponsive endpoint — a TLS rejection surfaces here only if the deadline expires before the handshake outcome is reported); `EPROTO` for a TLS handshake failure — most commonly a trust/hostname rejection under `.system` or `.customRoots`, but any other handshake rejection too — reported promptly and carrying the Security `OSStatus` as an `NSOSStatusErrorDomain` `NSUnderlyingErrorKey`; `ECONNABORTED` for close-during-connect; `CancellationError` for task cancellation), the secure-by-default TLS trust policy with explicit opt-in cases, and the caller-side TCP-fallback pattern
-
-### Requirement: All public methods documented
-
-The API reference SHALL document every public/open method on `SMB2Manager` with its async variant. Each method entry SHALL include: signature, description, parameters, return type, and throws behavior.
-
-#### Scenario: Method lookup
-- **WHEN** a developer or AI agent looks up a method name
-- **THEN** they SHALL find its complete signature, parameter descriptions, and error conditions
-
-### Requirement: Domain-grouped organization
-
-Methods SHALL be grouped by domain: Connection Management, Share Enumeration, Directory Operations, File Operations, File Attributes, Symbolic Links, Copy/Move, Upload/Download, Streaming, Monitoring.
-
-#### Scenario: Finding related methods
-- **WHEN** a developer wants to know all directory-related methods
-- **THEN** they SHALL find them grouped together in the Directory Operations section
-
-### Requirement: AI-parseable format
-
-Each method entry SHALL use a consistent markdown structure with machine-parseable headers (`### methodName`), parameter lists, and return type descriptions. No prose-heavy descriptions that require interpretation.
-
-#### Scenario: AI context loading
-- **WHEN** an AI coding assistant loads the API reference for context
-- **THEN** it SHALL be able to extract method signatures, parameter types, and behavior descriptions programmatically
 
 ### Requirement: Error documentation
 

@@ -142,9 +142,13 @@ connection activity begins after a losing resume; the in-flight-work flag spanni
 attempt clears only after that handoff, so `close()` (which waits on it) never returns while
 the committed start or its teardown is still pending; a loser that wins after `start` has
 returned performs the single cancel/release and resume itself. It SHALL handle
-every `NWConnection` state explicitly — `.setup`/`.preparing` (progress), `.waiting`
-(non-terminal; record the error and keep waiting), `.ready` (success), `.failed` (mapped
-`POSIXError`), `.cancelled` (terminal acknowledgment of a requested cancel) — and SHALL enforce
+every `NWConnection` state explicitly — `.setup`/`.preparing` (progress), `.waiting` (classified
+by error class at the connection-driver seam: a **transient** wait — no route, DNS, refused,
+or any non-TLS condition — is non-terminal: record the error and keep waiting; a **fatal** wait —
+a TLS handshake or trust rejection, which no path change can heal — claims the connect outcome as
+failure exactly as `.failed` does, without waiting for the deadline), `.ready` (success),
+`.failed` (mapped `POSIXError`), `.cancelled` (terminal acknowledgment of a requested cancel) —
+and SHALL enforce
 a deterministic, always-armed connect deadline from the `connectTimeout` validated and
 normalized at construction from `SMBQUICConfiguration.connectTimeout` (design D10 — never from
 `SMB2Manager.timeout`; the public initializer applies the shared normalization helper, so a
@@ -154,16 +158,44 @@ route to the established-connection lifecycle (design D8), which discriminates r
 signal, while an unsolicited event is abnormal transport loss — and SHALL NOT re-enter connect
 completion. Error contract: task cancellation → `CancellationError`; `close()` while
 connecting → `POSIXError(.ECONNABORTED)`; deadline expiry → `POSIXError(.ETIMEDOUT)`; `.failed`
-→ mapped `POSIXError` (design D7).
+and fatal `.waiting` → mapped `POSIXError` (design D7; TLS rejection error shape per the
+"TLS rejection fails fast with a distinguishable error" requirement).
 
 #### Scenario: Cancellation before start
 
 - **WHEN** the task is already cancelled when `connect(host:port:)` is called
 - **THEN** it throws `CancellationError` before any `NWConnection` is created
 
+#### Scenario: Transient waiting is non-terminal
+
+- **WHEN** the injected driver emits a transient `.waiting` (for example `ENETDOWN`,
+  `ECONNREFUSED`, or a DNS failure) and later emits `.ready`
+- **THEN** `connect` does not fail on the `.waiting` event, the deadline stays armed, and the
+  later `.ready` succeeds
+
+#### Scenario: Fatal waiting fails fast
+
+- **WHEN** the injected driver emits a fatal `.waiting` (a TLS handshake/trust rejection) while
+  the connect is in progress and the deadline has not fired
+- **THEN** the fatal event claims the connect outcome as failure through the same atomic claim as
+  `.failed`: `connect` throws the mapped `POSIXError` immediately (the deadline scheduler is
+  cancelled, not awaited), the started driver is cancelled exactly once, and the continuation is
+  resumed exactly once
+- **AND** a fatal `.waiting` that lands after `.ready` has won the claim is routed like any
+  post-ready `.failed` (design D8), never re-entering connect completion
+
+#### Scenario: Fatal waiting in the commit-to-start window is a parked loss
+
+- **WHEN** a fatal `.waiting` is delivered after the connect path committed toward starting the
+  driver but before `start` has returned
+- **THEN** it is handled exactly like a `.failed` in that window per "Loss in the commit-to-start
+  window": no cancel and no resume inside the window; the starting path finishes the parked loss
+  after `start` returns
+
 #### Scenario: Cancellation while waiting
 
-- **WHEN** the injected driver holds the connection in `.waiting` and the task is cancelled
+- **WHEN** the injected driver holds the connection in a transient `.waiting` and the task is
+  cancelled
 - **THEN** the cancellation claims the outcome, exactly one `cancel()` is issued to the
   connection, and `connect` throws `CancellationError`
 
@@ -262,7 +294,7 @@ connecting → `POSIXError(.ECONNABORTED)`; deadline expiry → `POSIXError(.ETI
   `.ready`/`.failed`/`.cancelled` in any interleaving, records `cancel()` requests to prove
   side-effect ownership, and the scheduler advances the deadline without wall-clock waiting.
   TEST-NET endpoints are optional, non-gating integration/smoke coverage only — never required
-  deterministic unit coverage (tasks 2.3)
+  deterministic unit coverage (archived `add-quic-transport` tasks 2.3)
 
 ### Requirement: Single bidirectional stream carries the SMB session
 
@@ -545,3 +577,48 @@ Under `.customRoots`, the transport SHALL implement this exact fail-closed seque
 
 - **WHEN** an `SMBQUICConfiguration` is created without arguments
 - **THEN** `trustPolicy` is `.system` and system verification applies
+
+### Requirement: TLS rejection fails fast with a distinguishable error
+
+When the QUIC handshake is rejected for a TLS reason — the server certificate fails the
+configured trust policy (`.system` or `.customRoots`), hostname verification fails, or the TLS
+handshake otherwise cannot complete — `connect` SHALL fail promptly (bounded by the handshake
+itself, never by `connectTimeout`) with `POSIXError(.EPROTO)`. The error SHALL carry the
+underlying Security framework status as `userInfo[NSUnderlyingErrorKey]`, an `NSError` in
+`NSOSStatusErrorDomain` whose `code` is the `OSStatus` reported by Network.framework, and its
+localized description SHALL name it as a QUIC TLS error including that status. Callers SHALL be
+able to distinguish a TLS rejection from an unreachable or unresponsive server by error code
+alone (`EPROTO` versus `ETIMEDOUT`/other), without inspecting description text. Non-TLS
+`.waiting` conditions SHALL NOT be affected: they continue to wait until `.ready`, cancellation,
+`close()`, or the deadline.
+
+#### Scenario: Untrusted certificate under system trust fails fast
+
+- **WHEN** the policy is `.system` (or unset) and the server presents a certificate that does not
+  chain to a system root (for example a self-signed Windows Server certificate)
+- **THEN** `connect` throws `POSIXError(.EPROTO)` well before `connectTimeout` elapses, and
+  `(error as NSError).userInfo[NSUnderlyingErrorKey]` is an `NSError` in `NSOSStatusErrorDomain`
+
+#### Scenario: Custom-root rejection fails fast
+
+- **WHEN** the policy is `.customRoots` and the server certificate does not chain to any supplied
+  anchor (or does not match the hostname)
+- **THEN** `connect` throws `POSIXError(.EPROTO)` promptly with the same underlying-error payload
+
+#### Scenario: TLS error mapping carries the status
+
+- **WHEN** a Network.framework `.tls(status)` error is mapped to `POSIXError`
+- **THEN** the result is `EPROTO`, its `NSUnderlyingErrorKey` is an `NSOSStatusErrorDomain`
+  `NSError` with `code == status`, and the description contains the numeric status
+
+#### Scenario: Unreachable server is still a timeout
+
+- **WHEN** the QUIC endpoint never answers (no server, filtered UDP port, or transient
+  `ECONNREFUSED`/no-route waits)
+- **THEN** `connect` still throws `POSIXError(.ETIMEDOUT)` at the deadline — a TLS rejection and
+  an unreachable server are no longer the same error code
+
+#### Scenario: Insecure policy is unaffected
+
+- **WHEN** the policy is `.insecureNoVerification` against the same untrusted server
+- **THEN** the handshake succeeds (no TLS rejection occurs, so no fatal wait is produced)
