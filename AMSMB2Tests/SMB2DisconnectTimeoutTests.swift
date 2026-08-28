@@ -118,20 +118,24 @@ class SMB2DisconnectTimeoutTests: SMBIntegrationTestCase, @unchecked Sendable {
         let baseline = SMB2Client.CBData.liveCount
         smb.timeout = 3
 
-        let readStarted = expectation(description: "read started")
-        readStarted.assertForOverFulfill = false
         let readTask = Task {
-            try await smb.contents(
-                atPath: file,
-                progress: { _, _ -> Bool in
-                    readStarted.fulfill()
-                    return true
-                }
-            )
+            try await smb.contents(atPath: file, progress: nil)
         }
-        await fulfillment(of: [readStarted], timeout: 20)
 
-        weak let weakClient = try smb.smbClient
+        // `weak var` + separate assignment: `weak let` needs Swift 6.2, and the Linux image
+        // (`Dockerfile`: swift:6.1) rejects it; a never-mutated `weak var` warns on 6.2.
+        weak var weakClient: SMB2Client?
+        do {
+            // Scoped: the test's own strong reference must be gone before the release check.
+            let client = try smb.smbClient
+            weakClient = client
+            // "In flight" means an operation is registered with libsmb2 and unanswered. A
+            // progress callback is NOT that signal: the read loop pipelines 4 × `optimizedReadSize`
+            // (8 MiB against Samba) per window, so a 32 MiB file completes in ONE window and the
+            // first progress call would only fire after the whole file had arrived.
+            let inFlight = await waitUntil(timeout: 20) { client.pendingSeamOperationCount > 0 }
+            XCTAssertTrue(inFlight, "no operation became pending before the deadline")
+        }
 
         try await smb.disconnectShare(gracefully: false)
 

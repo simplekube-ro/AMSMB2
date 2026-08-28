@@ -72,7 +72,10 @@ final class SMB2DisconnectReclaimTests: XCTestCase, @unchecked Sendable {
     func testDisconnectReleasesPendingCallbackObjectAndClient() async throws {
         let baseline = SMB2Client.CBData.liveCount
         var client: SMB2Client? = try SMB2Client(timeout: 0)
-        weak let weakClient = client
+        // `weak var` + separate assignment: `weak let` needs Swift 6.2 (Linux CI is 6.1) and a
+        // never-mutated `weak var` warns on 6.2.
+        weak var weakClient: SMB2Client?
+        weakClient = client
 
         // Capture the client strongly by value: Swift 6 forbids capturing the mutable `var` in a
         // @Sendable closure. The capture is released when the task completes, so the later
@@ -123,7 +126,10 @@ final class SMB2DisconnectReclaimTests: XCTestCase, @unchecked Sendable {
     /// hung for the full timeout before `ETIMEDOUT`.
     func testDisconnectIsTerminalAndLaterOperationsFailFast() async throws {
         var client: SMB2Client? = try SMB2Client(timeout: 30)
-        weak let weakClient = client
+        // `weak var` + separate assignment: `weak let` needs Swift 6.2 (Linux CI is 6.1) and a
+        // never-mutated `weak var` warns on 6.2.
+        weak var weakClient: SMB2Client?
+        weakClient = client
 
         await client!.disconnect()
 
@@ -182,10 +188,14 @@ extension SMB2DisconnectReclaimTests {
     func testSeamDisconnectReleasesPendingConnectAndBridge() async throws {
         let baseline = SMB2Client.CBData.liveCount
         var client: SMB2Client? = try SMB2Client(timeout: 0)
-        weak let weakClient = client
+        // `weak var` + separate assignment: `weak let` needs Swift 6.2 (Linux CI is 6.1) and a
+        // never-mutated `weak var` warns on 6.2.
+        weak var weakClient: SMB2Client?
+        weakClient = client
 
         var bridge: TransportBridge? = TransportBridge(transport: MockTransport(sendsAreDropped: true))
-        weak let weakBridge = bridge
+        weak var weakBridge: TransportBridge?
+        weakBridge = bridge
 
         let connectTask = Task { [client, bridge] in
             try await client!.connectWithBridge(
