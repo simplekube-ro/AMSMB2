@@ -65,10 +65,9 @@ final class SMB2DisconnectReclaimTests: XCTestCase, @unchecked Sendable {
     /// no session / transport / credit precondition — it just queues the PDU into `outqueue`,
     /// where it stays forever since no servicing path is armed on a never-connected client.
     ///
-    /// `timeout: 0` is required: with a positive timeout `async_await` arms an
-    /// `eventLoopQueue.asyncAfter` timer that captures `cb` STRONGLY, so the (already emptied)
-    /// `CBData` shell could not deallocate until that timer fired, and the `liveCount` assertion
-    /// immediately after `disconnect()` would be timing-dependent.
+    /// `timeout: 0` keeps the per-operation timeout timer out of the picture entirely: the timer
+    /// captures `cb` weakly, but not arming it at all is what makes this test's `liveCount`
+    /// assertion depend on `disconnect()` alone.
     func testDisconnectReleasesPendingCallbackObjectAndClient() async throws {
         let baseline = SMB2Client.CBData.liveCount
         var client: SMB2Client? = try SMB2Client(timeout: 0)
@@ -182,9 +181,7 @@ extension SMB2DisconnectReclaimTests {
     /// calls the *Swift* `bridge.close()` and never reaches it — so before the fix `disconnect()`
     /// stranded the bridge and its transport as well as the `CBData`.
     ///
-    /// `timeout: 0` — see `testDisconnectReleasesPendingCallbackObjectAndClient`: a positive
-    /// timeout arms a timer that captures `cb` strongly, which would make the `liveCount`
-    /// assertion timing-dependent.
+    /// `timeout: 0` — see `testDisconnectReleasesPendingCallbackObjectAndClient`.
     func testSeamDisconnectReleasesPendingConnectAndBridge() async throws {
         let baseline = SMB2Client.CBData.liveCount
         var client: SMB2Client? = try SMB2Client(timeout: 0)

@@ -13,8 +13,8 @@ context is destroyed so that the destroy-fired callbacks do not resume an alread
 - **THEN** the waiting caller receives `POSIXError(.ENOTCONN)`, the client holds no SMB2
   context, and by the time `disconnect()` returns libsmb2 has released its retain on every
   pending callback object, so the live callback-object count returns to its pre-operation
-  baseline (immediately when no per-operation timeout timer is armed; otherwise once that timer
-  fires, since it holds only the abandoned, closure-free object)
+  baseline once the waiting caller's frame has released its own reference (the per-operation
+  timeout timer captures the callback object weakly and does not extend its lifetime)
 
 #### Scenario: Client is released after disconnect
 - **WHEN** the last strong reference to a client is dropped after `disconnect()` returned

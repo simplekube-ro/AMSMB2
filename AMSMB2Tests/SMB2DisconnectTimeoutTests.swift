@@ -97,8 +97,8 @@ class SMB2DisconnectTimeoutTests: SMBIntegrationTestCase, @unchecked Sendable {
     /// with libsmb2, and the `CBData.dataHandler` wrapper's strong `self` capture made the whole
     /// client — context, event-loop queue, buffers — unreclaimable forever.
     ///
-    /// `smb.timeout = 3` bounds the per-operation timer that captures the (already emptied)
-    /// `CBData` strongly, so the `liveCount` poll below has a deterministic upper bound.
+    /// `smb.timeout = 3` bounds how long the failed read's own error path can take before the
+    /// `liveCount` poll below must have converged.
     func testNonGracefulDisconnectMidReadReleasesClient() async throws {
         let file = fileName()
         let smb = SMB2Manager(url: server, credential: credential)!
@@ -151,9 +151,9 @@ class SMB2DisconnectTimeoutTests: SMBIntegrationTestCase, @unchecked Sendable {
             "read completed before the disconnect landed — the mid-read scenario was not exercised"
         )
 
-        // The per-operation timeout timer holds the emptied CBData shell for up to `timeout`
-        // seconds even after the fix, so wait rather than asserting instantly. `<=`, not `==`:
-        // the count is process-global and other suites can drop below this baseline meanwhile.
+        // The read task's frame releases its CBData only after `readTask.value` has been
+        // observed above, so poll rather than assert instantly. `<=`, not `==`: the count is
+        // process-global and other suites can drop below this baseline meanwhile.
         let reclaimed = await waitUntil(timeout: 8) { SMB2Client.CBData.liveCount <= baseline }
         XCTAssertTrue(
             reclaimed,

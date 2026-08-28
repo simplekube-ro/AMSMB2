@@ -41,8 +41,9 @@ without resuming the caller a second time.
   called
 - **THEN** all N callers receive `POSIXError(.ENOTCONN)` exactly once each, libsmb2 releases
   every one of the N retains before `disconnect()` returns, and the live callback-object count
-  returns to its pre-read baseline (immediately when no per-operation timeout timer is armed,
-  otherwise once the timer holding the abandoned object fires)
+  returns to its pre-read baseline once the callers' frames have released their own references
+  (the per-operation timeout timer captures the callback object weakly and does not extend its
+  lifetime)
 
 #### Scenario: Integration — non-graceful disconnect mid-read releases the client
 - **WHEN** a manager performs a non-graceful `disconnectShare` while a large read is in flight

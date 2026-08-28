@@ -217,8 +217,9 @@ public final class SMB2Client: CustomDebugStringConvertible, CustomReflectable, 
     /// `cb.dataHandler` wrappers from ever being observed nil during `deinit` (Swift zeroes weak
     /// references once deallocation has begun). Do not "simplify" this by destroying first.
     ///
-    /// The `if let` guard is required because `flushOutboundForSeam` / `smb2_service` can
-    /// themselves destroy the context on error before this runs.
+    /// Every path that destroys the context (deinit, `disconnect()`, and the `smb2_service`
+    /// error branches) routes through here, so the `if let` guard covers a caller whose earlier
+    /// step already ran it.
     private func failPendingAndDestroyContext(with error: any Error) {
         failAllPendingOperations(with: error)
         if let ctx = context {
@@ -368,11 +369,8 @@ extension SMB2Client {
         let result = smb2_service(context, revents)
         if result < 0 {
             let errorMsg = error
-            Self.destroyContext(context)
-            self.context = nil
-            socketMonitor?.cancel()
-            socketMonitor = nil
-            failAllPendingOperations(with: POSIXError(.ECONNRESET, description: errorMsg))
+            stopSocketMonitoring()
+            failPendingAndDestroyContext(with: POSIXError(.ECONNRESET, description: errorMsg))
             return
         }
 
@@ -693,14 +691,10 @@ extension SMB2Client {
                 self.failPendingAndDestroyContext(with: POSIXError(.ENOTCONN))
                 continuation.resume()
                 #else
-                guard let context = self.context, smb2_get_fd(context) >= 0 else {
-                    self.stopSocketMonitoring()
-                    self.failPendingAndDestroyContext(with: POSIXError(.ENOTCONN))
-                    continuation.resume()
-                    return
+                if let context = self.context, smb2_get_fd(context) >= 0 {
+                    smb2_disconnect_share_async(context, SMB2Client.generic_handler_noop, nil)
+                    smb2_service(context, Int32(POLLOUT))
                 }
-                smb2_disconnect_share_async(context, SMB2Client.generic_handler_noop, nil)
-                smb2_service(context, Int32(POLLOUT))
                 self.stopSocketMonitoring()
                 self.failPendingAndDestroyContext(with: POSIXError(.ENOTCONN))
                 continuation.resume()
@@ -847,11 +841,11 @@ extension SMB2Client {
         /// disconnect-reclaim regression tests to assert that every callback object registered
         /// with libsmb2 is released by the time `disconnect()` returns.
         ///
-        /// Deliberately NOT wrapped in `#if DEBUG`: keeping it unconditional makes release and
-        /// debug binaries behaviourally identical (no configuration-dependent `CBData` layout or
-        /// lock ordering), and it matches the existing unconditional test accessors
-        /// `pendingSeamOperationCount` / `hasInstalledSeamBridge`. The cost is one uncontended
-        /// lock acquire per operation, negligible next to a network round trip.
+        /// Deliberately NOT wrapped in `#if DEBUG`, matching the existing unconditional test
+        /// accessors `pendingSeamOperationCount` / `hasInstalledSeamBridge` (and keeping
+        /// `swift test -c release` meaningful). The cost is two uncontended acquires of a
+        /// process-global lock per operation (init + deinit), negligible next to a network
+        /// round trip.
         ///
         /// Tests MUST compare against a baseline captured at test start, never against `0` —
         /// other tests in the same process may hold live instances.
@@ -918,9 +912,9 @@ extension SMB2Client {
 
             let result = smb2_service(context, Int32(pfd.revents))
             if result < 0 {
-                Self.destroyContext(context)
-                self.context = nil
-                throw POSIXError(.ECONNRESET, description: error)
+                let errorMsg = error
+                failPendingAndDestroyContext(with: POSIXError(.ECONNRESET, description: errorMsg))
+                throw POSIXError(.ECONNRESET, description: errorMsg)
             }
         }
         if let error = cb.error { throw error }
@@ -941,9 +935,7 @@ extension SMB2Client {
             let cbdata = Unmanaged<CBData>.fromOpaque(try cbdata.unwrap()).takeRetainedValue()
             guard !cbdata.isAbandoned else {
                 // Last time anyone touches an abandoned CBData: libsmb2 has just handed back its
-                // retain, so drop the closures here. This breaks the seam connect path's
-                // `cleanup -> cb` self-retain (the closure reads `cb.result`) and releases
-                // whatever the caller's `dataHandler` captured.
+                // retain, so drop the closures here and release whatever they captured.
                 cbdata.cleanup = nil
                 cbdata.dataHandler = nil
                 return
@@ -953,6 +945,7 @@ extension SMB2Client {
                 cbdata.result = status
             }
             cbdata.dataHandler?(command_data)
+            cbdata.dataHandler = nil
             cbdata.isFinished = true
             cbdata.cleanup?()
             cbdata.cleanup = nil
@@ -1053,8 +1046,8 @@ extension SMB2Client {
 
                         // Start timeout timer on the event loop queue.
                         if self.timeout > 0 {
-                            self.eventLoopQueue.asyncAfter(deadline: .now() + self.timeout) { [weak self] in
-                                guard !cb.isAbandoned else { return }
+                            self.eventLoopQueue.asyncAfter(deadline: .now() + self.timeout) { [weak self, weak cb] in
+                                guard let cb, !cb.isAbandoned else { return }
                                 cb.isAbandoned = true
                                 self?.pendingOperations.removeValue(forKey: cbId)
                                 if let cont = cb.continuation {
@@ -1169,8 +1162,8 @@ extension SMB2Client {
                         self.activateServicingAfterOperation(context: context)
 
                         if self.timeout > 0 {
-                            self.eventLoopQueue.asyncAfter(deadline: .now() + self.timeout) { [weak self] in
-                                guard !cb.isAbandoned else { return }
+                            self.eventLoopQueue.asyncAfter(deadline: .now() + self.timeout) { [weak self, weak cb] in
+                                guard let cb, !cb.isAbandoned else { return }
                                 cb.isAbandoned = true
                                 self?.pendingOperations.removeValue(forKey: cbId)
                                 if let cont = cb.continuation {
@@ -1697,10 +1690,14 @@ extension SMB2Client {
                         return
                     }
 
-                    cb.cleanup = { [weak self] in
+                    // `weak cb`: `cleanup` is stored ON `cb`, so a strong capture would be a
+                    // `cb -> cleanup -> cb` cycle that outlives a timed-out/cancelled connect until
+                    // the context is destroyed. `generic_handler` holds `cbdata` strongly while
+                    // invoking `cleanup`, so the weak reference is always live here.
+                    cb.cleanup = { [weak self, weak cb] in
                         self?.pendingOperations.removeValue(forKey: cbId)
                         // Mark seam-connected only on success (result == NTStatus.success == 0).
-                        if cb.result == Int32(NTStatus.success.rawValue) {
+                        if cb?.result == Int32(NTStatus.success.rawValue) {
                             self?.seamConnected = true
                         }
                     }
@@ -1720,8 +1717,8 @@ extension SMB2Client {
                     if self.timeout > 0 {
                         self.eventLoopQueue.asyncAfter(
                             deadline: .now() + self.timeout
-                        ) { [weak self] in
-                            guard !cb.isAbandoned else { return }
+                        ) { [weak self, weak cb] in
+                            guard let cb, !cb.isAbandoned else { return }
                             cb.isAbandoned = true
                             self?.pendingOperations.removeValue(forKey: cbId)
                             self?.teardownSeam()
@@ -1806,10 +1803,8 @@ extension SMB2Client {
         let serviceResult = smb2_service(context, revents)
         if serviceResult < 0 {
             let errorMsg = error
-            Self.destroyContext(context)
-            self.context = nil
             teardownSeam()
-            failAllPendingOperations(with: POSIXError(.ECONNRESET, description: errorMsg))
+            failPendingAndDestroyContext(with: POSIXError(.ECONNRESET, description: errorMsg))
             return
         }
 
@@ -1834,10 +1829,8 @@ extension SMB2Client {
             let result = smb2_service(context, Int32(POLLOUT))
             if result < 0 {
                 let errorMsg = error
-                Self.destroyContext(context)
-                self.context = nil
                 teardownSeam()
-                failAllPendingOperations(with: POSIXError(.ECONNRESET, description: errorMsg))
+                failPendingAndDestroyContext(with: POSIXError(.ECONNRESET, description: errorMsg))
                 return
             }
             iterations += 1

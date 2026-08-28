@@ -2,7 +2,7 @@
 
 See proposal.md — Why. Current state that shapes the approach:
 
-- `SMB2Client` owns one `smb2_context`; only `shutdown()` (called from `deinit`) and the three
+- (Pre-change state.) `SMB2Client` owns one `smb2_context`; only `shutdown()` (called from `deinit`) and the three
   `smb2_service` error paths (`Context.swift:349`, `:1710`, `:1738`) call `smb2_destroy_context`
   and nil `self.context`. `disconnect()` (`:639`) does neither.
 - `shutdown()` (`:189`) already performs the exact sequence this change needs, on
@@ -61,6 +61,14 @@ See proposal.md — Why. Current state that shapes the approach:
 ## Decisions
 
 **D-1: `disconnect()` destroys the context by reusing `shutdown()`'s tail; ordering is fixed.**
+*Scope note (post-implementation `/code-review --fix` pass):* the three `smb2_service` error-destroy
+paths (`handleSocketEvent`, `serviceContextForSeam`, `flushOutboundForSeam`) and the Linux
+`pollUntilComplete` error path were also routed through the shared helper, so **every** context
+destroy in the class now runs fail-then-destroy. Behavioural consequence: on a servicing error
+the pending callers are resumed with `ECONNRESET` (from `failAllPendingOperations`) instead of
+`generic_handler`'s `SMB2_STATUS_SHUTDOWN` status, and no non-abandoned `dataHandler` can run
+from a destroy sweep on any path (which is what makes the D-2 `[weak self]` read structurally
+unreachable rather than merely unobserved).
 Extract the common tail of `shutdown()` — `failAllPendingOperations(with:)` then
 `if let ctx = context { Self.destroyContext(ctx); context = nil }` — into a private
 event-loop-confined helper taking the failure error. `shutdown()` calls it with `ECANCELED`
@@ -135,8 +143,11 @@ Before `return` on `isAbandoned`, set `cbdata.cleanup = nil; cbdata.dataHandler 
 the last time anyone touches an abandoned `CBData`; clearing here breaks the seam connect path's
 `cleanup → cb` self-retain and releases whatever the caller's `dataHandler` captured (buffers,
 handles) once libsmb2 has balanced the retain.
-*Alternative — `[weak cb]` in the connect `cleanup` closure:* rejected; it still leaves caller
-captures in `dataHandler` alive and only fixes one site.
+*Alternative — `[weak cb]` in the connect `cleanup` closure:* rejected as the *sole* mechanism
+(it leaves caller captures in `dataHandler` alive and fixes one site). Applied *in addition*
+during the post-implementation `/code-review --fix` pass: the connect `cleanup` now captures
+`[weak cb]` so the object never self-retains even before libsmb2 hands it back, and
+`generic_handler` also clears `dataHandler` after invoking it on the non-abandoned branch.
 
 **D-4: Contract — `disconnect()` is terminal for the instance.**
 Doc comment on `disconnect()`: after it returns the client has no context; every subsequent
@@ -173,16 +184,16 @@ configuration-dependent `CBData` layout or lock ordering) and matches the existi
 `consumeInboundReadySignal` are existing internal test accessors.
 *Alternative — sentinel object captured by the test's `dataHandler`:* works only for
 `async_await`, not the connect path; rejected as the sole mechanism.
-**Timer caveat found during implementation:** the per-operation timeout timers
-(`eventLoopQueue.asyncAfter` in `async_await`, `async_await_pdu` and `connectWithBridge`) capture
-`cb` **strongly**, so with `timeout > 0` the abandoned `CBData` — by then an empty shell, its
-closures cleared by D-3 — stays allocated until that timer fires (bounded by `timeout`, not a
-leak). The unit tests that assert `liveCount == baseline` immediately after `disconnect()`
-therefore construct the client with `timeout: 0` (no timer armed); the integration test sets a
-short manager timeout and polls for the baseline. Changing those timers to `[weak cb]` (with a
-`guard let cb` so a recycled `ObjectIdentifier` can never evict a different pending operation)
-would make the count return at `disconnect()` for every timeout value; deliberately left out of
-this change as unrequested scope — flagged as a follow-up.
+**Timer capture (found during implementation, resolved in the `/code-review --fix` pass):** the
+per-operation timeout timers (`eventLoopQueue.asyncAfter` in `async_await`, `async_await_pdu` and
+`connectWithBridge`) originally captured `cb` **strongly**, so with `timeout > 0` the abandoned
+`CBData` — by then an empty shell — stayed allocated until the timer fired. They now capture
+`[weak self, weak cb]` with `guard let cb, !cb.isAbandoned` — the `guard let` matters because a
+deallocated `cb` means the operation is fully over, and its `ObjectIdentifier` could already have
+been recycled for a different pending entry, which the timer must never evict. The unit tests
+still construct their client with `timeout: 0` so the `liveCount` assertion depends on
+`disconnect()` alone; the integration test polls (the read task's frame releases its `CBData`
+only after the awaiting caller has observed the failure).
 
 **D-6: Verification strategy (TDD; each test MUST be RED on current code).**
 - *Unit, all platforms, no server — `async_await` path:* fresh `SMB2Client(timeout: 30)`;
@@ -262,10 +273,11 @@ this change as unrequested scope — flagged as a follow-up.
   the archived `disconnect-fix` requirement "After sending the disconnect PDU, `disconnect()` MUST
   fail all pending in-flight operations". If `smb2_service(POLLOUT)` errors inside that flush it
   destroys the context (`Context.swift:1738`) while the pending `CBData` are still live, so those
-  callers are resumed by `generic_handler` with the SHUTDOWN status instead of `ENOTCONN`. This is
-  pre-existing behaviour of that error path and is left alone; hoisting `failAllPendingOperations`
-  ahead of the flush would be strictly safer but contradicts that archived requirement and would
-  need its own MODIFIED delta.
+  callers are resumed with `ECONNRESET` instead of `ENOTCONN` (since the `/code-review --fix`
+  pass routed that error path through the shared fail-then-destroy helper; before that pass they
+  got `generic_handler`'s SHUTDOWN status). Hoisting `failAllPendingOperations` ahead of the
+  flush would remove the window entirely but contradicts that archived requirement and would need
+  its own MODIFIED delta.
 - [Upstream libsmb2: `smb2_destroy_context` can double-fire a callback] → `init.c:331-338` fires
   and frees `smb2->pdu`, then the `waitqueue` drain (`:339-351`) can fire and free the *same* PDU,
   because `smb2->pdu = NULL` is assigned only inside that loop, after the earlier free. Reachable
