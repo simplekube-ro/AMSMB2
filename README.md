@@ -112,6 +112,15 @@ smb.quicConfiguration = SMBQUICConfiguration()          // .system trust, 30 s c
 // hostname is still verified).
 smb.quicConfiguration = SMBQUICConfiguration(trustPolicy: .customRoots([caCertificateDER]))
 
+// Trust on first use — no .cer to sideload: fetch the chain the server presents (one capture-only
+// TLS handshake; nothing is trusted, no SMB session is created), show the user the leaf's identity
+// and SHA-256, and only after they confirm it out of band use the leaf as the anchor.
+let chain = try await SMBQUICCertificateProbe.fetchServerCertificateChain(server: "fs.example.com")
+let leaf = chain[0]                                     // DER, leaf first
+let fingerprint = SHA256.hash(data: leaf)               // CryptoKit — display this for confirmation
+// ... user confirms the fingerprint against the server admin's record, app persists `leaf` ...
+smb.quicConfiguration = SMBQUICConfiguration(trustPolicy: .customRoots([leaf]))
+
 try await smb.connectShare(name: "Documents")
 ```
 
@@ -121,8 +130,9 @@ Security caveats:
 - **`.insecureNoVerification` is a debug-only escape hatch** — it disables chain and hostname verification (TLS encryption and ALPN `"smb"` remain). Do not ship it.
 - **Non-numeric hostnames only** — numeric IP targets are rejected with `POSIXError(.EINVAL)` (independent of the trust policy; `.insecureNoVerification` does not bypass it).
 - **No silent fallback** — a `.quic` failure is thrown to you; the library never retries over TCP. Implement fallback yourself if you want it (`try .quic`, `catch`, retry `.tcp`).
+- **The probe never trusts — the user does.** `SMBQUICCertificateProbe` only returns the bytes the server presented; trust is granted by the user, after confirming the SHA-256 out of band. A chain fetched on first contact is only as trustworthy as the network at that moment — an on-path attacker can present their own — and the persisted anchor *replaces* the system roots for that connection. Swift-only; on Linux it throws `POSIXError(.ENOTSUP)`.
 
-The new transport surface is Swift-only (not exposed to Objective-C). See **[docs/API.md](docs/API.md)** for the full contract and **[docs/INTEROP-QUIC.md](docs/INTEROP-QUIC.md)** for the live interop procedure and server requirements.
+The new transport surface, including `SMBQUICCertificateProbe`, is Swift-only (not exposed to Objective-C). See **[docs/API.md](docs/API.md)** for the full contract and **[docs/INTEROP-QUIC.md](docs/INTEROP-QUIC.md)** for the live interop procedure and server requirements.
 
 ## Testing
 

@@ -101,6 +101,29 @@ final class QUICTrustTests: XCTestCase, @unchecked Sendable {
         )
     }
 
+    // MARK: - certificateChainDER (design D3)
+
+    /// WHEN the capture helper is handed a `SecTrust` built over a single self-signed leaf
+    /// THEN it returns exactly that certificate's DER, leaf first and byte-equal — the bytes the
+    /// probe hands back to a consumer must be the bytes the server presented, unmodified,
+    /// because they are persisted as the `.customRoots` anchor.
+    func testCertificateChainDERReturnsLeafFirstBytes() throws {
+        guard let leafDER = Self.selfSignedDER(commonName: "quic.test") else {
+            throw XCTSkip("openssl unavailable — cannot generate a test certificate")
+        }
+        let leaf = try Self.certificate(leafDER)
+        let chain = NWConnectionQUICDriver.certificateChainDER(from: Self.serverTrust([leaf]))
+        XCTAssertEqual(chain.count, 1, "a single-certificate trust yields exactly one DER")
+        XCTAssertEqual(chain.first, leafDER, "the leaf DER must round-trip byte-for-byte")
+    }
+
+    /// WHEN `SecTrustCopyCertificateChain` yields no chain at all (`nil`)
+    /// THEN the helper yields `[]` rather than trapping — the probe treats an empty chain as
+    /// "nothing captured" and reports `EPROTO`, so this `nil` path must be total.
+    func testCertificateChainDEROfNilChainIsEmpty() {
+        XCTAssertTrue(NWConnectionQUICDriver.certificateChainDER(nil).isEmpty)
+    }
+
     // MARK: - Certificate helpers
 
     /// Builds a `SecCertificate` from DER, or throws if the bytes are not a certificate.

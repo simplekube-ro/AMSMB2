@@ -179,6 +179,70 @@ final class QUICSeamConnectTests: XCTestCase, @unchecked Sendable {
             }
         }
     }
+
+    // MARK: - Factored endpoint validation (design D4)
+
+    /// WHEN `validatedQUICEndpoint(_:)` parses a server string carrying no explicit port
+    /// THEN it yields the host unchanged and the `.quic` default port 443 — the probe and the
+    /// `.quic` connect branch therefore target the same endpoint for the same input.
+    func testValidatedQUICEndpointDefaultsToPort443() throws {
+        let endpoint = try SMB2Client.validatedQUICEndpoint("fs.example.com")
+        XCTAssertEqual(endpoint.host, "fs.example.com")
+        XCTAssertEqual(endpoint.port, 443)
+    }
+
+    /// WHEN the server string carries an explicit in-range port
+    /// THEN it is honored verbatim (no silent rewrite to 443).
+    func testValidatedQUICEndpointHonorsExplicitPort() throws {
+        let endpoint = try SMB2Client.validatedQUICEndpoint("fs.example.com:4433")
+        XCTAssertEqual(endpoint.host, "fs.example.com")
+        XCTAssertEqual(endpoint.port, 4433)
+    }
+
+    /// WHEN the server string is a numeric address — plain IPv4 or the bracketed IPv6 literal
+    /// form, which parses to a bare numeric host
+    /// THEN `validatedQUICEndpoint` throws `POSIXError(.EINVAL)`, exactly as the `.quic` connect
+    /// branch does: the two callers share one classifier and cannot diverge.
+    func testValidatedQUICEndpointRejectsNumericHost() throws {
+        for server in ["192.168.1.10", "[::1]", "127.1", "2130706433"] {
+            XCTAssertThrowsError(try SMB2Client.validatedQUICEndpoint(server), server) { error in
+                XCTAssertEqual((error as? POSIXError)?.code, .EINVAL, "\(server) must be EINVAL")
+            }
+        }
+    }
+
+    /// WHEN the server string carries an explicit port outside 1...65535 — including an oversized
+    /// digit string that must never trap the leading-digit parser
+    /// THEN `validatedQUICEndpoint` throws `POSIXError(.EINVAL)`.
+    func testValidatedQUICEndpointRejectsOutOfRangePort() throws {
+        let nines = String(repeating: "9", count: 300)
+        for server in ["fs.example.com:0", "fs.example.com:65536", "fs.example.com:\(nines)"] {
+            XCTAssertThrowsError(try SMB2Client.validatedQUICEndpoint(server), server.prefix(24).description) { error in
+                XCTAssertEqual((error as? POSIXError)?.code, .EINVAL, "out-of-range port must be EINVAL")
+            }
+        }
+    }
+
+    /// WHEN `validateQUICEndpoint(host:port:)` is handed an already-parsed pair
+    /// THEN a hostname with an in-range port passes, and a numeric host or an out-of-range port
+    /// throws `EINVAL` — this is the exact check the `.quic` connect branch performs on the
+    /// endpoint it parsed once, so factoring it out cannot change connect behavior.
+    func testValidateQUICEndpointOnPreParsedPair() throws {
+        XCTAssertNoThrow(try SMB2Client.validateQUICEndpoint(host: "fs.example.com", port: 443))
+        XCTAssertNoThrow(try SMB2Client.validateQUICEndpoint(host: "fs.example.com", port: 65535))
+        XCTAssertThrowsError(try SMB2Client.validateQUICEndpoint(host: "192.168.1.10", port: 443)) { error in
+            XCTAssertEqual((error as? POSIXError)?.code, .EINVAL)
+        }
+        XCTAssertThrowsError(try SMB2Client.validateQUICEndpoint(host: "", port: 443)) { error in
+            XCTAssertEqual((error as? POSIXError)?.code, .EINVAL, "an empty host is not a usable hostname")
+        }
+        XCTAssertThrowsError(try SMB2Client.validateQUICEndpoint(host: "fs.example.com", port: 0)) { error in
+            XCTAssertEqual((error as? POSIXError)?.code, .EINVAL)
+        }
+        XCTAssertThrowsError(try SMB2Client.validateQUICEndpoint(host: "fs.example.com", port: 65536)) { error in
+            XCTAssertEqual((error as? POSIXError)?.code, .EINVAL)
+        }
+    }
 }
 
 #endif // canImport(Network)
