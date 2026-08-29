@@ -1,9 +1,5 @@
-# api-reference Specification
+## MODIFIED Requirements
 
-## Purpose
-Provide a complete, AI-parseable API reference (`docs/API.md`) that documents every public type and method of AMSMB2, organized by domain, with consistent machine-readable structure and error-condition documentation so developers and AI coding assistants can look up signatures, parameters, return types, and error behavior.
-
-## Requirements
 ### Requirement: All public types documented
 
 The API reference SHALL document every public type: `SMB2Manager`, `SMB2Client`, `SMB2FileHandle`, `AsyncInputStream`, `SMB2FileChangeType`, `SMB2FileChangeAction`, `SMB2FileChangeInfo`, `SMBTransport`, `SMBTransportKind`, `TCPTransportApple`, `QUICTransportApple`, `SMBQUICConfiguration`, and `SMBQUICCertificateProbe`. For the transport seam types, the reference SHALL document that transport selection is exposed through `SMB2Manager.transportKind` (default `.automatic` → TCP), the QUIC availability floor on every Apple platform (iOS 15 / macOS 12 / macCatalyst 15 / tvOS 15 / watchOS 8 / visionOS 1) and the Linux behavior (`.quic` → `ENOTSUP`; configuration types exist but are inert), and the QUIC connection policy (explicit opt-in, all numeric hosts rejected — non-numeric hostnames only, so `localhost` and single-label names are accepted even though they may later fail resolution; rejection precedes and is independent of the TLS trust policy, and `.insecureNoVerification` does not bypass it — UDP/443 default, no silent fallback, secure-by-default TLS with the mutually exclusive `TrustPolicy`, and the dedicated `SMBQUICConfiguration.connectTimeout` — default 30 s, finite positive values only with `EINVAL` on `NaN`/infinite/zero/negative and clamping above 3600 s, independent of `SMB2Manager.timeout`'s zero-or-negative-disables contract). The reference SHALL also document the settings' snapshot semantics (changes never affect an in-flight or established connection), that `copy()` preserves `transportKind` and `quicConfiguration` while archiving round-trips only `transportKind`, that the new transport/configuration surface — including `SMBQUICCertificateProbe` — is Swift-only and intentionally absent from the Objective-C interface while the existing Objective-C API is unchanged (design D11), and that local disconnect is best-effort (the DISCONNECT PDU's wire delivery is not guaranteed). For `SMBQUICCertificateProbe`, the reference SHALL document the capture-only contract (the chain is returned leaf first as DER `[Data]`, the peer is never trusted, no SMB session is created, no connection outlives the call), the `server` string and `timeout` validation shared with `.quic` connect, the outcome table (`[Data]` / `EPROTO` with the `NSOSStatusErrorDomain` underlying error / `ETIMEDOUT` / `CancellationError` / `EINVAL` / `ENOTSUP` on Linux / compile-time unavailable below the floor), that its `timeout` (default 8 s) is independent of `SMBQUICConfiguration.connectTimeout` and why, and a trust-on-first-use recipe showing which returned element to persist as the `.customRoots` anchor and what to show the user (subject, SAN, validity, SHA-256) before trusting it. The recipe SHALL carry the first-contact caveat: a chain fetched on first contact is only as trustworthy as the network at that moment — an on-path attacker can present their own chain — so the displayed SHA-256 MUST be confirmed out of band before it is persisted, and the persisted anchor replaces the system roots for that connection.
@@ -23,30 +19,6 @@ The API reference SHALL document every public type: `SMB2Manager`, `SMB2Client`,
 #### Scenario: Trust-on-first-use is documented
 - **WHEN** a developer looks up how to let a user trust a self-signed or private-CA SMB-over-QUIC server without sideloading a `.cer`
 - **THEN** they SHALL find `SMBQUICCertificateProbe.fetchServerCertificateChain(server:timeout:)`, its outcome table, the statement that the probe never trusts the peer and never creates an SMB session, a recipe that probes, displays the leaf's identity and SHA-256 for confirmation, and then connects with `.customRoots([leaf])`, and the first-contact caveat (confirm the fingerprint out of band; the anchor replaces the system roots)
-
-### Requirement: All public methods documented
-
-The API reference SHALL document every public/open method on `SMB2Manager` with its async variant. Each method entry SHALL include: signature, description, parameters, return type, and throws behavior.
-
-#### Scenario: Method lookup
-- **WHEN** a developer or AI agent looks up a method name
-- **THEN** they SHALL find its complete signature, parameter descriptions, and error conditions
-
-### Requirement: Domain-grouped organization
-
-Methods SHALL be grouped by domain: Connection Management, Share Enumeration, Directory Operations, File Operations, File Attributes, Symbolic Links, Copy/Move, Upload/Download, Streaming, Monitoring.
-
-#### Scenario: Finding related methods
-- **WHEN** a developer wants to know all directory-related methods
-- **THEN** they SHALL find them grouped together in the Directory Operations section
-
-### Requirement: AI-parseable format
-
-Each method entry SHALL use a consistent markdown structure with machine-parseable headers (`### methodName`), parameter lists, and return type descriptions. No prose-heavy descriptions that require interpretation.
-
-#### Scenario: AI context loading
-- **WHEN** an AI coding assistant loads the API reference for context
-- **THEN** it SHALL be able to extract method signatures, parameter types, and behavior descriptions programmatically
 
 ### Requirement: Error documentation
 
