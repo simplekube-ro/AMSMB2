@@ -1378,20 +1378,9 @@ extension SMB2Client {
             transport = TCPTransportApple()
         case .quic:
             // Policy validation runs before any transport object exists or any network activity
-            // occurs (design D4). Numeric-host rejection is independent of the TLS trust policy —
-            // `.insecureNoVerification` never bypasses it.
-            guard !Self.isNumericHost(endpoint.host) else {
-                throw POSIXError(.EINVAL,
-                    description: "SMB over QUIC requires a hostname, not an IP address")
-            }
-            // Explicit-port range validation (design D4): only 1...65535 is valid, rejected
-            // here so an out-of-range port never constructs a transport or reaches the
-            // NWConnection driver factory (the driver independently re-rejects out-of-range
-            // ports for directly constructed transports).
-            guard (1...65535).contains(endpoint.port) else {
-                throw POSIXError(.EINVAL,
-                    description: "SMB over QUIC: invalid port \(endpoint.port)")
-            }
+            // occurs (design D4), on the endpoint parsed once above — so the numeric-host and
+            // port-range rules live in exactly one place shared with `SMBQUICCertificateProbe`.
+            try Self.validateQUICEndpoint(host: endpoint.host, port: endpoint.port)
             // Dedicated, finite, always-armed connect deadline (design D10) — independent of
             // `self.timeout`. Validated here, before transport construction and before the
             // availability check; the transport initializer independently normalizes the same
@@ -1478,6 +1467,38 @@ extension SMB2Client {
         case .quic:
             return SMB2_TRANSPORT_QUIC
         }
+    }
+
+    // MARK: QUIC endpoint validation (design D4)
+
+    /// Applies the SMB-over-QUIC endpoint policy to an already-parsed `(host, port)` pair:
+    /// the host must be a name (never a numeric address, never empty) and the port must be in
+    /// 1...65535. Throws `POSIXError(.EINVAL)` otherwise.
+    ///
+    /// Factored so the `.quic` connect branch and `SMBQUICCertificateProbe` share one classifier
+    /// and cannot diverge. Numeric-host rejection is independent of the TLS trust policy —
+    /// `.insecureNoVerification` never bypasses it. The port check runs here so an out-of-range
+    /// port never constructs a transport or reaches the `NWConnection` driver factory (the driver
+    /// independently re-rejects out-of-range ports for directly constructed transports).
+    static func validateQUICEndpoint(host: String, port: Int) throws {
+        guard !isNumericHost(host) else {
+            throw POSIXError(.EINVAL,
+                description: "SMB over QUIC requires a hostname, not an IP address")
+        }
+        guard (1...65535).contains(port) else {
+            throw POSIXError(.EINVAL,
+                description: "SMB over QUIC: invalid port \(port)")
+        }
+    }
+
+    /// Parses a `host[:port]` server string with the `.quic` default port (UDP/443) and applies
+    /// `validateQUICEndpoint`. The single entry point for callers that have no already-parsed
+    /// endpoint (`SMBQUICCertificateProbe`); `connect` parses once itself and calls
+    /// `validateQUICEndpoint` directly, preserving its "parsed exactly once" invariant.
+    static func validatedQUICEndpoint(_ server: String) throws -> (host: String, port: Int) {
+        let endpoint = try parseSeamEndpoint(server, defaultPort: seamDefaultPort(for: .quic))
+        try validateQUICEndpoint(host: endpoint.host, port: endpoint.port)
+        return endpoint
     }
 
     /// Parses leading decimal digits from `text`, mirroring C `strtol(text, NULL, 10)`:

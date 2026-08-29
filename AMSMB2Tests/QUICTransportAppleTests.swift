@@ -40,6 +40,15 @@ final class ScriptedQUICDriver: QUICConnectionDriver, @unchecked Sendable {
     private var _started = false
     private var _cancelCount = 0
     private var _sentChunks: [Data] = []
+    private var _onCancel: (@Sendable () -> Void)?
+
+    /// Optional hook fired from `cancel()` (outside the lock), after the cancel is counted. Lets a
+    /// test observe teardown ordering — the certificate probe uses it to store into its capture
+    /// slot strictly during `close()`. Unset by default, so every other test is unaffected.
+    var onCancel: (@Sendable () -> Void)? {
+        get { lock.withLock { _onCancel } }
+        set { lock.withLock { _onCancel = newValue } }
+    }
 
     func start(
         onState: @escaping @Sendable (QUICConnectionState) -> Void,
@@ -53,7 +62,11 @@ final class ScriptedQUICDriver: QUICConnectionDriver, @unchecked Sendable {
     }
 
     func cancel() {
-        lock.withLock { _cancelCount += 1 }
+        let hook = lock.withLock { () -> (@Sendable () -> Void)? in
+            _cancelCount += 1
+            return _onCancel
+        }
+        hook?()
     }
 
     func send(_ bytes: Data) async throws {

@@ -18,6 +18,7 @@ Complete reference for the AMSMB2 public API. All async methods also have comple
 | [`TCPTransportApple`](#tcptransportapple) | Concrete `SMBTransport` over `NIOTransportServices` (Apple only) |
 | [`QUICTransportApple`](#quictransportapple) | Concrete `SMBTransport` over Network.framework QUIC (Apple only, availability-gated) |
 | [`SMBQUICConfiguration`](#smbquicconfiguration) | Platform-neutral SMB-over-QUIC config: TLS `TrustPolicy` + connect timeout |
+| [`SMBQUICCertificateProbe`](#smbquiccertificateprobe) | Capture-only SMB-over-QUIC TLS handshake returning the server's DER certificate chain, leaf first — for trust-on-first-use (Swift-only; Apple, availability-gated; Linux throws `ENOTSUP`) |
 
 ---
 
@@ -650,6 +651,59 @@ Platform-neutral SMB-over-QUIC configuration — it holds **no Security.framewor
 
 ---
 
+## SMBQUICCertificateProbe
+
+```swift
+@available(iOS 15, macOS 12, macCatalyst 15, tvOS 15, watchOS 8, visionOS 1, *)
+public enum SMBQUICCertificateProbe {
+    public static func fetchServerCertificateChain(
+        server: String, timeout: TimeInterval = 8
+    ) async throws -> [Data]
+}
+```
+
+Caseless namespace enum. `fetchServerCertificateChain(server:timeout:)` performs exactly **one** SMB-over-QUIC TLS handshake (ALPN `"smb"`, SNI = host, TLS 1.3 — the same wire contract `.quic` connect uses) against `server` with a **capture-only** verify step and returns the DER-encoded certificate chain the server presented, **leaf first**, as `[Data]` (no Security.framework types on the surface). It exists so an app can implement trust-on-first-use (see [Trust on first use](#trust-on-first-use)) without re-implementing the handshake or sideloading a `.cer`. Declared on every platform, so consumers need no `#if`; **Swift-only** and absent from the Objective-C interface, like the rest of the QUIC surface.
+
+**`server`** is a `host[:port]` string — the same form `SMB2Manager` accepts for `.quic`:
+
+| Value | Handshake target |
+|-------|------------------|
+| `"fs.example.com"` | UDP/443 — the SMB-over-QUIC default port |
+| `"fs.example.com:4433"` | UDP/4433 — an explicit port is honored |
+
+**Capture-only contract:**
+
+- The verify step captures the chain and then **always rejects** the handshake — no code path completes verification — so the connection is torn down before any application data flows. The server's own rejection after the capture is the expected outcome, not an error.
+- The peer is **never trusted**, no SMB PDU is ever sent, and **no SMB session** (or `SMB2Client`) is created. The probe returns bytes; deciding to trust them is the app's job.
+- **No connection outlives the call.** On every exit path — chain returned, `EPROTO`, `ETIMEDOUT`, `CancellationError`, and the defensive case of a server that unexpectedly accepts the handshake — a started connection is cancelled exactly once, and the probe does not return until that teardown has completed.
+- The capture mode is internal and **unreachable from any public configuration** — `SMBQUICConfiguration` and its `TrustPolicy` cases are unchanged; you cannot *connect* with it.
+
+**Validation** — the same classifier `.quic` connect uses, so the two surfaces cannot drift; every check runs before any network activity:
+
+| Input | Rule |
+|-------|------|
+| host | Non-numeric names only (the QUIC connection policy). A numeric IPv4/IPv6 host in any form, or an empty host → `POSIXError(.EINVAL)`. |
+| port | Optional; defaults to 443. An explicit port outside 1...65535 (`0`, `65536`, an oversized digit string) → `POSIXError(.EINVAL)`. |
+| `timeout` | The QUIC connect-timeout rules: `NaN`, `±infinity`, `0`, and negative values → `POSIXError(.EINVAL)`; values above 3600 s clamp to 3600. Default **8 s**. |
+
+**`timeout` is independent of `SMBQUICConfiguration.connectTimeout`** (default 30 s) and of `SMB2Manager.timeout`. The probe is interactive — a user is typically waiting on a "fetch certificate" button — and a TLS rejection arrives in about 0.2 s, so 8 s is generous for the path that succeeds, while a UDP black hole (a TCP-only host, a firewalled port) must not stall the UI for the 30 s a real session setup is allowed to take. Pass a different `timeout` if your UI needs another bound; it never affects `.quic` connect.
+
+**Outcomes** (keyed on the thrown error, not on connection state — a captured chain wins over any error except cancellation):
+
+| Outcome | Meaning |
+|---------|---------|
+| returns `[Data]` | The chain the server presented, leaf first (`chain[0]` is the server certificate). Also returned when the deadline expired *after* the chain was captured, and when the server unexpectedly accepted the handshake — the connection is torn down regardless. Never empty on success. |
+| throws `POSIXError(.EPROTO)` | The TLS handshake was rejected **before any certificate was delivered** — an ALPN mismatch, a non-QUIC listener that still answers TLS, a server that accepted without ever presenting a chain. The Security `OSStatus` is available as `userInfo[NSUnderlyingErrorKey]` (an `NSError` in `NSOSStatusErrorDomain`). |
+| throws `POSIXError(.ETIMEDOUT)` | The endpoint was unreachable or unresponsive within `timeout` and no certificate was captured — e.g. a TCP-only host on 445, or a UDP port with no QUIC listener. The probe never takes longer than `timeout` plus teardown to return; it never hangs. |
+| throws `CancellationError` | The calling task was cancelled while the probe was waiting — **even if a chain had already been captured** (a cancelled task never observes a success value; re-probe). The connection is torn down before the error is thrown. |
+| throws `POSIXError(.EINVAL)` | `server` or `timeout` failed the validation above; no connection attempt was started. |
+| throws `POSIXError(.ENOTSUP)` | Linux (no Network.framework). Thrown before any validation, so on Linux a numeric host yields `ENOTSUP`, not `EINVAL` — the same ordering as `.quic` connect. Surfaces as the `EOPNOTSUPP` alias there. |
+| compile-time unavailable | Below the Apple availability floor (iOS 15 / macOS 12 / macCatalyst 15 / tvOS 15 / watchOS 8 / visionOS 1) the symbol is `@available`-gated exactly like `QUICTransportApple` — it does not throw; guard the call with `if #available(...)`. |
+
+> **What "the chain" is.** The array is the chain *as presented to Security.framework*, leaf first (`SecTrustCopyCertificateChain`). For self-signed and private-CA servers — the cases trust-on-first-use exists for — that is exactly what the server sent: a single self-signed leaf, or the leaf followed by the intermediates the server included. Against a publicly-trusted server, Security.framework may append a system root the server did not send; that is harmless for TOFU (such a server is what `.system` trust is for).
+
+---
+
 ## SMB-over-QUIC
 
 Opt into QUIC by setting `SMB2Manager.transportKind = .quic` (optionally with a `quicConfiguration`) before `connectShare`. Availability floor per platform: **iOS 15 / macOS 12 / macCatalyst 15 / tvOS 15 / watchOS 8 / visionOS 1**. On Linux the settings exist but are inert — `.quic` throws `POSIXError(.ENOTSUP)` (on Linux this surfaces as its `EOPNOTSUPP` alias; `.ENOTSUP` is not a distinct `POSIXErrorCode` there) before any transport is constructed or any packet is sent.
@@ -669,7 +723,7 @@ Opt into QUIC by setting `SMB2Manager.transportKind = .quic` (optionally with a 
 - `copy()` preserves both `transportKind` and `quicConfiguration`.
 - `NSSecureCoding`/`Codable` round-trip **only** `transportKind` (via a private string mapping; old/unknown archives decode to `.automatic`). `quicConfiguration` is **never serialized** — trust anchors and the insecure flag are security-sensitive, so a decoded `.quic` manager gets `quicConfiguration == nil` (system-trust default). This copy-vs-archive asymmetry is deliberate.
 
-**Objective-C:** `transportKind`, `quicConfiguration`, `SMBQUICConfiguration`, and `QUICTransportApple` are **Swift-only** — their types are not Objective-C-representable, so they are absent from the generated Objective-C interface (the existing Objective-C API is unchanged). An Objective-C app opts into QUIC through a small Swift shim, e.g.:
+**Objective-C:** `transportKind`, `quicConfiguration`, `SMBQUICConfiguration`, `QUICTransportApple`, and `SMBQUICCertificateProbe` are **Swift-only** — their types are not Objective-C-representable, so they are absent from the generated Objective-C interface (the existing Objective-C API is unchanged). An Objective-C app opts into QUIC through a small Swift shim, e.g.:
 
 ```swift
 // AMSMB2QUICShim.swift — call from Objective-C
@@ -697,6 +751,42 @@ do {
 }
 ```
 
+### Trust on first use
+
+For a self-signed or private-CA server, the alternative to sideloading a `.cer` is to let the user trust the certificate the server presents — after seeing it. [`SMBQUICCertificateProbe`](#smbquiccertificateprobe) fetches that chain with one capture-only handshake: it never trusts the peer, never creates an SMB session, and leaves no connection behind. The app then shows the leaf's identity and fingerprint, and only a confirmed leaf becomes a `.customRoots` anchor:
+
+```swift
+import AMSMB2
+import CryptoKit
+import Security
+
+// 1. Probe: one TLS handshake, nothing trusted, no SMB session (8 s default timeout).
+let chain = try await SMBQUICCertificateProbe.fetchServerCertificateChain(server: "fs.example.com")
+let leaf = chain[0]                                    // the server certificate, DER, leaf first
+
+// 2. Show the user what they are about to trust: subject, SAN, validity, SHA-256.
+guard let certificate = SecCertificateCreateWithData(nil, leaf as CFData) else { return }
+let subject = SecCertificateCopySubjectSummary(certificate) as String? ?? "(no subject)"
+let sha256 = SHA256.hash(data: leaf).map { String(format: "%02X", $0) }.joined(separator: ":")
+// SAN and validity: on macOS, `SecCertificateCopyValues(certificate, nil, nil)` returns the parsed
+// X.509 fields (`kSecOIDSubjectAltName`, `kSecOIDX509V1ValidityNotBefore` / `...NotAfter`).
+// That API does not exist on iOS/tvOS/watchOS/visionOS — there, parse the DER yourself (a small
+// ASN.1 walk of the TBSCertificate, or an X.509 library) or show subject + SHA-256 only.
+
+// 3. The user confirms the SHA-256 OUT OF BAND (against the server admin's published fingerprint).
+guard await confirmWithUser(subject: subject, sha256: sha256) else { return }
+
+// 4. Persist the confirmed leaf (Keychain / app support), then connect with it as the anchor.
+try trustStore.save(leafDER: leaf, for: "fs.example.com")
+smb.transportKind = .quic
+smb.quicConfiguration = SMBQUICConfiguration(trustPolicy: .customRoots([leaf]))
+try await smb.connectShare(name: "Documents")
+```
+
+**Which element to persist.** For a self-signed server (e.g. Windows Server 2022's default SMB-over-QUIC certificate) the chain has one element and `chain[0]` — the leaf — is its own anchor. For a private-CA server the chain is the leaf followed by the intermediates the server sent; either the whole returned chain (`.customRoots(chain)`) or just the CA/intermediate element works as the anchor, because `.customRoots` anchors *replace* the system roots and hostname verification stays on — the server string you later connect to must still match a name in the leaf, which is one reason to show the SAN. Persisting the leaf alone also works for a private-CA server, at the cost of re-trusting on every leaf renewal.
+
+> **First-contact caveat.** A chain fetched on first contact is only as trustworthy as the network at that moment — an on-path attacker can present their own chain, and the probe cannot tell the difference (that is precisely what it does not check). The displayed SHA-256 **must** be confirmed out of band — against the server admin's fingerprint, the server's own `Get-SmbServerCertificateMapping` output, or the exported `.cer` — before it is persisted. Once persisted, the anchor **replaces the system roots for that connection**: a wrong anchor does not weaken trust to "system or this", it silently makes the attacker's certificate the only one accepted. The probe never trusts; the user does, after confirming.
+
 ---
 
 ## Common Errors
@@ -710,13 +800,13 @@ All operations throw `POSIXError` on failure. Common codes:
 | 5 | `EIO` | I/O error (network or protocol) |
 | 13 | `EACCES` | Permission denied |
 | 17 | `EEXIST` | File already exists (e.g., `uploadItem` to existing path) |
-| 22 | `EINVAL` | Invalid argument — with `.quic`: a numeric target host, an invalid DER trust anchor, an empty `.customRoots([])` set, a `NaN`/infinite/non-positive `connectTimeout`, or an explicit port outside 1...65535 |
-| 45 | `ENOTSUP` | Unsupported — selecting `.quic` below the QUIC availability floor or on a platform without `Network` (Linux). On Linux this surfaces as `EOPNOTSUPP` (same errno; `.ENOTSUP` is not a distinct `POSIXErrorCode` there). |
+| 22 | `EINVAL` | Invalid argument — with `.quic` or [`SMBQUICCertificateProbe`](#smbquiccertificateprobe): a numeric target host, an invalid DER trust anchor or an empty `.customRoots([])` set (connect only), a `NaN`/infinite/non-positive `connectTimeout` or probe `timeout`, or an explicit port outside 1...65535 |
+| 45 | `ENOTSUP` | Unsupported — selecting `.quic` below the QUIC availability floor or on a platform without `Network` (Linux). [`SMBQUICCertificateProbe`](#smbquiccertificateprobe) throws it on Linux (before any validation); below the Apple availability floor the probe symbol is unavailable at compile time rather than throwing. On Linux this surfaces as `EOPNOTSUPP` (same errno; `.ENOTSUP` is not a distinct `POSIXErrorCode` there). |
 | 53 | `ECONNABORTED` | Transport (QUIC) `close()` called while a connect was in flight |
 | 57 | `ENOTCONN` | Not connected (call `connectShare` first) |
-| 60 | `ETIMEDOUT` | Operation or connect timed out — including the QUIC connect deadline (`SMBQUICConfiguration.connectTimeout`), i.e. an unreachable or unresponsive endpoint. A QUIC TLS rejection is `EPROTO` instead, unless the deadline expires before the handshake outcome is reported |
+| 60 | `ETIMEDOUT` | Operation or connect timed out — including the QUIC connect deadline (`SMBQUICConfiguration.connectTimeout`) expiring, or the [`SMBQUICCertificateProbe`](#smbquiccertificateprobe) `timeout` expiring before any certificate was captured: an unreachable or unresponsive endpoint. A QUIC TLS rejection is `EPROTO` instead; it surfaces as `ETIMEDOUT` only if the deadline expires before the handshake outcome is reported |
 | 61 | `ECONNREFUSED` | Connection refused by the peer (e.g., transport connect failure) |
-| 100 | `EPROTO` | QUIC TLS handshake failure — most commonly the server certificate failing the configured trust policy or hostname verification, but any other handshake rejection (e.g. an ALPN mismatch) as well. Reported promptly, ahead of the connect deadline; the Security `OSStatus` under `userInfo[NSUnderlyingErrorKey]` (an `NSError` in `NSOSStatusErrorDomain`) identifies the cause |
+| 100 | `EPROTO` | QUIC TLS handshake failure — most commonly the server certificate failing the configured trust policy or hostname verification, but any other handshake rejection (e.g. an ALPN mismatch) as well. Reported promptly, ahead of the connect deadline; the Security `OSStatus` under `userInfo[NSUnderlyingErrorKey]` (an `NSError` in `NSOSStatusErrorDomain`) identifies the cause. For [`SMBQUICCertificateProbe`](#smbquiccertificateprobe): a handshake that failed before any certificate was delivered (a captured chain is returned instead of this error) |
 
 Task cancellation surfaces as `CancellationError` (not a `POSIXError`) — see [Task Cancellation](#task-cancellation).
 

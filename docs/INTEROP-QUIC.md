@@ -64,6 +64,12 @@ SMB_QUIC_CA_DER=/path/to/ca.der \
 
 Convert the lab CA to DER once: `openssl x509 -in ca.crt -outform DER -out ca.der`.
 
+Optional: `SMB_QUIC_LEAF_DER=/path/to/server-leaf.der` — the DER of the server's *own* certificate
+(the leaf, not the CA). When set, `testProbeReturnsServerLeaf` additionally asserts the probed
+`chain[0]` has the same SHA-256, and — when the leaf file is byte-equal to `SMB_QUIC_CA_DER`
+(a self-signed target such as the Windows host) — that the chain has exactly one element. Fetch
+the leaf off the wire with `openssl s_client -quic -alpn smb -connect host:443 -showcerts`.
+
 Coverage: first-contact NEGOTIATE (the D2 framing proof), NTLM auth + share enumeration, directory
 listing, 8 MiB write/read round-trip (md5), real-media read from `//demo` verified against a
 server-side md5, cancel-mid-transfer, best-effort disconnect, numeric-target rejection,
@@ -230,6 +236,34 @@ SMB_QUIC_SHARE=Share SMB_QUIC_CA_DER=<the server .cer>`): `testTrustSystemReject
 `ubuntu-brix`, and this certificate's SAN carries no short name) — dialling that unreachable name
 still produces the transient-wait `ETIMEDOUT`, i.e. an unreachable host and a trust rejection
 are now different codes on a real server.
+
+### Certificate probe (`add-quic-certificate-probe`, 2026-08-29)
+
+`SMBQUICCertificateProbe.fetchServerCertificateChain(server:timeout:)` run live through the three
+new interop cases (`testProbeReturnsServerLeaf`, `testProbedChainConnectsAsCustomRoots`,
+`testProbeAgainstTCPOnlyPortDoesNotHang`), each target in one `--filter SMB2QUICInteropTests/testProbe`
+batch:
+
+| Target | Probe | `.customRoots(chain)` connect + listing | `host:445`, `timeout: 3` |
+|---|---|---|---|
+| `win2k22.kaveman.intra` (self-signed leaf) | **1 DER**, 850 bytes, in **0.017 s**; SHA-256 `431244918de616f1d8c94a830708c634c2731b97fe674285356229a549808981` — equal to the exported `.cer` (`SMB_QUIC_LEAF_DER` == `SMB_QUIC_CA_DER`, so the exactly-one-element assertion ran) | connected + `contentsOfDirectory` in 0.264 s | `POSIXError(.ETIMEDOUT)` (errno 60) in 3.008 s |
+| `ubuntu-brix.kaveman.intra` (Samba, private lab CA) | **1 DER**, 874 bytes, in **0.034 s**; SHA-256 `9f01be44c8c9dc14ce4efaba1cdfaae8bd9afc5ba101bb56db1b90f9d623856a` — equal to the leaf `openssl s_client -quic -alpn smb -showcerts` receives | connected + listing in 0.145 s — the non-self-signed leaf works as its own anchor | `POSIXError(.ETIMEDOUT)` (errno 60) in 3.006 s |
+
+Observations:
+
+- The Samba rig sends **only its leaf** on the wire (`openssl s_client -showcerts` shows one
+  certificate, `i:CN=AMSMB2 QUIC Lab CA`), so "leaf then intermediates" degenerates to one element
+  there; `SecTrustCopyCertificateChain` adds nothing for an issuer the platform does not know. The
+  Samba run used the wire-fetched leaf as both `SMB_QUIC_CA_DER` and `SMB_QUIC_LEAF_DER` (the lab CA
+  file was not on the test host); the CA-anchored connect matrix above is unaffected.
+- Negative case: a TCP-only port (`:445`) never answers the QUIC Initial, so the probe surfaces the
+  deadline (`ETIMEDOUT`, never a hang) at `timeout` + ~10 ms teardown on both targets; no `EPROTO`
+  was observed for this shape.
+- Publicly-trusted server (design open question): probing `www.google.com:443` with the SMB ALPN
+  never completes a handshake — the connection stays in a transient `.waiting` ("Socket is not
+  connected") and the probe returns `ETIMEDOUT` after the 8 s default. No chain can be observed
+  from a public endpoint this way, so the `docs/API.md` wording stays "may append a system root the
+  server did not send".
 
 ### D8 disconnect / server-close observations (2026-07-24)
 

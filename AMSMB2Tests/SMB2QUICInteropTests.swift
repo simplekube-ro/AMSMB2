@@ -34,13 +34,16 @@
 //  `POSIXError(.EPROTO)`, so `ETIMEDOUT` here means only "endpoint unreachable/unresponsive".)
 //
 //  Env: SMB_QUIC_SERVER, SMB_QUIC_SHARE (default "share"), SMB_QUIC_USER (default "smbtest"),
-//  SMB_QUIC_PASSWORD (default "quictest1"), SMB_QUIC_CA_DER (DER path of the lab CA).
+//  SMB_QUIC_PASSWORD (default "quictest1"), SMB_QUIC_CA_DER (DER path of the lab CA),
+//  SMB_QUIC_LEAF_DER (optional; DER path of the expected server leaf — enables the
+//  certificate-probe fingerprint assertion).
 //
 
 #if canImport(Network)
 
 import CryptoKit
 import Foundation
+import Security
 import XCTest
 @testable import AMSMB2
 
@@ -357,6 +360,87 @@ final class SMB2QUICInteropTests: XCTestCase, @unchecked Sendable {
             "\(label): the underlying OSStatus must be a real (non-zero) status",
             file: file, line: line
         )
+    }
+
+    // MARK: - Certificate probe (add-quic-certificate-probe, tasks 3.1–3.3)
+
+    /// The probe returns the chain the rig actually presents, leaf first, with no SMB session
+    /// created. `SMB_QUIC_LEAF_DER` (optional) pins the expected leaf by SHA-256 — the exact
+    /// fingerprint a TOFU consumer would show a user before persisting the anchor.
+    @available(iOS 15, macOS 12, macCatalyst 15, tvOS 15, watchOS 8, visionOS 1, *)
+    func testProbeReturnsServerLeaf() async throws {
+        let started = Date()
+        let chain = try await SMBQUICCertificateProbe.fetchServerCertificateChain(server: host)
+        let elapsed = Date().timeIntervalSince(started)
+
+        XCTAssertFalse(chain.isEmpty, "the probe must return at least the leaf")
+        let leaf = try XCTUnwrap(chain.first)
+        XCTAssertNotNil(
+            SecCertificateCreateWithData(nil, leaf as CFData),
+            "the leaf must parse as a DER certificate"
+        )
+        print(
+            "QUIC certificate probe: \(chain.count) DER(s) in "
+                + String(format: "%.3f", elapsed) + "s; leaf SHA-256 " + sha256Hex(leaf)
+        )
+        for (index, der) in chain.enumerated() {
+            print("  [\(index)] \(der.count) bytes, SHA-256 \(sha256Hex(der))")
+        }
+
+        guard let leafPath = env("SMB_QUIC_LEAF_DER"),
+              let expectedLeaf = try? Data(contentsOf: URL(fileURLWithPath: leafPath))
+        else { return }
+        XCTAssertEqual(
+            sha256Hex(leaf), sha256Hex(expectedLeaf),
+            "the probed leaf must be the server's own certificate"
+        )
+        if expectedLeaf == caDER {
+            XCTAssertEqual(
+                chain.count, 1,
+                "a self-signed target (leaf == CA) presents exactly one certificate"
+            )
+        }
+    }
+
+    /// The whole point of the probe: material it returns, fed back as `.customRoots`, connects.
+    /// This is the trust-on-first-use round trip end to end.
+    @available(iOS 15, macOS 12, macCatalyst 15, tvOS 15, watchOS 8, visionOS 1, *)
+    func testProbedChainConnectsAsCustomRoots() async throws {
+        let chain = try await SMBQUICCertificateProbe.fetchServerCertificateChain(server: host)
+        XCTAssertFalse(chain.isEmpty, "nothing to anchor with")
+
+        let manager = try makeManager(trustPolicy: .customRoots(chain))
+        try await manager.connectShare(name: shareName)
+        _ = try await manager.contentsOfDirectory(atPath: "/")
+        try? await manager.disconnectShare()
+    }
+
+    /// A TCP-only port (445) answers nothing on UDP, so the probe must hit its own deadline and
+    /// return promptly — never hang past `timeout` plus teardown.
+    @available(iOS 15, macOS 12, macCatalyst 15, tvOS 15, watchOS 8, visionOS 1, *)
+    func testProbeAgainstTCPOnlyPortDoesNotHang() async throws {
+        let started = Date()
+        do {
+            _ = try await SMBQUICCertificateProbe.fetchServerCertificateChain(
+                server: "\(host):445", timeout: 3
+            )
+            XCTFail("a TCP-only port must not yield a QUIC certificate chain")
+        } catch let posix as POSIXError {
+            let elapsed = Date().timeIntervalSince(started)
+            print(
+                "QUIC probe against \(host):445 → \(posix.code) in "
+                    + String(format: "%.3f", elapsed) + "s"
+            )
+            XCTAssertTrue(
+                [.ETIMEDOUT, .EPROTO].contains(posix.code),
+                "expected ETIMEDOUT or EPROTO, got \(posix.code)"
+            )
+            XCTAssertLessThan(elapsed, 5, "the probe must return within timeout plus teardown")
+        }
+    }
+
+    private func sha256Hex(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
     // MARK: - 4.3 D8 lifecycle observations (opt-in; set SMB_QUIC_OBSERVE=1)

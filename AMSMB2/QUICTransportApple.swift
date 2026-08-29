@@ -80,6 +80,10 @@ enum QUICResolvedTrust {
     case system
     case customRoots(anchors: [SecCertificate], host: String)
     case insecure
+    /// Capture-only (design D2): record the peer's DER chain into `slot` and then always reject
+    /// the handshake. Internal and unreachable from any public `SMBQUICConfiguration.TrustPolicy`
+    /// — only `SMBQUICCertificateProbe` installs it, via the internal driver-factory seam.
+    case capture(QUICCertificateCaptureSlot)
 }
 
 // MARK: - QUICTransportApple
@@ -920,6 +924,21 @@ final class NWConnectionQUICDriver: QUICConnectionDriver, @unchecked Sendable {
                 },
                 verifyQueue
             )
+        case .capture(let slot):
+            // Capture-only (design D2): record the presented chain, then ALWAYS reject — every
+            // path calls `complete(false)` exactly once, so no code path can leave a
+            // trusted-but-unauthenticated connection alive. The store happens *before* the
+            // completion, and Network.framework only reports the rejection afterwards, so the
+            // slot is filled before the transport can observe the failure.
+            sec_protocol_options_set_verify_block(
+                securityOptions,
+                { _, trustRef, complete in
+                    let secTrust = sec_trust_copy_ref(trustRef).takeRetainedValue()
+                    slot.store(NWConnectionQUICDriver.certificateChainDER(from: secTrust))
+                    complete(false)
+                },
+                verifyQueue
+            )
         }
 
         let parameters = NWParameters(quic: quicOptions)
@@ -936,6 +955,23 @@ final class NWConnectionQUICDriver: QUICConnectionDriver, @unchecked Sendable {
             to: .hostPort(host: NWEndpoint.Host(host), port: nwPort), using: parameters
         )
         self.initError = nil
+    }
+
+    /// The DER-encoded certificate chain of `trust`, **leaf first** (design D3).
+    ///
+    /// `SecTrustCopyCertificateChain` (iOS 15 / macOS 12 — the QUIC availability floor) returns
+    /// the chain as Security.framework sees it, which for a self-signed or private-CA server is
+    /// exactly what the peer presented. A `nil` chain yields `[]`, which the capture verify block
+    /// treats as "nothing captured".
+    static func certificateChainDER(from trust: SecTrust) -> [Data] {
+        certificateChainDER(SecTrustCopyCertificateChain(trust))
+    }
+
+    /// The DER mapping itself, split out so the `nil`-chain contract is unit-testable without
+    /// constructing a `SecTrust` that Security.framework refuses to leave empty.
+    static func certificateChainDER(_ chain: CFArray?) -> [Data] {
+        guard let certificates = chain as? [SecCertificate] else { return [] }
+        return certificates.map { SecCertificateCopyData($0) as Data }
     }
 
     func start(
