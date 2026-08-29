@@ -1,27 +1,34 @@
-# swift-platform-developer memory (AMSMB2)
+# swift-platform-developer — AMSMB2 notes
 
-## Build / test
+## Build / verification
+- Always `--disable-sandbox`: `swift build --disable-sandbox`, `swift test --disable-sandbox [--filter X]`.
+- `swift build --build-tests --disable-sandbox` is the cheapest way to prove a TDD "red" (compile failure).
+- `make linuxtest` (Docker) works and rebuilds the whole package on Linux; grep its output for
+  `Compiling AMSMB2 <File>.swift` to *prove* a new file compiled under the `#else` (non-Network) branch.
+- `swiftformat` and `swift-format` are NOT installed on this machine (as of 2026-08); lint steps must be
+  reported as "tool unavailable", never faked. Manual check: `awk 'length > 120'` (style limit 100/132).
+- `timeout(1)` does not exist in this zsh env (use the Bash tool's own `timeout` param).
 
-- Always `--disable-sandbox`: `swift build --disable-sandbox`, `swift build --disable-sandbox --build-tests`,
-  `swift test --disable-sandbox --filter <Suite>/<test>`.
-- `swift build` prints a giant frontend command line on failure — grep for `error:` instead of
-  reading the tail.
-- Full unit run baseline (no `SMB_SERVER`/`SMB_QUIC_SERVER`): ~291 executed, ~69 skipped,
-  0 failures. All skips are server-gated; a non-server-gated skip is a real problem.
-- No Docker on this host: `make integrationtest` / `make linuxtest` cannot run here. Record that
-  rather than claiming a pass.
+## Test-double seams (QUIC)
+- `AMSMB2Tests/QUICTransportAppleTests.swift` defines internal doubles reusable from any test file in
+  the target: `TestFlag`, `ScriptedQUICDriver`, `ManualDeadlineScheduler`, `ImmediateFireScheduler`,
+  `GatedStartDriver`. `waitUntil(_:_:)` is private per-file — copy the 10-line poller, don't widen it.
+- Pattern for "cancel before the attempt is committed": `withUnsafeCurrentTask { $0?.cancel() }` inside
+  the injected `driverFactory` closure (it runs on the connect task, between `Task.checkCancellation()`
+  and the continuation store).
+- `XCTAssertEqual(try await x, y)` does NOT compile (autoclosure isn't async) — hoist to a `let` first.
 
-## Swift 6 gotchas hit in this repo
-
-- A `static var` counter guarded by an `NSLock` still needs `nonisolated(unsafe)` under Swift 6
-  ("not concurrency-safe because it is nonisolated global shared mutable state"). Acceptable when
-  EVERY access goes through the lock — say so in a comment. Precedent: `CBData.liveCount`.
-- Capturing a mutable `var client: SMB2Client?` in a `Task { }` is rejected; capture by value with
-  `Task { [client] in ... }`, then `client = nil` later to drop the last reference (pattern used
-  throughout `SMB2CBDataLifetimeTests` / `SMB2DisconnectReclaimTests`).
-- Test files need `import SMB2` to call `smb2_*` C symbols; they are not re-exported through
-  `@testable import AMSMB2`.
-
-## Context.swift lifetime model
-
-See [disconnect-reclaim.md](disconnect-reclaim.md) for the CBData / context ownership rules.
+## QUIC transport / probe architecture
+- `QUICResolvedTrust` cases: `.system` (no verify block) / `.customRoots` / `.insecure` / `.capture(slot)`.
+  `.capture` is internal-only, installed solely by `SMBQUICCertificateProbe` through the internal
+  `QUICTransportApple.init(configuration:connectTimeout:driverFactory:deadline:)`, whose factory
+  *discards* the `trust` argument the transport passes.
+- `SMB2Client.validateQUICEndpoint(host:port:)` / `validatedQUICEndpoint(_:)` (Context.swift, inside the
+  `#if canImport(Network)` region) are the single home of the numeric-host + 1...65535 rules.
+  `connect`'s `.quic` branch must keep calling `parseSeamEndpoint` exactly once — it validates the
+  already-parsed pair, it does NOT call `validatedQUICEndpoint`.
+- `QUICTransportApple.close()` is cancellation-safe (awaits only non-throwing teardown continuations),
+  so "always `await close()` even on CancellationError" is safe. Read shared capture state only AFTER
+  close returns — that is when the started driver is guaranteed cancelled and its handlers cleared.
+- Linux `ENOTSUP` spelling (`.ENOTSUP` is not a `POSIXErrorCode` case there):
+  `throw POSIXError(.init(ENOTSUP), description: ...)` with `#if canImport(Glibc) import Glibc #endif`.

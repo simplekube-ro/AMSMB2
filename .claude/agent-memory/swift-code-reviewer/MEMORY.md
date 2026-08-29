@@ -1,48 +1,71 @@
-# swift-code-reviewer — AMSMB2 institutional notes
+# AMSMB2 — swift-code-reviewer memory
 
-## Verified project conventions (confirmed by review)
-- Errors are `POSIXError` only. `POSIXError(_:description:)` and `POSIXError(_:userInfo:)` both
-  live in `AMSMB2/Extensions.swift` (~line 70). No custom Error types anywhere.
-- Line width: `.swiftformat --maxwidth 132`, `.swift-format lineLength 100`. In practice the
-  codebase holds to **100**; flag added lines over 100.
-- Build/test must use `--disable-sandbox`. Full suite is ~285 tests, ~67 skipped (integration,
-  `SMB_SERVER`/`SMB_QUIC_SERVER` unset). Zero warnings is the standing bar.
-- `swift build` caches aggressively — `touch` the changed files before rebuilding if you need to
-  see warnings.
+## Build / test facts (verified)
+- `swift build --disable-sandbox` and `swift test --disable-sandbox --filter <regex>` work; plain
+  `make test` fails in the sandbox.
+- SwiftPM is incremental: after `swift build` reports `[Using on-disk description]` no warnings are
+  re-emitted. **`touch` the changed files and rebuild** before claiming "zero new warnings".
+- Known **pre-existing** warnings on master (do NOT attribute to a change): `ImplicitStrongCapture`
+  ("'weak' ownership of capture 'self'/'cb' differs from implicitly-captured strong reference") in
+  `AMSMB2/Context.swift` around lines 1041, 1049, 1158, 1165, 1718, 1741 (from commit e3670e6).
+- Line-width rule that is actually enforced: `.swiftformat --maxwidth 132`. `.swift-format`
+  `lineLength: 100` is advisory — existing code routinely exceeds 100. Only flag > 132.
+- Package.swift is `swift-tools-version:6.0` → Swift 6 language mode, strict concurrency.
 
-## QUIC transport (`AMSMB2/QUICTransportApple.swift`) — the claim machinery
-This file is the most intricate in the repo. Key invariants to re-verify on ANY change:
-- `resolveConnect(_:)` is the **single atomic claim point**; it guards on
-  `case .connecting(let continuation)`. Every completion path (`.ready`, `.failed`, task cancel,
-  `close()`, deadline) funnels through it. Losers get `nil` and perform **no** side effects.
-- `consumeLossClaimLocked` sets `connectState = .failed` **first, unconditionally**, before its
-  `startPhase` switch. This is what makes repeated terminal events idempotent: a second delivery
-  finds `.failed` and hits `.ignore`. Do not let anyone reorder that assignment.
-- `startPhase` three-way handoff: `.notStarted` → forbid start (nothing to cancel);
-  `.starting` → **park** in `pendingLoss`, return `nil`, and `resolveConnect` returns *before*
-  `deadline.cancel()` — the post-`start()` handoff does the single deadline-cancel + driver-cancel
-  + resume; `.started`/`.forbidden` → cancel the driver inline.
-  A connection must never be cancelled before its `start()` side effect.
-- `handleFailed` reads state under the lock, releases it, then calls `resolveConnect` which
-  re-takes it. Two callers can both pass the first check — safe **only** because `resolveConnect`
-  re-guards. Preserve that second guard.
-- Seam: `QUICConnectionState` is driver-neutral (no Network.framework types cross it); tests inject
-  `ScriptedQUICDriver` / `GatedStartDriver` / `GatedCancelDriver` + `ManualDeadlineScheduler`.
+## Confirmed project conventions
+- Errors are `POSIXError` only. `POSIXError(_:description:)` and `POSIXErrorCode.init(_ code: Int32)`
+  (total, falls back to `.ECANCELED`) live in `AMSMB2/Extensions.swift:~70-80`. The Linux
+  "no QUIC" spelling is `throw POSIXError(.init(ENOTSUP), description: ...)` — precedent
+  `AMSMB2/AMSMB2.swift:1616`.
+- Every `.swift` file carries the MIT header block; 4-space indent, no tabs.
+- Test doubles live in `AMSMB2Tests/QUICTransportAppleTests.swift` at file scope and are reused
+  across QUIC test files: `TestFlag`, `ScriptedQUICDriver`, `ManualDeadlineScheduler`.
+  Check there before accepting a newly-written double as necessary.
+- Integration/interop suites gate on env vars in `setUpWithError()` with `throw XCTSkip(...)`.
 
-## Recurring review checks that have paid off here
-- **Test-only production symbols**: CLAUDE.md's dead-code gate says every new type needs a call
-  site outside its definition file. The QUIC seam legitimately keeps producer + consumer in one
-  file, so judge by *intent* (would removing it break production?) not by the letter.
-- **Unbounded `await parked`** in post-ready abnormal-loss tests (`async let parked` +
-  `await parked`) is the established pattern in `QUICTransportAppleTests.swift`. A regression
-  hangs rather than fails. Bounded helpers exist: `waitUntil` (2000 × 1 ms), `expectPromptPOSIX`,
-  `launchConnect`, `reap`, `ErrorBox`. Prefer them for new connect-phase tests.
-- **Double-resume is self-detecting**: continuations are `CheckedContinuation`, so a second resume
-  traps the process. Tests asserting "no double resume" do get real signal from that.
-- **Error `userInfo` survives to the public API**: `Context.mapTransportConnectError`
-  (`AMSMB2/Context.swift` ~1417) passes `POSIXError`/`CancellationError` through **verbatim** and
-  only wraps foreign errors. So transport-level `userInfo` (e.g. `NSUnderlyingErrorKey`) does
-  reach `SMB2Manager.connectShare` callers.
+## Architecture notes worth reusing
+- `AMSMB2/QUICTransportApple.swift` is the QUIC transport. Its connect state machine (design D7)
+  is a proven claim/handoff/deadline/cancel/close set — reviews should verify callers *reuse* it
+  rather than re-deriving it. Key guarantees relied on by callers:
+  - `close()` is cancellation-safe (only non-throwing continuations) → always `await`-able, even
+    from an already-cancelled task.
+  - `close()` returns only after teardown + in-flight connect work drained → a *started* driver was
+    cancelled exactly once.
+  - `.ready` deliberately RETAINS the driver; every loss path nils it. So "cancelled exactly once"
+    holds across both.
+  - Internal init injects `driverFactory` + `ConnectDeadlineScheduler` — the seam every
+    deterministic test (and now `SMBQUICCertificateProbe`) uses.
+- `sec_trust_copy_ref(trustRef).takeRetainedValue()` is the established (correct, +1) idiom in every
+  verify block. `SecTrustCopyCertificateChain` is `_Nullable CF_RETURNS_RETAINED` → imports as a
+  managed `CFArray?`, no `Unmanaged` handling needed.
+- Verify blocks must call `complete(...)` exactly once on **every** path — a trap or early return
+  hangs the handshake until the connect deadline. Check totality of every helper called inside.
+- QUIC endpoint policy (numeric-host + 1...65535) is factored into
+  `SMB2Client.validateQUICEndpoint(host:port:)` / `validatedQUICEndpoint(_:)` in `Context.swift`.
+  `connect`'s `.quic` branch must keep calling `parseSeamEndpoint` exactly once.
 
-## Detail files
-- `quic-transport-review-notes.md` — per-change findings history for the QUIC seam.
+## Recurring findings to check for in this repo
+1. **Unused imports** in new files guarded by `#if canImport(Network)` — module-internal types
+   (`NWConnectionQUICDriver`, `QUICTransportApple`, …) need no `import Network`/`import Security`.
+2. **Invariant enforced in a different file from where it is relied on** (e.g. "the slot never holds
+   an empty array" guarded at the writer, assumed at the reader). Push the guard to the type.
+3. **Design-doc outcome tables drifting from the implemented precedence order.** CLAUDE.md requires
+   artifacts to match implementation — reread the table row by row against the code.
+4. **Values passed for "truthfulness" that no code reads** (e.g. a `connectTimeout` in a config the
+   internal init ignores) — flag when the dead value can disagree with the live one.
+5. Tests that call `withUnsafeCurrentTask { $0?.cancel() }` from an async XCTest method cancel the
+   *test's own* task; prefer wrapping in `Task { }`.
+
+## QUIC certificate probe (add-quic-certificate-probe) — verified facts
+- `AMSMB2/SMBQUICCertificateProbe.swift`: public `SMBQUICCertificateProbe.fetchServerCertificateChain`
+  + internal `(server:timeout:driverFactory:deadline:)` seam. Outcome precedence (design D1):
+  `CancellationError` → captured chain → transport error → `EPROTO`. `await transport.close()` runs
+  on EVERY path *before* the slot is read — that ordering is the load-bearing invariant (test
+  `testSlotIsReadAfterCloseReturned`).
+- `QUICCertificateCaptureSlot.store` guards `!chain.isEmpty` — the "a stored chain is always
+  non-empty" invariant lives in the type, not at the call site.
+- `QUICResolvedTrust.capture(slot)` is internal-only, unreachable from `SMBQUICConfiguration.TrustPolicy`
+  (`resolveTrust` cannot produce it) — the probe installs it via the driver-factory seam.
+- `ScriptedQUICDriver` (AMSMB2Tests/QUICTransportAppleTests.swift) has an optional `onCancel` hook
+  read under the lock and invoked OUTSIDE it. Default-nil, so other suites are unaffected.
+- Pre-existing >132-col line: `AMSMB2/Context.swift:727` (commit 75e4db5c) — not a new-change finding.
