@@ -145,7 +145,8 @@ separately and excluded from the percentiles, the `TransportRead`-to-`InboundChu
 ratio, the pump-hop latency distribution derived by consuming `TransportRead` events in order
 until their bytes sum to each `InboundChunk` and measuring from the first consumed read, the
 bytes still buffered at the end (total `InboundChunk` minus total `RecvDrain`), and the derived
-throughput (bytes drained per second of wall-clock). When the input contains no `TransportRead`
+throughput (bytes drained per second of wall-clock, both over the whole span and over the active
+time with idle gaps longer than one second excluded). When the input contains no `TransportRead`
 events (a QUIC capture, or a bundle from a build before this change) the coalescing ratio and
 pump-hop latency SHALL be reported as not available rather than as pairing errors. It SHALL work
 with the `xctrace` shipped in Xcode 26 and SHALL fail with a clear message, not a stack trace,

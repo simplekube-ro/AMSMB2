@@ -220,7 +220,11 @@ bytes, popping `TransportRead` events from a FIFO until their bytes sum to exact
 overshoots S is reported as a pairing error, not silently skipped; with no `TransportRead`
 events at all — a QUIC or pre-rc4 capture — the ratio and latency lines print `n/a` instead of
 one error per chunk), the bytes still buffered at the end (`InboundChunk` total minus `RecvDrain`
-total), and the derived throughput. Pairing by byte sum in FIFO order is exact for the TCP
+total), and the derived throughput — both over the whole signpost span and as an `active
+throughput` that excludes idle gaps longer than 1 s, because the consumer app fills its cache in
+one burst and the seam then carries only a 72-byte keepalive every 5 s, which made the plain
+figure under-report by 10–40× on the real captures. `xctrace export` 16.0 segfaults on roughly
+one call in three, so the export step retries up to three times on exit 139 only. Pairing by byte sum in FIFO order is exact for the TCP
 transport because the pump is strictly sequential (one `receive()` outstanding at a time), so
 chunks are handed over in read order and each chunk is a contiguous run of reads. Output is plain text tables. No third-party tooling; python3 ships
 with Xcode's command-line tools.

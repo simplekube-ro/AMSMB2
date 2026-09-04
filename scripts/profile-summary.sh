@@ -27,6 +27,9 @@
 #     (zero-byte reads are skipped and counted); latency = chunk.ts - first popped read.ts.
 #     Overshoot or FIFO underflow is printed as a pairing error and counted, not fatal.
 #   - Throughput = RecvDrain bytes / (last - first subsystem signpost timestamp), MB = 10^6 bytes.
+#     Active throughput divides by the active time instead: the sum of the gaps between
+#     consecutive subsystem signposts (all names, timestamp order) that are <= 1 s, so a burst
+#     followed by a long keepalive-only stretch is measured over the burst.
 #   - Signpost row order within one export follows the table's timestamp order; Begin/End are
 #     paired by (name, signpost id) in that order.
 #
@@ -50,13 +53,20 @@ trap cleanup EXIT
 # export_table <name> <xpath>: export one table of the bundle to $export_dir/<name>.xml.
 # xctrace writes to stdout when --output is omitted, but crashes if stdout is a closed pipe,
 # so always export to a file.
+# xctrace 16.0 segfaults (exit 139) on roughly one invocation in three against real bundles;
+# that status alone is retried up to 3 attempts.
 export_table() {
     local name="$1" xpath="$2"
-    local status=0
-    xcrun xctrace export --input "$input" --xpath "$xpath" \
-        --output "$export_dir/$name.xml" >"$tmpdir/$name.log" 2>&1 || status=$?
+    local status=0 attempt
+    for attempt in 1 2 3; do
+        status=0
+        xcrun xctrace export --input "$input" --xpath "$xpath" \
+            --output "$export_dir/$name.xml" >"$tmpdir/$name.log" 2>&1 || status=$?
+        [[ $status -eq 139 && $attempt -lt 3 ]] || break
+        echo "xctrace export of the $name table crashed (exit 139), retrying ($attempt/3)" >&2
+    done
     if [[ $status -ne 0 ]]; then
-        # a crash (e.g. signal 11 → status 139) leaves the log empty, so always name the status
+        # a crash leaves the log empty, so always name the status
         die "xctrace export of the $name table failed for $input (exit $status):" \
             "$(tail -n 1 "$tmpdir/$name.log")"
     fi
@@ -85,6 +95,7 @@ import xml.etree.ElementTree as ET
 export_dir, subsystem = sys.argv[1], sys.argv[2]
 
 NS = 1_000_000_000
+IDLE_GAP_NS = NS  # gaps longer than this between signposts do not count as active time
 BYTE_EVENTS = ("TransportRead", "InboundChunk", "RecvDrain")
 INTERVALS = ("ServiceDispatch", "ServicePass")
 
@@ -359,10 +370,19 @@ def main():
     print(f"  buffered at end: {chunk_total - drained} bytes (InboundChunk {chunk_total} - RecvDrain {drained})")
 
     span_ns = events[-1][0] - events[0][0]
+    # Active window: the sum of gaps between consecutive subsystem signposts that are <= 1 s,
+    # so a burst followed by minutes of keepalives is measured over the burst.
+    active_ns = sum(b[0] - a[0] for a, b in zip(events, events[1:]) if b[0] - a[0] <= IDLE_GAP_NS)
     if span_ns > 0:
-        print(f"  throughput: {drained / span_ns * NS / 1e6:.3f} MB/s (RecvDrain {drained} bytes over {span_ns / NS:.3f} s)")
+        print(f"  throughput: {drained / span_ns * NS / 1e6:.3f} MB/s "
+              f"(RecvDrain {drained} bytes over {span_ns / NS:.3f} s)")
     else:
         print(f"  throughput: n/a (RecvDrain {drained} bytes, zero wall-clock span)")
+    if active_ns > 0:
+        print(f"  active throughput: {drained / active_ns * NS / 1e6:.3f} MB/s "
+              f"(RecvDrain {drained} bytes over {active_ns / NS:.3f} s active; idle gaps > 1 s excluded)")
+    else:
+        print(f"  active throughput: n/a (RecvDrain {drained} bytes, zero active time)")
 
 
 try:
