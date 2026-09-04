@@ -5,11 +5,12 @@
 //  Copyright © 2024 Mousavian. Distributed under MIT license.
 //  All rights reserved.
 //
-//  Unit tests for the SMBTransport seam (T4 / issue #23).
+//  Unit tests for the SMBTransport seam (T4 / issue #23, push-converted by #45).
 //  Acceptance criteria:
 //    - SMBTransport + SMBTransportKind compile and are public API
-//    - MockTransport round-trips bytes, signals graceful EOF, surfaces
-//      connect failure — with no server and no libsmb2 dependency
+//    - MockTransport pushes injected inbound chunks, graceful EOF and errors to the
+//      handler supplied at connect, records sent bytes, and surfaces connect failure —
+//      with no server and no libsmb2 dependency
 //    - Zero Swift 6 strict-concurrency warnings
 //
 
@@ -40,111 +41,153 @@ final class SMBTransportTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(echoed, SMBTransportKind.automatic)
     }
 
-    // MARK: - MockTransport: round-trip
+    // MARK: - MockTransport: inbound push
 
-    /// Scenario: bytes written via send() are returned by receive().
-    func testMockTransportRoundTripsBytes() async throws {
+    /// Scenario: Mock delivers injected inbound bytes.
+    ///
+    /// WHY: the seam's whole inbound contract is "the transport invokes the handler supplied at
+    /// connect, once per chunk, in arrival order" — a test that only checked the bytes would pass
+    /// against a transport that coalesced or reordered them.
+    func testMockTransportDeliversInjectedChunksInOrder() async throws {
         let mock = MockTransport()
-        try await mock.connect(host: "localhost", port: 445)
-        let payload = Data("hello SMB2 seam".utf8)
-        try await mock.send(payload)
-        let received = try await mock.receive()
-        XCTAssertEqual(received, payload, "receive() must return the exact bytes passed to send()")
+        let recorder = InboundRecorder()
+        try await mock.connect(host: "localhost", port: 445, onReceive: recorder.handler)
+
+        let first = Data("first".utf8)
+        let second = Data("second".utf8)
+        await mock.deliver(first)
+        await mock.deliver(second)
+
+        XCTAssertEqual(
+            recorder.deliveredData, [first, second],
+            "each injected chunk must reach the handler as its own delivery, in order"
+        )
     }
 
-    /// Scenario: multiple sequential send/receive pairs deliver in order.
-    func testMockTransportDeliversInFIFOOrder() async throws {
+    /// Scenario: Mock signals graceful EOF — exactly once, nothing afterwards.
+    func testMockTransportSignalsGracefulEOFTerminalOnce() async throws {
         let mock = MockTransport()
-        try await mock.connect(host: "localhost", port: 445)
+        let recorder = InboundRecorder()
+        try await mock.connect(host: "localhost", port: 445, onReceive: recorder.handler)
+
+        await mock.signalGracefulEOF()
+        // Terminal: neither a repeat EOF nor a later chunk may be delivered.
+        await mock.signalGracefulEOF()
+        await mock.deliver(Data("late".utf8))
+
+        XCTAssertEqual(recorder.deliveryCount, 1, "EOF is terminal — exactly one delivery")
+        XCTAssertEqual(
+            recorder.deliveredData, [Data()],
+            "graceful EOF is signalled by an empty Data delivery"
+        )
+    }
+
+    /// Scenario: an injected error is delivered once as a `POSIXError` and is terminal.
+    func testMockTransportSignalsErrorTerminalOnce() async throws {
+        let mock = MockTransport()
+        let recorder = InboundRecorder()
+        try await mock.connect(host: "localhost", port: 445, onReceive: recorder.handler)
+
+        await mock.signalError(POSIXError(.ECONNRESET))
+        await mock.signalError(POSIXError(.EIO))
+        await mock.deliver(Data("late".utf8))
+
+        XCTAssertEqual(recorder.deliveryCount, 1, "abnormal loss is terminal — exactly one delivery")
+        XCTAssertEqual(recorder.deliveredErrors.map(\.code), [.ECONNRESET])
+    }
+
+    /// Scenario: bytes queued before EOF are delivered before the EOF delivery.
+    func testMockTransportDeliversChunksBeforeEOF() async throws {
+        let mock = MockTransport()
+        let recorder = InboundRecorder()
+        try await mock.connect(host: "localhost", port: 445, onReceive: recorder.handler)
+
+        let payload = Data("last bytes".utf8)
+        await mock.deliver(payload)
+        await mock.signalGracefulEOF()
+
+        XCTAssertEqual(
+            recorder.deliveredData, [payload, Data()],
+            "chunks precede the terminal EOF delivery, in arrival order"
+        )
+    }
+
+    // MARK: - MockTransport: outbound observation
+
+    /// Scenario: Mock records sent bytes and never loops them back to the inbound handler.
+    ///
+    /// WHY: the loopback the mock used to have fed libsmb2 its own PDUs back; the sent log is
+    /// how outbound delivery is observed now, so the directions must stay strictly separate.
+    func testMockTransportRecordsSentBytesWithoutLoopback() async throws {
+        let mock = MockTransport()
+        let recorder = InboundRecorder()
+        try await mock.connect(host: "localhost", port: 445, onReceive: recorder.handler)
+
         let first = Data("first".utf8)
         let second = Data("second".utf8)
         try await mock.send(first)
         try await mock.send(second)
-        let receivedFirst = try await mock.receive()
-        let receivedSecond = try await mock.receive()
-        XCTAssertEqual(receivedFirst, first)
-        XCTAssertEqual(receivedSecond, second)
+
+        let sent = await mock.sentChunks()
+        XCTAssertEqual(sent, [first, second], "sent bytes are recorded in send order")
+        XCTAssertEqual(recorder.deliveryCount, 0, "sent bytes must never loop back inbound")
     }
 
-    // MARK: - MockTransport: graceful EOF
-
-    /// Scenario: after signalGracefulEOF(), receive() returns empty Data.
-    func testMockTransportSignalsGracefulEOF() async throws {
+    /// Scenario: `waitForSent(count:)` resolves once the sent log reaches the count.
+    func testMockTransportWaitForSentResolvesWhenLogReachesCount() async throws {
         let mock = MockTransport()
-        try await mock.connect(host: "localhost", port: 445)
-        await mock.signalGracefulEOF()
-        let eofChunk = try await mock.receive()
-        XCTAssertTrue(eofChunk.isEmpty, "EOF must be signalled by empty Data, got \(eofChunk.count) bytes")
-    }
+        let recorder = InboundRecorder()
+        try await mock.connect(host: "localhost", port: 445, onReceive: recorder.handler)
 
-    /// Scenario: bytes queued before EOF are drained before EOF is delivered.
-    func testMockTransportDrainsBufferBeforeEOF() async throws {
-        let mock = MockTransport()
-        try await mock.connect(host: "localhost", port: 445)
-        let payload = Data("last bytes".utf8)
+        let payload = Data("outbound".utf8)
+        let waiter = Task { await mock.waitForSent(count: 1) }
         try await mock.send(payload)
-        await mock.signalGracefulEOF()
-        // First receive: queued bytes
-        let bytes = try await mock.receive()
-        XCTAssertEqual(bytes, payload)
-        // Second receive: EOF
-        let eof = try await mock.receive()
-        XCTAssertTrue(eof.isEmpty)
+        await waiter.value
+
+        let sent = await mock.sentChunks()
+        XCTAssertEqual(sent, [payload])
     }
 
     // MARK: - MockTransport: connect failure
 
-    /// Scenario: .fail connect behaviour causes connect() to throw POSIXError.
-    func testMockTransportSurfacesConnectFailure() async {
+    /// Scenario: Mock surfaces connection failure — and the failing connect never invokes the
+    /// handler it was given (the seam's failed-connect contract).
+    func testMockTransportSurfacesConnectFailureAndNeverDelivers() async {
         let mock = MockTransport(connectBehavior: .fail(POSIXError(.ECONNREFUSED)))
+        let recorder = InboundRecorder()
         do {
-            try await mock.connect(host: "localhost", port: 445)
+            try await mock.connect(host: "localhost", port: 445, onReceive: recorder.handler)
             XCTFail("connect() must throw on .fail behaviour")
         } catch let posixError as POSIXError {
             XCTAssertEqual(posixError.code, .ECONNREFUSED)
         } catch {
             XCTFail("Expected POSIXError, got \(error)")
         }
+
+        // Nothing may be delivered to a handler whose connect threw, even if the test then
+        // tries to inject through the mock.
+        await mock.deliver(Data("ignored".utf8))
+        await mock.signalGracefulEOF()
+        XCTAssertEqual(recorder.deliveryCount, 0, "a throwing connect never invokes its handler")
     }
 
-    // MARK: - MockTransport: never-reply / cancellation
+    // MARK: - MockTransport: nothing after close
 
-    /// Scenario: receive() suspended on an empty open mock can be cancelled
-    /// via Task cancellation; the Task terminates without hanging.
-    func testMockTransportNeverReplyCanBeCancelled() async throws {
+    /// Scenario: deliveries attempted after `close()` are not made.
+    func testMockTransportDeliversNothingAfterClose() async throws {
         let mock = MockTransport()
-        try await mock.connect(host: "localhost", port: 445)
+        let recorder = InboundRecorder()
+        try await mock.connect(host: "localhost", port: 445, onReceive: recorder.handler)
 
-        let task: Task<Data, any Error> = Task {
-            try await mock.receive()
-        }
+        await mock.deliver(Data("before".utf8))
+        await mock.close()
+        await mock.deliver(Data("after".utf8))
+        await mock.signalGracefulEOF()
+        await mock.signalError(POSIXError(.EIO))
 
-        // Give the task a moment to suspend inside receive(), then cancel.
-        try await Task.sleep(nanoseconds: 10_000_000) // 10 ms
-        task.cancel()
-
-        do {
-            _ = try await task.value
-            XCTFail("Expected task to complete with an error after cancellation")
-        } catch is CancellationError {
-            // Expected: receive() was cancelled.
-        } catch {
-            XCTFail("Expected CancellationError, got \(error)")
-        }
-    }
-
-    // MARK: - MockTransport: concurrent send then receive
-
-    /// Scenario: receive() suspends first, then send() resumes it —
-    /// the concurrent flow that a bridge pump would exercise.
-    func testMockTransportConcurrentSendResumesReceiver() async throws {
-        let mock = MockTransport()
-        try await mock.connect(host: "localhost", port: 445)
-        let payload = Data("concurrent".utf8)
-
-        async let received = mock.receive()         // suspends immediately (buffer empty)
-        try await mock.send(payload)                // resumes the suspended receive()
-        let result = try await received
-        XCTAssertEqual(result, payload)
+        XCTAssertEqual(
+            recorder.deliveredData, [Data("before".utf8)],
+            "nothing is delivered once close() has begun"
+        )
     }
 }

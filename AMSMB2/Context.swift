@@ -1573,8 +1573,9 @@ extension SMB2Client {
 
             // Eager connect (fix-seam-connect-ordering): establish the transport BEFORE libsmb2
             // begins the handshake. `ext_connect` fires NEGOTIATE synchronously on a `>= 0`
-            // return, so the channel must be live first or the first send()/receive() fails with
-            // ENOTCONN. This `await` runs on the caller's task — never on `eventLoopQueue`.
+            // return, so the channel must be live first or the first outbound send fails with
+            // ENOTCONN. Connecting is also what hands the bridge's inbound receiver to the
+            // transport. This `await` runs on the caller's task — never on `eventLoopQueue`.
             let eagerFailure: (any Error)?
             do {
                 try await bridge.connect(host: host, port: port)
@@ -1724,8 +1725,14 @@ extension SMB2Client {
                     }
                     self.pendingOperations[cbId] = cb
 
-                    // Start pumps now so bytes can flow immediately.
-                    bridge.startPumps()
+                    // Start the outbound pump now so bytes can flow immediately. The ordering
+                    // here is load-bearing (design D2): the pump is started *after*
+                    // `setInboundReadyHandler` above, so no outbound byte (NEGOTIATE) can leave
+                    // before the inbound-ready handler is registered and the server can have
+                    // nothing to answer. That keeps the pre-registration delivery window to
+                    // unsolicited events only — and those are covered by the bridge's
+                    // signal-on-registration. Do not move this call above the registration.
+                    bridge.startOutboundPump()
 
                     // Flush any outbound PDUs libsmb2 queued during smb2_set_transport
                     // or smb2_connect_share_async (e.g. NEGOTIATE).
@@ -1925,8 +1932,8 @@ extension SMB2Client {
     /// Tears down the seam: cancels the timer, clears the bridge reference, resets
     /// `seamConnected`. Must run on `eventLoopQueue`.
     ///
-    /// Calling `bridge.close()` cancels the pump Tasks and calls `transport.close()` in a
-    /// background Task (see `TransportBridge.close()`). Idempotent.
+    /// Calling `bridge.close()` cancels the outbound pump Task and calls `transport.close()` in
+    /// a background Task (see `TransportBridge.close()`). Idempotent.
     func teardownSeam() {
         pendingTimeoutItem?.cancel()
         pendingTimeoutItem = nil

@@ -53,7 +53,7 @@ protocol QUICConnectionDriver: AnyObject, Sendable {
     /// handlers are invoked serially on the connection's private queue.
     func start(
         onState: @escaping @Sendable (QUICConnectionState) -> Void,
-        onReceive: @escaping @Sendable (Result<Data, POSIXError>) -> Void
+        onReceive: @escaping InboundReceiver
     )
     /// Cancels the connection (idempotent). Eventually delivers a `.cancelled` state event.
     func cancel()
@@ -205,14 +205,22 @@ public final class QUICTransportApple: SMBTransport, @unchecked Sendable {
     private var closeWaiters: [CheckedContinuation<Void, Never>] = []
     /// Last `.waiting` error, folded into the `ETIMEDOUT` description on deadline expiry.
     private var lastWaitingError: POSIXError?
-    /// `true` once `.ready` won the connect claim — gates `receive()`'s never-connected `ENOTCONN`.
+    /// `true` once `.ready` won the connect claim — gates `send(_:)`'s never-connected `ENOTCONN` and
+    /// every inbound delivery (`takeReceiverLocked`: nothing produced before readiness is delivered).
     private var everReady = false
 
-    /// Inbound chunk FIFO (bytes arrived faster than consumed) + a single parked `receive()`.
-    private var inboundChunks: [Data] = []
-    private var inboundEOF = false
-    private var receiveError: POSIXError?
-    private var receiveWaiter: CheckedContinuation<Data, any Error>?
+    /// The receiver supplied to `connect(host:port:onReceive:)`, stored only after the one-shot
+    /// reservation succeeded (so a rejected repeat connect can never replace the live one) and
+    /// released when `close()` publishes `.closed`. Guarded by `lock`; read under the lock and
+    /// invoked outside it.
+    private var onReceive: InboundReceiver?
+    /// Set once a terminal delivery (peer EOF or a failure) has been made, or `close()` has
+    /// begun. One flag across all four producers — the EOF branch, the chunk-path failure, a
+    /// post-ready `.failed` and a post-ready `.cancelled` — because the EOF branch deliberately
+    /// does not move `lifecycle` (a peer EOF is not a failure), so without it the connection's
+    /// routine `.cancelled` after a peer EOF would deliver a failure *after* a terminal
+    /// delivery. Guarded by `lock`.
+    private var deliveryTerminated = false
 
     // MARK: - Init
 
@@ -265,7 +273,14 @@ public final class QUICTransportApple: SMBTransport, @unchecked Sendable {
     /// failed attempt (retry is unsupported — one instance per connection lifetime; build a
     /// fresh transport instead), `ECONNABORTED` after `close()`. An accepted attempt that fails
     /// validation (e.g. `EINVAL` trust material) also consumes the one shot.
-    public func connect(host: String, port: Int) async throws {
+    ///
+    /// `onReceive` is stored in the same critical section that reserves the attempt, so it is
+    /// installed only when the reservation succeeded: a rejected repeat `connect` never replaces
+    /// the live receiver.
+    public func connect(
+        host: String, port: Int,
+        onReceive: @escaping InboundReceiver
+    ) async throws {
         // Cancellation before the reservation: nothing is consumed, no NWConnection is created.
         try Task.checkCancellation()
 
@@ -287,6 +302,8 @@ public final class QUICTransportApple: SMBTransport, @unchecked Sendable {
                     description: "QUICTransportApple: one-shot connect attempt already consumed"
                 )
             }
+            // Reached only by the `.idle` case above — the reservation is ours.
+            self.onReceive = onReceive
         }
 
         // Eager, fail-closed trust resolution BEFORE any connection object exists (design D5):
@@ -486,6 +503,9 @@ public final class QUICTransportApple: SMBTransport, @unchecked Sendable {
         }
         let duty: Duty? = lock.withLock {
             guard case .connecting(let continuation) = connectState else { return nil }
+            // `.ready` returns from this closure, so `lossError` is definitely initialized on
+            // every path that reaches its use below.
+            let lossError: any Error
             switch outcome {
             case .ready:
                 connectState = .ready
@@ -493,22 +513,24 @@ public final class QUICTransportApple: SMBTransport, @unchecked Sendable {
                 // Keep `driver` for send/receive; no cancellation.
                 return .ready(continuation)
             case .failed(let error):
-                return consumeLossClaimLocked(continuation, error: error).map(Duty.loss)
+                lossError = error
             case .taskCancelled:
-                return consumeLossClaimLocked(continuation, error: CancellationError()).map(Duty.loss)
+                lossError = CancellationError()
             case .closed:
-                return consumeLossClaimLocked(
-                    continuation,
-                    error: POSIXError(.ECONNABORTED, description: "QUIC connect aborted by close()")
-                ).map(Duty.loss)
+                lossError = POSIXError(.ECONNABORTED, description: "QUIC connect aborted by close()")
             case .deadline:
                 let description = lastWaitingError.map {
                     "QUIC connect timed out after \(connectTimeout)s; last waiting error: \($0)"
                 } ?? "QUIC connect timed out after \(connectTimeout)s"
-                return consumeLossClaimLocked(
-                    continuation, error: POSIXError(.ETIMEDOUT, description: description)
-                ).map(Duty.loss)
+                lossError = POSIXError(.ETIMEDOUT, description: description)
             }
+            // Every non-ready outcome makes this `connect` throw, so its handler must never be
+            // invoked: the receiver was installed at the reservation and the driver arms its
+            // receive before `.ready`, so it stays reachable through a failing connect. Set
+            // before the claim is consumed, so a loss parked for the commit-to-start handoff is
+            // covered too. Mirrors what `close()` does at the `open → closing` transition.
+            deliveryTerminated = true
+            return consumeLossClaimLocked(continuation, error: lossError).map(Duty.loss)
         }
         guard let duty else { return } // lost the claim, or loss parked for the handoff (D7).
         deadline.cancel()
@@ -549,7 +571,7 @@ public final class QUICTransportApple: SMBTransport, @unchecked Sendable {
     private func handleFailed(_ error: POSIXError) {
         enum Action {
             case connectClaim
-            case abnormalLoss(CheckedContinuation<Data, any Error>?, (any QUICConnectionDriver)?)
+            case abnormalLoss(InboundReceiver?, (any QUICConnectionDriver)?)
             case ignore
         }
         let action: Action = lock.withLock {
@@ -558,12 +580,10 @@ public final class QUICTransportApple: SMBTransport, @unchecked Sendable {
                 return .connectClaim
             case .ready where lifecycle == .active:
                 lifecycle = .failed
-                receiveError = error
-                let waiter = receiveWaiter
-                receiveWaiter = nil
+                let receiver = takeReceiverLocked(terminal: true)
                 let toCancel = driver // post-ready ⇒ the driver was started.
                 driver = nil
-                return .abnormalLoss(waiter, toCancel)
+                return .abnormalLoss(receiver, toCancel)
             default:
                 return .ignore
             }
@@ -571,9 +591,9 @@ public final class QUICTransportApple: SMBTransport, @unchecked Sendable {
         switch action {
         case .connectClaim:
             resolveConnect(.failed(error))
-        case .abnormalLoss(let waiter, let toCancel):
+        case .abnormalLoss(let receiver, let toCancel):
             toCancel?.cancel()
-            waiter?.resume(throwing: error)
+            receiver?(.failure(error))
         case .ignore:
             break
         }
@@ -585,7 +605,7 @@ public final class QUICTransportApple: SMBTransport, @unchecked Sendable {
         enum Action {
             case connectClaim
             case localCloseAck
-            case abnormalLoss(CheckedContinuation<Data, any Error>?)
+            case abnormalLoss(InboundReceiver?)
             case ignore
         }
         let action: Action = lock.withLock {
@@ -596,12 +616,9 @@ public final class QUICTransportApple: SMBTransport, @unchecked Sendable {
                 if lifecycle == .active {
                     // No local-close cause recorded → unsolicited cancel = abnormal loss.
                     lifecycle = .failed
-                    let error = POSIXError(.ECONNRESET, description: "QUIC connection cancelled by peer")
-                    receiveError = error
-                    let waiter = receiveWaiter
-                    receiveWaiter = nil
+                    let receiver = takeReceiverLocked(terminal: true)
                     driver = nil
-                    return .abnormalLoss(waiter)
+                    return .abnormalLoss(receiver)
                 }
                 return .localCloseAck // our own close()'s cancel — no-op on the recorded result.
             default:
@@ -613,47 +630,56 @@ public final class QUICTransportApple: SMBTransport, @unchecked Sendable {
             resolveConnect(.closed)
         case .localCloseAck, .ignore:
             break
-        case .abnormalLoss(let waiter):
-            waiter?.resume(throwing: POSIXError(.ECONNRESET, description: "QUIC connection cancelled by peer"))
+        case .abnormalLoss(let receiver):
+            receiver?(.failure(POSIXError(.ECONNRESET, description: "QUIC connection cancelled by peer")))
         }
     }
 
     // MARK: - Inbound delivery (design D8)
 
+    /// Inbound events from the driver. Nothing is delivered before `.ready` has won the connect
+    /// claim: the driver arms its receive during setup, and the seam's contract is that a
+    /// `connect` which throws never invokes its handler. A setup-time event is therefore dropped
+    /// whole — not just its delivery — so it also cannot tear down an attempt that is still
+    /// running; a genuine setup failure reaches the caller through the state handler
+    /// (`.failed` → `resolveConnect`), which is what resolves the connect.
     private func handleReceive(_ result: Result<Data, POSIXError>) {
         switch result {
         case .success(let data) where data.isEmpty:
-            // Peer-originated graceful EOF (stream complete): a parked/next receive() sees empty.
-            let waiter: CheckedContinuation<Data, any Error>? = lock.withLock {
-                inboundEOF = true
-                let waiter = receiveWaiter
-                receiveWaiter = nil
-                return waiter
-            }
-            waiter?.resume(returning: Data())
+            // Peer-originated graceful EOF (stream complete) — terminal.
+            let receiver = lock.withLock { takeReceiverLocked(terminal: true) }
+            receiver?(.success(Data()))
         case .success(let data):
-            let waiter: CheckedContinuation<Data, any Error>? = lock.withLock {
-                if let waiter = receiveWaiter {
-                    receiveWaiter = nil
-                    return waiter
-                }
-                inboundChunks.append(data)
-                return nil
-            }
-            waiter?.resume(returning: data)
+            let receiver = lock.withLock { takeReceiverLocked(terminal: false) }
+            receiver?(.success(data))
         case .failure(let error):
-            // A receive-side error is abnormal transport loss (design D8).
-            let waiter: CheckedContinuation<Data, any Error>? = lock.withLock {
-                guard lifecycle == .active else { return nil }
+            // A receive-side error is abnormal transport loss (design D8) — terminal.
+            let receiver: InboundReceiver? = lock.withLock {
+                // `everReady` also gates the state mutation, not only the delivery: nilling
+                // `driver` during setup would strand the connect claim's cleanup with nothing
+                // to cancel, and fail a connection that was still on its way to `.ready`.
+                guard everReady, lifecycle == .active else { return nil }
                 lifecycle = .failed
-                receiveError = error
-                let waiter = receiveWaiter
-                receiveWaiter = nil
                 driver = nil
-                return waiter
+                return takeReceiverLocked(terminal: true)
             }
-            waiter?.resume(throwing: error)
+            receiver?(.failure(error))
         }
+    }
+
+    /// Reads the receiver, consuming the terminal-once flag when `terminal` is set. Returns
+    /// `nil` before `.ready` has won the connect claim, once delivery has terminated, or before
+    /// a receiver exists. MUST be called while holding `lock`; the returned receiver MUST be
+    /// invoked outside it (it takes the bridge's own lock — the two are never nested).
+    ///
+    /// The `everReady` gate is what makes "a `connect` that throws never invokes its handler"
+    /// true for this conformer: the receiver is installed at the reservation and the driver arms
+    /// its receive before `.ready`, so it is reachable throughout a failing connect. It is a
+    /// no-op for the post-ready state producers, which already require `connectState == .ready`.
+    private func takeReceiverLocked(terminal: Bool) -> InboundReceiver? {
+        guard everReady, !deliveryTerminated, let receiver = onReceive else { return nil }
+        if terminal { deliveryTerminated = true }
+        return receiver
     }
 
     // MARK: - SMBTransport: send / receive / close
@@ -668,56 +694,14 @@ public final class QUICTransportApple: SMBTransport, @unchecked Sendable {
         try await driver.send(bytes)
     }
 
-    public func receive() async throws -> Data {
-        try await withTaskCancellationHandler(
-            operation: {
-                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, any Error>) in
-                    self.lock.withLock {
-                        // Drain buffered chunks before surfacing any EOF/error (design D8 / matches
-                        // TCPTransportApple's "drain buffer before EOF").
-                        if !inboundChunks.isEmpty {
-                            continuation.resume(returning: inboundChunks.removeFirst())
-                        } else if closeState != .open {
-                            // After (or during) close() → empty Data (the close contract wins
-                            // over a prior error).
-                            continuation.resume(returning: Data())
-                        } else if let error = receiveError {
-                            continuation.resume(throwing: error) // abnormal loss (pre-close).
-                        } else if inboundEOF {
-                            continuation.resume(returning: Data()) // peer graceful EOF.
-                        } else if !everReady {
-                            // Never connected → ENOTCONN. On `receive()` this is the ONLY ENOTCONN
-                            // case (a local close is reported as empty `Data` above); `send(_:)`
-                            // throws ENOTCONN whenever no connection is usable, close() included.
-                            continuation.resume(throwing: POSIXError(.ENOTCONN, description: "QUICTransportApple: not connected"))
-                        } else if Task.isCancelled {
-                            continuation.resume(throwing: CancellationError())
-                        } else {
-                            receiveWaiter = continuation
-                        }
-                    }
-                }
-            },
-            onCancel: { [self] in
-                let waiter: CheckedContinuation<Data, any Error>? = lock.withLock {
-                    let waiter = receiveWaiter
-                    receiveWaiter = nil
-                    return waiter
-                }
-                waiter?.resume(throwing: CancellationError())
-            }
-        )
-    }
-
     /// Closes the connection through the close lifecycle (`open → closing → closed`, design
     /// D7/D8). The first caller atomically becomes the teardown **owner**; it records the
     /// local-close cause under the lock **before** `NWConnection.cancel()` (so the resulting
     /// `.cancelled` state event is never misread as abnormal loss), performs the resource
-    /// teardown on the dedicated teardown queue — cancel the driver exactly once, resume a
-    /// parked `receive()` with empty `Data` (the local-close EOF signal, matching
-    /// `TCPTransportApple.signalClosed()`), resolve the connect continuation if close won the
-    /// claim — then waits for any in-flight connect work (a committed `start()` that has not
-    /// returned, its handoff, or the deadline arming tail) to finish, and only then transitions
+    /// teardown on the dedicated teardown queue — cancel the driver exactly once, resolve the
+    /// connect continuation if close won the claim — then waits for any in-flight connect work
+    /// (a committed `start()` that has not returned, its handoff, or the deadline arming tail)
+    /// to finish, and only then transitions
     /// to `.closed` and resumes every concurrent caller.
     ///
     /// `SMBTransport.close()` promises resources are released when it returns — for **every**
@@ -734,8 +718,7 @@ public final class QUICTransportApple: SMBTransport, @unchecked Sendable {
         enum Entry {
             case alreadyClosed
             case waitForOwner
-            case own(abort: LossDuty?, receiveWaiter: CheckedContinuation<Data, any Error>?,
-                     driverToCancel: (any QUICConnectionDriver)?)
+            case own(abort: LossDuty?, driverToCancel: (any QUICConnectionDriver)?)
         }
         let entry: Entry = lock.withLock {
             switch closeState {
@@ -745,6 +728,10 @@ public final class QUICTransportApple: SMBTransport, @unchecked Sendable {
                 return .waitForOwner
             case .open:
                 closeState = .closing
+                // Delivery stops the moment close() begins (design D4): the `.cancelled` the
+                // teardown below produces must never reach the receiver, so the bridge sees the
+                // same silent teardown `TCPTransportApple` gives it.
+                deliveryTerminated = true
                 if case .connecting(let continuation) = connectState {
                     // close() while connecting wins the connect claim → ECONNABORTED (design
                     // D7). A nil duty means the loss landed in the commit-to-start window and
@@ -754,16 +741,14 @@ public final class QUICTransportApple: SMBTransport, @unchecked Sendable {
                         continuation,
                         error: POSIXError(.ECONNABORTED, description: "QUIC connect aborted by close()")
                     )
-                    return .own(abort: duty, receiveWaiter: nil, driverToCancel: nil)
+                    return .own(abort: duty, driverToCancel: nil)
                 }
                 // Established (or never-started/reserved): record the local-close cause
                 // BEFORE cancel (design D8).
                 lifecycle = .closed
-                let waiter = receiveWaiter
-                receiveWaiter = nil
                 let toCancel = driver
                 driver = nil
-                return .own(abort: nil, receiveWaiter: waiter, driverToCancel: toCancel)
+                return .own(abort: nil, driverToCancel: toCancel)
             }
         }
 
@@ -784,7 +769,7 @@ public final class QUICTransportApple: SMBTransport, @unchecked Sendable {
                 }
             }
             return
-        case .own(let abort, let receiveWaiter, let driverToCancel):
+        case .own(let abort, let driverToCancel):
             // Owner: perform the resource teardown on the dedicated teardown queue (never a
             // cooperative thread) and wait for it to complete before proceeding.
             await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
@@ -795,7 +780,6 @@ public final class QUICTransportApple: SMBTransport, @unchecked Sendable {
                         abort.continuation.resume(throwing: abort.error)
                     }
                     driverToCancel?.cancel()
-                    receiveWaiter?.resume(returning: Data()) // local-close EOF signal.
                     continuation.resume(returning: ())
                 }
             }
@@ -816,6 +800,7 @@ public final class QUICTransportApple: SMBTransport, @unchecked Sendable {
             // Fully closed: publish and release every concurrent caller.
             let waiters: [CheckedContinuation<Void, Never>] = lock.withLock {
                 closeState = .closed
+                onReceive = nil // the receiver is released when close completes (design D4).
                 let waiters = closeWaiters
                 closeWaiters = []
                 return waiters
@@ -824,6 +809,12 @@ public final class QUICTransportApple: SMBTransport, @unchecked Sendable {
                 waiter.resume(returning: ())
             }
         }
+    }
+
+    /// Test observability (internal): whether an inbound receiver is currently installed. A
+    /// never-connected transport holds none; `close()` releases the one a connect installed.
+    var hasInboundHandler: Bool {
+        lock.withLock { onReceive != nil }
     }
 
     /// Test observability (internal, like `connectTimeout`): how many `close()` callers are
@@ -895,7 +886,7 @@ final class NWConnectionQUICDriver: QUICConnectionDriver, @unchecked Sendable {
     let connection: NWConnection?
     let initError: POSIXError?
     private let lock = NSLock()
-    private var onReceive: (@Sendable (Result<Data, POSIXError>) -> Void)?
+    private var onReceive: InboundReceiver?
 
     init(host: String, port: Int, trust: QUICResolvedTrust) {
         // ALPN "smb", SNI = host, TLS 1.3 (QUIC-implied) — design D2.
@@ -976,7 +967,7 @@ final class NWConnectionQUICDriver: QUICConnectionDriver, @unchecked Sendable {
 
     func start(
         onState: @escaping @Sendable (QUICConnectionState) -> Void,
-        onReceive: @escaping @Sendable (Result<Data, POSIXError>) -> Void
+        onReceive: @escaping InboundReceiver
     ) {
         lock.withLock { self.onReceive = onReceive }
         guard let connection else {

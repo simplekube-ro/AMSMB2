@@ -549,10 +549,11 @@ This prevents unbounded memory growth when the producer (async sequence) is fast
 ## SMBTransport
 
 ```swift
+public typealias InboundReceiver = @Sendable (Result<Data, POSIXError>) -> Void
+
 public protocol SMBTransport: Sendable {
-    func connect(host: String, port: Int) async throws
+    func connect(host: String, port: Int, onReceive: @escaping InboundReceiver) async throws
     func send(_ bytes: Data) async throws
-    func receive() async throws -> Data
     func close() async
 }
 ```
@@ -560,9 +561,46 @@ public protocol SMBTransport: Sendable {
 The transport seam: the abstraction that carries raw SMB2 bytes over the network, decoupled from any specific wire implementation. It is intentionally free of SwiftNIO and libsmb2 dependencies, so conformers can be unit-tested in isolation and reused by both the TCP and QUIC transports.
 
 - **Buffer type:** `Foundation.Data` (concrete transports convert to/from NIO `ByteBuffer` internally).
-- **EOF convention:** `receive()` returning empty `Data` signals graceful peer close. Stop the receive loop on an empty result.
+- **Inbound is push:** the receiver is a parameter of `connect`, so a connection cannot exist without one. There is no `receive()` and no separate registration step.
+- **Delivery contract:** the transport invokes `onReceive` on its own serial delivery queue — once per inbound chunk in arrival order, once with empty `Data` for graceful EOF, or once with a `POSIXError` for abnormal connection loss. EOF and failure are terminal (nothing follows either), nothing is delivered once `close()` has begun, a `connect` that throws never invokes its handler, and a rejected repeat `connect` never replaces the live receiver. The handler runs on the network queue: it must return promptly and must not suspend.
 - **Concurrency:** conformers must be `Sendable` (use an `actor`, or a `final class` with justified `@unchecked Sendable`).
-- **Errors:** `connect(host:port:)` throws `POSIXError` on failure (e.g. `.ECONNREFUSED`).
+- **Errors:** `connect(host:port:onReceive:)` throws `POSIXError` on failure (e.g. `.ECONNREFUSED`).
+
+### Migrating a conformer from `receive()`
+
+A pull-style conformer that buffered bytes for `receive()` becomes a forwarder: store the handler at connect, invoke it from the network callback, and stop at the first terminal delivery.
+
+```swift
+// Before — buffer + parked continuation, drained by the pull loop.
+func connect(host: String, port: Int) async throws { /* … */ }
+func receive() async throws -> Data { /* park until a chunk, EOF or an error */ }
+
+// After — the callback is the delivery.
+private var receiver: InboundReceiver?              // @Sendable (Result<Data, POSIXError>) -> Void
+private var terminated = false                     // EOF/error/close are terminal
+
+func connect(host: String, port: Int, onReceive: @escaping InboundReceiver) async throws {
+    try reserveSingleAttempt()                     // throws → handler never installed
+    lock.withLock { receiver = onReceive }         // installed only after the reservation
+    try await establishConnection(host: host, port: port)
+}
+
+// On the network queue, for each event:
+private func forward(_ result: Result<Data, POSIXError>, terminal: Bool) {
+    let receiver = lock.withLock { () -> InboundReceiver? in
+        guard !terminated, let receiver else { return nil }
+        if terminal { terminated = true }
+        return receiver
+    }
+    receiver?(result)                              // never invoked while holding the lock
+}
+// chunk    → forward(.success(bytes), terminal: false)   // skip zero-length reads
+// peer EOF → forward(.success(Data()), terminal: true)
+// error    → forward(.failure(mapped), terminal: true)
+// close()  → set `terminated` and drop `receiver` before tearing the connection down
+```
+
+Empty `Data` still means graceful EOF, so a zero-length read must be skipped rather than forwarded; the buffer and the parked continuation are deleted along with `receive()`.
 
 > On Apple platforms, `SMB2Manager.connectShare(...)` drives this seam automatically. The protocol is `public` for extensibility, but the public API does not yet expose injecting a custom transport. See [ARCHITECTURE.md → Transport Layer](ARCHITECTURE.md#transport-layer).
 

@@ -79,25 +79,26 @@ final class SMB2ServicingLoopTests: XCTestCase, @unchecked Sendable {
 
     // MARK: - Inbound-ready signal triggers servicing on the event loop queue
 
-    /// WHEN the bridge's inbound pump appends bytes
+    /// WHEN the transport delivers bytes to the bridge
     /// THEN the `onInboundReady` callback fires (signalling the event loop)
     func testInboundReadyCallbackFiresWhenBytesAreAppended() async throws {
         let mock = MockTransport()
         let bridge = TransportBridge(transport: mock)
+        // Connecting is what hands the bridge's inbound handler to the transport.
+        try await bridge.connect(host: "testserver", port: 445)
 
         let signalExpectation = XCTestExpectation(
-            description: "onInboundReady fires when bytes are appended to the bridge"
+            description: "onInboundReady fires when the transport delivers bytes"
         )
         signalExpectation.expectedFulfillmentCount = 1
 
         bridge.setInboundReadyHandler {
             signalExpectation.fulfill()
         }
-        bridge.startInboundPump()
 
-        // Push bytes from the "server" side — the inbound pump picks them up,
-        // appends to the bridge inbound buffer, then calls onInboundReady.
-        try await mock.send(Data("hello from server".utf8))
+        // Inject bytes from the "server" side — the transport pushes them into the bridge's
+        // store on the delivery thread, which fires onInboundReady before it returns.
+        await mock.deliver(Data("hello from server".utf8))
 
         await fulfillment(of: [signalExpectation], timeout: 2.0)
     }
@@ -217,12 +218,13 @@ final class SMB2ServicingLoopTests: XCTestCase, @unchecked Sendable {
     /// THEN the connect attempt is driven by the seam servicing loop (not poll(fd))
     /// AND it completes (with timeout error from mock not speaking SMB2) without hanging
     ///
-    /// `sendsAreDropped: true` prevents MockTransport from looping sent bytes back to
-    /// `receive()`. Without this flag, libsmb2's own NEGOTIATE PDU would be fed back as a
-    /// "server response", causing libsmb2 to parse invalid SMB2 data and SIGSEGV.
+    /// `MockTransport` records what the bridge sends and never feeds it back inbound, so
+    /// libsmb2's own NEGOTIATE PDU can never return as a bogus "server response" (which would
+    /// make libsmb2 parse invalid SMB2 data and SIGSEGV). Nothing is injected, so the server
+    /// simply never replies.
     func testConnectWithBridgeCompletesWithoutHang() async throws {
         let client = try SMB2Client(timeout: 0.5) // short timeout so the test finishes quickly
-        let bridge = TransportBridge(transport: MockTransport(sendsAreDropped: true))
+        let bridge = TransportBridge(transport: MockTransport())
 
         let start = Date()
         do {
@@ -256,7 +258,7 @@ final class SMB2ServicingLoopTests: XCTestCase, @unchecked Sendable {
     /// "Operation timeout fires" scenario: `ETIMEDOUT` + pending operation removed.
     func testTimeoutThrowsETIMEDOUTAndRemovesPendingOperation() async throws {
         let client = try SMB2Client(timeout: 0.3) // 300 ms → Swift asyncAfter wins the race
-        let bridge = TransportBridge(transport: MockTransport(sendsAreDropped: true))
+        let bridge = TransportBridge(transport: MockTransport())
 
         let start = Date()
         do {
@@ -296,9 +298,9 @@ final class SMB2ServicingLoopTests: XCTestCase, @unchecked Sendable {
     /// pins the connect-ordering spec's "Cancel mid-operation" scenario.
     func testCancellationThrowsCancellationErrorAndTearsDownSeam() async throws {
         let client = try SMB2Client(timeout: 30) // long timeout; cancel before any timer fires
-        // sendsAreDropped: true prevents MockTransport from echoing libsmb2's NEGOTIATE PDU
-        // back as a server response (which would cause libsmb2 to SIGSEGV on invalid data).
-        let bridge = TransportBridge(transport: MockTransport(sendsAreDropped: true))
+        // MockTransport never echoes what it is sent, so libsmb2's own NEGOTIATE PDU can
+        // never come back as a bogus server response (which would SIGSEGV its parser).
+        let bridge = TransportBridge(transport: MockTransport())
 
         let connectTask = Task {
             try await client.connectWithBridge(

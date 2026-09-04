@@ -4,6 +4,7 @@
 Provide an architecture document (`docs/ARCHITECTURE.md`) that explains the AMSMB2 system through Mermaid diagrams and a file-structure map: the four-layer stack, the connection lifecycle, the async operation flow that bridges Swift concurrency to libsmb2's C async model, the thread-safety model, and the pluggable transport layer (the Apple external-transport seam vs the legacy libsmb2-owned socket path on Linux) — so developers can understand responsibilities, dependency directions, locking strategy, how the wire is driven on each platform, and where to find code.
 
 ## Requirements
+
 ### Requirement: Layer architecture diagram
 
 The architecture document SHALL include a Mermaid diagram showing the four-layer stack: libsmb2 (C) → SMB2Client (Swift wrapper) → SMB2FileHandle (file abstraction) → SMB2Manager (public API).
@@ -38,7 +39,7 @@ The architecture document SHALL describe the thread safety model: the serial `ev
 
 ### Requirement: Transport layer (Apple seam) documentation
 
-The architecture document SHALL include a Transport Layer section describing the pluggable external-transport seam used on Apple platforms. It SHALL cover: the public seam types (`SMBTransport`, `SMBTransportKind`) and conformer (`TCPTransportApple`) plus the internal `TransportBridge`; that Apple connections default to the seam (`smb2_set_transport` with `SMB2_TRANSPORT_AUTO`, never `SMB2_TRANSPORT_TCP`) so `smb2_get_fd == -1`; the no-fd servicing loop driven by an inbound-ready signal and timer-driven `smb2_service_timeout`; eager transport connect ordering before NEGOTIATE; the inbound/outbound pump tasks with copy-at-the-C-boundary semantics; and that Linux retains libsmb2's built-in socket path. The document SHALL also state that the seam is not currently selectable through the public `SMB2Manager` API.
+The architecture document SHALL include a Transport Layer section describing the pluggable external-transport seam used on Apple platforms. It SHALL cover: the public seam types (`SMBTransport`, `SMBTransportKind`) and conformer (`TCPTransportApple`) plus the internal `TransportBridge`; that Apple connections default to the seam (`smb2_set_transport` with `SMB2_TRANSPORT_AUTO`, never `SMB2_TRANSPORT_TCP`) so `smb2_get_fd == -1`; the no-fd servicing loop driven by an inbound-ready signal and timer-driven `smb2_service_timeout`; eager transport connect ordering before NEGOTIATE; the pushed inbound path (the transport delivers each chunk into the bridge's store on its own network queue, with no task in between) and the outbound pump task, both with copy-at-the-C-boundary semantics; and that Linux retains libsmb2's built-in socket path. The document SHALL also state that the seam is not currently selectable through the public `SMB2Manager` API.
 
 #### Scenario: Transport seam understanding
 - **WHEN** a developer reads the Transport Layer section

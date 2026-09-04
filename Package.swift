@@ -93,6 +93,14 @@ let package = Package(
                     package: "swift-nio",
                     condition: .when(platforms: [.macOS, .iOS, .tvOS, .watchOS, .visionOS, .macCatalyst])
                 ),
+                // NIOEmbedded (test-only): drives InboundForwardingHandler's channel callbacks
+                // deterministically — a zero-length read and a chosen ChannelError cannot be
+                // produced on demand by a real socket.
+                .product(
+                    name: "NIOEmbedded",
+                    package: "swift-nio",
+                    condition: .when(platforms: [.macOS, .iOS, .tvOS, .watchOS, .visionOS, .macCatalyst])
+                ),
                 .product(
                     name: "NIOTransportServices",
                     package: "swift-nio-transport-services",

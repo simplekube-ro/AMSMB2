@@ -2,7 +2,9 @@
 
 ## Purpose
 TBD - created by archiving change fix-seam-connect-ordering. Update Purpose after archive.
+
 ## Requirements
+
 ### Requirement: Transport is connected before libsmb2 starts NEGOTIATE
 
 When a connection is established through the seam, the underlying `SMBTransport` SHALL be fully
@@ -14,8 +16,8 @@ result to libsmb2 while the transport channel is not yet established.
 
 - **WHEN** the seam connect path drives `smb2_connect_share_async` and libsmb2 begins NEGOTIATE
 - **THEN** the bridge's first outbound `SMBTransport.send(_:)` succeeds (no `POSIXError(.ENOTCONN)`)
-- **AND** the first inbound `SMBTransport.receive()` succeeds rather than failing with
-  "Socket is not connected"
+- **AND** the first inbound delivery from the transport reaches the bridge's store rather than
+  failing with "Socket is not connected"
 
 #### Scenario: No-fd invariant holds throughout the seam connection
 
@@ -69,7 +71,8 @@ multiple request/response round-trips over the bridge.
 ### Requirement: Large read and write round-trip through the seam
 
 Reads and writes larger than a single PDU SHALL transfer byte-exact data through the seam,
-exercising the inbound/outbound pumps and the no-fd servicing loop under sustained I/O.
+exercising the pushed inbound path, the outbound pump and the no-fd servicing loop under
+sustained I/O.
 
 #### Scenario: Large write then read-back matches
 
@@ -105,4 +108,3 @@ The seam acceptance suite (`SMB2SeamIntegrationTests`) SHALL pass against a live
 - **THEN** all scenarios (connect/NTLM, list, large read/write, cancel/timeout) pass with zero
   failures
 - **AND** every connection asserts `smb2_get_fd == -1`
-

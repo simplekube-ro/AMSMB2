@@ -163,16 +163,19 @@ path or a bundle with no time-profile table exits 1 with a one-line message.
 
 ## Metrics
 
-The inbound path is a pull loop with two executor hops per burst. The signposts measure the two
-hops separately:
+The inbound path has one executor hop per burst since the inbound push-conversion (#45): the
+transport delivers each chunk into the bridge's store inside its own network callback, and the
+inbound-ready signal then hops to `eventLoopQueue`. Before the conversion there were two — a
+cooperative-pool pump `Task` sat between the transport and the store, and the Baseline section
+below was captured with it. The signposts measure both:
 
 | Metric | Source | Definition |
 |---|---|---|
 | Per-thread CPU | `time-profile` | Samples per thread and share of total. The unnamed `RandomPlayer (0x…)` threads are the Swift cooperative pool; `NIO-SGLTN-*` is the NIOTS event loop; the cooperative-pool share is the signature #45 should shrink. |
 | `TransportRead` | event, bytes | One per chunk the TCP transport receives on the network stack's queue. **TCP transport only** — a QUIC capture has none, and the script prints `n/a` for the two derived metrics instead of pairing errors. |
 | `InboundChunk` | event, bytes | One per non-empty chunk the bridge appends to its FIFO. Total `InboundChunk` bytes equal total `TransportRead` bytes: coalescing changes counts, never bytes. |
-| Coalescing ratio | derived | `TransportRead` count ÷ `InboundChunk` count, plus the reads-per-chunk distribution. When the pump `Task` is behind, several reads accumulate and are handed over as one chunk; a ratio above 1 is direct evidence of pump backlog. |
-| Pump-hop latency | derived | For each `InboundChunk` the script pops `TransportRead`s in FIFO order until their bytes sum to the chunk size and reports chunk time − first popped read time: the queueing delay of the oldest coalesced byte. This is the network-queue → cooperative-pool hop that #45 removes. |
+| Coalescing ratio | derived | `TransportRead` count ÷ `InboundChunk` count, plus the reads-per-chunk distribution. After #45 it is **1.00 by construction for the connection's lifetime**: the transport hands each read to the bridge inside the same callback, and a zero-length read is skipped before `TransportRead` is emitted, so every read has exactly one non-empty chunk to pair with. The one exception is a read that races bridge teardown — the bridge is closed but `transport.close()` has not run yet, so the channel can still read for a moment and the bridge drops the delivery — which leaves that read unpaired; expect at most a couple per connection, at the end. A ratio above 1 is otherwise only possible in a pre-#45 capture, where it was direct evidence of pump backlog. |
+| Pump-hop latency | derived | For each `InboundChunk` the script pops `TransportRead`s in FIFO order until their bytes sum to the chunk size and reports chunk time − first popped read time. After #45 this is the residual **in-callback hand-off** — the bridge lock and the FIFO append, with the `Data` copy already done before `TransportRead` — not an executor hop. In the pre-#45 Baseline it is the network-queue → cooperative-pool hop that the conversion removed, which is what the before/after delta reads. |
 | `ServiceDispatch` | interval | From the inbound-ready signal arming a pass (debounce accepts) to the armed signal being cleared: the pass beginning on `eventLoopQueue`, or teardown clearing it first. This is the debounce + queue hop that stays after #45. |
 | `ServicePass` | interval, `terminal=0/1` | One signal-driven service pass (`smb2_service`, outbound flush, timer reschedule). `terminal=1` means the seam was gone when the pass ended: the pass tore it down (service failure or flush failure) or teardown ran while the pass was already dispatched. Terminal passes are listed separately and excluded from the duration percentiles because they include teardown and context destruction. |
 | `RecvDrain` | event, bytes | One per libsmb2 drain of the FIFO: bytes copied, `0` for EOF, `-1` for would-block. Total `RecvDrain` bytes never exceed total `InboundChunk` bytes; the difference is what was still buffered when recording stopped (`buffered at end`). |
@@ -319,14 +322,55 @@ per-thread table with the main thread but no single one dominates. Run 1's recor
 of its one unpaired pass and its 21120-vs-21119 read/chunk counts. Bundles are kept locally in
 `../RandomPlayer/profiling/` (gitignored); the summaries above are the record.
 
+## After (inbound push-conversion)
+
+Captured with the inbound push-conversion (#45) by the same procedure, same device, same script.
+**Not yet captured** — filled by the operator gate (tasks 7.1–7.3 of the `inbound-push-conversion`
+change) once `6.0.0-rc5` is tagged and RandomPlayer is re-pinned to it.
+
+| Field | Value |
+|---|---|
+| Date | _pending_ |
+| Device / OS | _pending_ |
+| AMSMB2 version | _pending (6.0.0-rc5)_ |
+| RandomPlayer commit | _pending_ |
+| `xcrun xctrace version` | _pending_ |
+| Video | _pending_ |
+| Instruments | Time Profiler + os_signpost, attached to the running app, no debugger library in the process list |
+| Runs | 3 (median by `ServicePass` median duration reported) |
+
+Script output of the median run:
+
+```
+_pending_
+```
+
+Delta against the Baseline (same script, same procedure). The merge condition is no regression in
+the dispatch/pass percentiles or active throughput, and no stalls.
+
+| Metric | Baseline (rc4) | After (rc5) | Delta |
+|---|---|---|---|
+| Cooperative-pool per-thread shares | _pending_ | _pending_ | _pending_ |
+| `ServiceDispatch` median / p95 / max (ms) | _pending_ | _pending_ | _pending_ |
+| `ServicePass` median / p95 / max (ms) | _pending_ | _pending_ | _pending_ |
+| Active throughput (MB/s) | _pending_ | _pending_ | _pending_ |
+| Stalls | _pending_ | _pending_ | _pending_ |
+| Pump-hop latency median / p95 / max (ms) — residual | _pending_ | _pending_ | _pending_ |
+| Coalescing ratio | _pending_ | 1.00 (by construction) | — |
+
 ## Using the baseline
 
 For #45, #46, or any other change to the inbound path:
 
 1. Same device, same server and link, uncached videos of comparable size, three runs, report the median.
 2. Run `scripts/profile-summary.sh` on each bundle; never read numbers off the Instruments GUI.
-3. Compare against the Baseline section above; the delta on pump-hop latency, coalescing ratio,
-   per-thread cooperative-pool share and throughput is the evidence the PR must carry.
+3. Compare against the Baseline (pre-#45) and After (post-#45) sections above. The evidence a PR
+   must carry is the delta on the **per-thread shares** (the cooperative-pool threads called out
+   — the signature #45 targets), the **`ServiceDispatch` and `ServicePass` percentiles**, the
+   **active throughput**, and the **stalls**. Pump-hop latency and the coalescing ratio are no
+   longer the comparison: post-conversion the ratio is 1.00 by construction and the pump-hop row
+   is only the residual in-callback hand-off — report them, but read the delta from the four
+   metrics above.
 4. Record the new numbers under a dated subsection here when the change merges, so the next
    comparison has a baseline that matches the shipped code.
 

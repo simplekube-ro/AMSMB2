@@ -16,9 +16,12 @@ import os.signpost
 /// `os_signpost` emission points for the SMB-over-NIO inbound path (design D1/D2).
 ///
 /// The five points — `TransportRead`, `InboundChunk`, `ServiceDispatch`, `ServicePass` and
-/// `RecvDrain` — make the two executor hops of the inbound pull loop measurable: the
-/// `TransportRead → InboundChunk` gap is the cooperative-pool pump hop, and `ServiceDispatch` is
-/// the debounce-plus-event-loop-queue hop.
+/// `RecvDrain` — make the inbound path's hand-offs measurable: the `TransportRead →
+/// InboundChunk` gap is the in-callback hand-off into the bridge (the lock and the FIFO append,
+/// on the transport's own delivery queue), and `ServiceDispatch` is the one executor hop that
+/// remains — the debounce plus the event-loop queue. Before the inbound push-conversion (#45) a
+/// cooperative-pool `Task` sat between those two events and the gap was its executor hop; the
+/// baseline in `docs/PROFILING.md` records what that cost.
 ///
 /// **Reentrancy.** `os_signpost` never calls back into AMSMB2 code, so an emit inside
 /// `SMB2Client.serviceFlagLock` or `TransportBridge.lock` cannot re-enter either lock; there is
@@ -63,8 +66,9 @@ enum InboundSignposts {
         )
     }
 
-    /// A non-empty inbound chunk was delivered to the bridge's FIFO. When the pump is behind,
-    /// several `TransportRead`s coalesce into one chunk whose size is their sum.
+    /// A non-empty inbound chunk was delivered to the bridge's FIFO — emitted inside the same
+    /// transport callback as its `TransportRead`, so the two pair one-to-one (zero-length reads
+    /// are skipped before `TransportRead` is emitted, so no chunk is ever empty).
     static func chunk(bytes: Int) {
         guard log.signpostsEnabled else { return }
         os_signpost(
