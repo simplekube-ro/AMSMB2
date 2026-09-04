@@ -204,7 +204,7 @@ median duration: run 3 0.010 ms, **run 2 0.011 ms**, run 1 0.012 ms).
 | Date | 2026-09-04 |
 | Device / OS | Apple TV 4K (3rd generation) "Birou", tvOS 26.6, network-connected |
 | AMSMB2 version | 6.0.0-rc4 (b919898) |
-| RandomPlayer commit | 15654e10, pinned to AMSMB2 6.0.0-rc4 |
+| RandomPlayer commit | 92726906, pinned to AMSMB2 6.0.0-rc4 (simplekube-ro/RandomPlayer#549) |
 | `xcrun xctrace version` | xctrace version 16.0 (17F113), Xcode 26.6 |
 | Video | `8513d1_1080_8000.mp4` (106 MB, complete fill) |
 | Instruments | Time Profiler + os_signpost, attached to the running app, no debugger library in the process list |
