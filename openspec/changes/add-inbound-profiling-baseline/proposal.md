@@ -29,7 +29,7 @@ consumer app pins 6.0.0-rc3, whose inbound hot path is identical to 6.0.0-rc1).
 - **A committed capture procedure** in `docs/PROFILING.md`: Release build via the app's Profile
   action, physical device (primary target: Apple TV, the low-power streaming target), Time
   Profiler with the Hangs/GCD instruments removed and the `os_signpost` instrument filtered to
-  our subsystem, the RandomPlayer streaming + seek workload, the exact `xctrace record` /
+  our subsystem, the RandomPlayer cache-fill workload, the exact `xctrace record` /
   `xctrace export` commands, the metrics to record, and a "Baseline" section that holds the
   captured numbers (date, device, AMSMB2 version, per-thread CPU signature, throughput,
   chunk-size distribution, dispatch latency, stalls).

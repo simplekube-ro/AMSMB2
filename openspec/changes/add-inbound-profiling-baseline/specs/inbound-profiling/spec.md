@@ -103,13 +103,15 @@ whose presence in a trace's process list disqualifies it and the export command 
 them), the physical device and OS versions to record (primary target: Apple TV), the
 Instruments configuration (Time Profiler with the Hangs and GCD instruments removed, plus the
 `os_signpost` instrument filtered to `ro.SimpleKube.AMSMB2`), the equivalent `xctrace record`
-command line, the workload (steady-state playback of a named representative video over SMB
-through RandomPlayer for a fixed duration, followed by a fixed set of seeks), the metrics to
+command line, the workload (one cache fill: the consumer app caches a video on open and plays
+the local copy, so the operator attaches the recording to the idle app and then opens an
+uncached representative video of stated size, leaving it until the fill completes),
+the metrics to
 record (average CPU cores, per-thread CPU distribution with the cooperative-pool threads called
 out, sustained throughput in MB/s, inbound chunk-size distribution, the `TransportRead`-to-`InboundChunk` coalescing ratio, pump-hop
 latency from the first coalesced `TransportRead` to its `InboundChunk`, dispatch-latency
 percentiles, service-pass count and duration with terminal passes reported separately, stalls
-during playback and seeks; `TransportRead` marked as TCP-only), how to read a dispatch interval that is closed by
+during the fill and playback; `TransportRead` marked as TCP-only), how to read a dispatch interval that is closed by
 teardown with no following pass, how to run the summary script on the resulting bundle, and a
 Baseline section holding the recorded numbers together with the date, device, OS, `xctrace`
 version, and AMSMB2 version they were captured against.

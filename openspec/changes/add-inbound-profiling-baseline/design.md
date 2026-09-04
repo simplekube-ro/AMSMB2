@@ -260,9 +260,13 @@ contain `libBacktraceRecording.dylib` or `libLogRedirect.dylib`, which is the Ru
 fingerprint that disqualified both existing bundles, checked with
 `xcrun xctrace export --input <bundle> --xpath '/trace-toc/run[1]/processes'`); Instruments
 (Time Profiler template, delete the Hangs track, do not add GCD, add `os_signpost` filtered to
-the subsystem; equivalent `xcrun xctrace record --device <udid> --template 'Time Profiler'
---instrument os_signpost --time-limit 3m --launch -- <app>` form); Workload (open the named
-video, 120 s steady-state playback, then five seeks at fixed offsets, 10 s each, stop); Export
+the subsystem; equivalent `xcrun xctrace record --device <udid> --instrument 'Time Profiler'
+--instrument os_signpost --time-limit 4m --attach <pid>` form — the two instruments named
+explicitly because the template bundles Hangs, and `--attach` because `--launch` hung over the
+network-connected Apple TV); Workload (RandomPlayer caches a video on open at full speed and
+plays the local copy, so the workload is one cache fill: attach to the idle app on the browse
+screen, open an uncached video of at least 1 GB, leave it until the fill completes; playback and
+seeks never touch SMB and are not part of the workload); Export
 and summarise (the script); Metrics table with definitions, including the two hops, the coalescing ratio, `TransportRead`
 marked TCP-only, terminal passes, and the note that a `ServiceDispatch` interval closed by
 teardown with no following pass is interval hygiene, not a lost wakeup (architect review, O5); Baseline (filled by the capture task: date, device, OS,
@@ -290,8 +294,9 @@ that the library now emits signposts under `ro.SimpleKube.AMSMB2` / `Inbound`, a
 - [`os_signpost` inside `serviceFlagLock` / the bridge `lock`] → Idle: one boolean read.
   Recording: a bounded, non-blocking buffer write that never calls back into AMSMB2, so no
   reentrancy or lock-ordering hazard (D4).
-- [tvOS workload is manual; run-to-run variance] → Fixed video, fixed duration, fixed seek
-  offsets, three runs, median reported. The doc calls out that a single run is not a baseline.
+- [tvOS workload is manual; run-to-run variance] → One cache fill per run of an uncached video
+  of comparable size, three runs, median reported, per-event metrics compared rather than MB/s
+  (which the link bounds). The doc calls out that a single run is not a baseline.
 - [The Apple TV is the least convenient device to attach] → It is also the target where the
   op-count wins matter most (maintainer's choice). The doc notes the iPhone/iPad variant
   (identical steps, iOS destination) as a secondary target, without a recorded baseline.
