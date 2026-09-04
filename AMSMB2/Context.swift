@@ -1794,6 +1794,9 @@ extension SMB2Client {
         serviceFlagLock.withLock {
             if servicePending { return false }
             servicePending = true
+            // The `false → true` flip is the one place a dispatch interval opens; emitting under
+            // the lock keeps begin/end strictly ordered with the flag they bracket.
+            InboundSignposts.dispatchBegin(for: self)
             return true
         }
     }
@@ -1802,8 +1805,22 @@ extension SMB2Client {
     /// `serviceContextForSeam` drains the inbound buffer. This ordering guarantees no lost
     /// wakeup: a chunk appended after the reset (even mid-drain) re-arms a fresh pass via
     /// `consumeInboundReadySignal()`. Runs on `eventLoopQueue`.
-    func beginServicePass() {
-        serviceFlagLock.withLock { servicePending = false }
+    @discardableResult
+    func beginServicePass() -> Bool {
+        clearInboundReadySignal()
+    }
+
+    /// Clears the debounce flag and reports whether a signal was actually armed, closing the
+    /// `ServiceDispatch` interval exactly in that case. The single clearing path shared by
+    /// `beginServicePass()` and `teardownSeam()`, so an interval can never be ended twice.
+    /// Thread-safe.
+    private func clearInboundReadySignal() -> Bool {
+        serviceFlagLock.withLock {
+            let wasArmed = servicePending
+            servicePending = false
+            if wasArmed { InboundSignposts.dispatchEnd(for: self) }
+            return wasArmed
+        }
     }
 
     // MARK: No-fd servicing loop
@@ -1817,6 +1834,11 @@ extension SMB2Client {
     /// and `smb2_service_timeout` directly and do NOT route through this function.
     func serviceContextForSeam() {
         guard let context else { return }
+
+        InboundSignposts.passBegin(for: self)
+        // `teardownSeam()` nils `transportBridge` on this same queue, so reading it here covers
+        // both failure paths (this function's own, and the one inside `flushOutboundForSeam`).
+        defer { InboundSignposts.passEnd(for: self, terminal: transportBridge == nil) }
 
         // Use smb2_which_events to determine what libsmb2 currently needs, then OR in POLLIN
         // because this function is always triggered by inbound-byte readiness.
@@ -1912,7 +1934,7 @@ extension SMB2Client {
         // Reset the inbound-ready debounce so a stuck `servicePending` can never outlive the seam.
         // Without this, a client reused across a reconnect would coalesce every future signal
         // against a stale `true` and silently never schedule a service pass (connect would hang).
-        serviceFlagLock.withLock { servicePending = false }
+        _ = clearInboundReadySignal()
         if let bridge = transportBridge {
             transportBridge = nil
             bridge.close()

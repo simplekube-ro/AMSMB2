@@ -591,6 +591,7 @@ final class InboundBufferingHandler: ChannelInboundHandler, @unchecked Sendable 
         // slice — copying it here is the canonical NIO pattern and satisfies design D4
         // (copy at the boundary before the ByteBuffer may be returned to the pool).
         let received = Data(byteBuffer.readableBytesView)
+        InboundSignposts.transportRead(bytes: received.count)
 
         // Capture the continuation under the lock, then resume outside it.
         let continuation: CheckedContinuation<Data, any Error>? = lock.withLock {

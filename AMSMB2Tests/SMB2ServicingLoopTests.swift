@@ -167,6 +167,50 @@ final class SMB2ServicingLoopTests: XCTestCase, @unchecked Sendable {
         )
     }
 
+    /// WHEN the debounce is driven through the coalesce, re-arm and teardown-with-armed-signal
+    ///      sequences
+    /// THEN every accepted signal is followed by exactly one *armed* clear, and a clear with
+    ///      nothing armed reports that nothing was armed.
+    ///
+    /// This is the `ServiceDispatch` interval-pairing invariant expressed at the seam a unit test
+    /// can reach. `dispatchBegin` is emitted exactly when `consumeInboundReadySignal()` returns
+    /// `true`, and `dispatchEnd` exactly when a clear (`beginServicePass()` or `teardownSeam()`)
+    /// finds the flag armed. So "one accepted signal → one armed clear" is precisely "one begin →
+    /// one end": an interval can neither be begun twice (coalesced signals return `false`) nor
+    /// ended twice (a clear with nothing armed returns `false`). Emission itself cannot be
+    /// asserted without a recording session, so this boolean contract is what guards it.
+    func testEveryAcceptedSignalIsFollowedByExactlyOneArmedClear() throws {
+        let client = try SMB2Client(timeout: 30)
+
+        // Coalesce: one accepted signal, two coalesced — so exactly one interval is open, and
+        // exactly one clear finds it armed.
+        XCTAssertTrue(client.consumeInboundReadySignal(),
+            "the first signal of a burst arms a dispatch interval")
+        XCTAssertFalse(client.consumeInboundReadySignal(),
+            "a coalesced signal must not begin a second interval")
+        XCTAssertFalse(client.consumeInboundReadySignal(),
+            "further coalesced signals must not begin a second interval")
+        XCTAssertTrue(client.beginServicePass(),
+            "the pass that begins must report the armed signal it consumed (interval end)")
+        XCTAssertFalse(client.beginServicePass(),
+            "a clear with nothing armed must report false — an interval cannot end twice")
+
+        // Re-arm: with the pass already under way and nothing armed, a fresh signal arms a new
+        // interval, which the next pass ends.
+        XCTAssertTrue(client.consumeInboundReadySignal(),
+            "a signal after the pass began arms a fresh interval (no lost wakeup)")
+        XCTAssertTrue(client.beginServicePass(),
+            "the following pass ends exactly that fresh interval")
+
+        // Teardown with an armed signal: teardown performs the one armed clear, so no interval
+        // is left open across a reconnect and the next pass has nothing to end.
+        XCTAssertTrue(client.consumeInboundReadySignal(),
+            "an inbound-ready signal arms an interval before teardown")
+        client.teardownSeam()
+        XCTAssertFalse(client.beginServicePass(),
+            "teardown performed the one armed clear, so no interval remains to end")
+    }
+
     // MARK: - connectWithBridge: seam connect path (no poll(fd))
 
     /// WHEN `connectWithBridge` is called with a MockTransport-backed bridge

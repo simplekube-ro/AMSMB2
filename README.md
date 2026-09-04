@@ -170,6 +170,7 @@ make cleanlinuxtest   # Clean Docker build
 - **[Architecture](docs/ARCHITECTURE.md)** — Layer stack, event loop model, transport layer (Apple seam: TCP + QUIC) and socket monitoring (Linux), buffer pool, pipelined I/O, thread safety model
 - **[API Reference](docs/API.md)** — Complete reference for all public types and methods
 - **[SMB-over-QUIC interop](docs/INTEROP-QUIC.md)** — Repeatable interop procedure, server (Samba + lxin/quic) requirements and traps, and verified results
+- **[Inbound profiling](docs/PROFILING.md)** — Release-build on-device capture procedure for the SMB-over-NIO inbound path (`os_signpost` points, workload, `scripts/profile-summary.sh`) and the recorded baseline gating #45/#46
 
 ## License
 
