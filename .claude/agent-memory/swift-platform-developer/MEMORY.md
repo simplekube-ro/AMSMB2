@@ -3,8 +3,11 @@
 ## Build / verification
 - Always `--disable-sandbox`: `swift build --disable-sandbox`, `swift test --disable-sandbox [--filter X]`.
 - `swift build --build-tests --disable-sandbox` is the cheapest way to prove a TDD "red" (compile failure).
-- `make linuxtest` (Docker) works and rebuilds the whole package on Linux; grep its output for
-  `Compiling AMSMB2 <File>.swift` to *prove* a new file compiled under the `#else` (non-Network) branch.
+- `make linuxtest` (Docker) works and rebuilds the whole package on Linux. Docker here is
+  **colima**: if it errors with "Cannot connect to the Docker daemon at ~/.colima/...", run
+  `colima start` first (~30 s), then re-run. Caveat: a `Compiling AMSMB2 <File>.swift` line does
+  NOT prove the file's code compiled — a whole-file `#if canImport(Network)` file (Signposts,
+  QUIC*, TCPTransportApple) still shows that line on Linux as an empty translation unit.
 - `swiftformat` and `swift-format` are NOT installed on this machine (as of 2026-08); lint steps must be
   reported as "tool unavailable", never faked. Manual check: `awk 'length > 120'` (style limit 100/132).
 - `timeout(1)` does not exist in this zsh env (use the Bash tool's own `timeout` param).

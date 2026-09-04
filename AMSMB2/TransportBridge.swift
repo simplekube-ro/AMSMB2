@@ -343,10 +343,14 @@ final class TransportBridge: @unchecked Sendable {
                 }
             }
             inboundCount -= copied
+            InboundSignposts.recv(bytes: copied)
             return Int32(copied)
         }
 
-        if inboundEOF { return 0 }
+        if inboundEOF {
+            InboundSignposts.recv(bytes: 0)
+            return 0
+        }
 
         if inboundError != nil {
             errno = ECONNRESET
@@ -354,6 +358,7 @@ final class TransportBridge: @unchecked Sendable {
         }
 
         // Would-block: inbound buffer is empty and the transport is still open.
+        InboundSignposts.recvWouldBlock()
         errno = EAGAIN
         return -1
     }
@@ -476,6 +481,7 @@ final class TransportBridge: @unchecked Sendable {
         // at the transport boundary), avoiding a second full-payload copy. Empty chunks are
         // skipped so the FIFO head always has unconsumed bytes (cRecv's loop invariant).
         if !data.isEmpty {
+            InboundSignposts.chunk(bytes: data.count)
             inboundChunks.append(data)
             inboundCount += data.count
         }
