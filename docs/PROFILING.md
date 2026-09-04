@@ -324,39 +324,187 @@ of its one unpaired pass and its 21120-vs-21119 read/chunk counts. Bundles are k
 
 ## After (inbound push-conversion)
 
-Captured with the inbound push-conversion (#45) by the same procedure, same device, same script.
-**Not yet captured** — filled by the operator gate (tasks 7.1–7.3 of the `inbound-push-conversion`
-change) once `6.0.0-rc5` is tagged and RandomPlayer is re-pinned to it.
+Captured 2026-09-05 with the inbound push-conversion (#45, PR #67) by the same procedure on the
+same Apple TV, three runs, median run reported (median by `ServicePass` median duration: run 2
+0.008 ms, **run 3 0.009 ms**, run 1 0.016 ms).
 
 | Field | Value |
 |---|---|
-| Date | _pending_ |
-| Device / OS | _pending_ |
-| AMSMB2 version | _pending (6.0.0-rc5)_ |
-| RandomPlayer commit | _pending_ |
-| `xcrun xctrace version` | _pending_ |
-| Video | _pending_ |
+| Date | 2026-09-05 |
+| Device / OS | Apple TV 4K (3rd generation) "Birou", tvOS 26.6, network-connected |
+| AMSMB2 version | 6.0.0-rc5 (ff39d15) |
+| RandomPlayer commit | 2949293e, pinned to AMSMB2 6.0.0-rc5 (simplekube-ro/RandomPlayer#550) |
+| `xcrun xctrace version` | xctrace version 16.0 (17F113), Xcode 26.6 |
+| Video | `892bjd1_1080_8000.mp4` (491 MB, complete fill) |
 | Instruments | Time Profiler + os_signpost, attached to the running app, no debugger library in the process list |
-| Runs | 3 (median by `ServicePass` median duration reported) |
+| Runs | 3 (median reported) |
 
-Script output of the median run:
+Script output of the median run (run 3):
 
 ```
-_pending_
+Time profile: 87282 samples
+  samples   share  thread
+    17733   20.3%  Main Thread (0x193b6f)
+    10264   11.8%  RandomPlayer (0x1a1263)
+     7106    8.1%  RandomPlayer (0x1a1cae)
+     6302    7.2%  RandomPlayer (0x1a12f3)
+     5487    6.3%  RandomPlayer (0x1a1213)
+     5081    5.8%  RandomPlayer (0x1a0faa)
+     4310    4.9%  RandomPlayer (0x1a114c)
+     3419    3.9%  RandomPlayer (0x1a0fa8)
+     3403    3.9%  RandomPlayer (0x1a1cad)
+     3345    3.8%  RandomPlayer (0x1a1b23)
+     3220    3.7%  RandomPlayer (0x1a16bf)
+     3137    3.6%  RandomPlayer (0x1a12f5)
+     2183    2.5%  RandomPlayer (0x1a12f4)
+     1744    2.0%  RandomPlayer (0x1a1e76)
+     1489    1.7%  RandomPlayer (0x1a12b1)
+     1434    1.6%  RandomPlayer (0x1a1fac)
+     1314    1.5%  RandomPlayer (0x1a1df2)
+     1265    1.4%  RandomPlayer (0x1a1fb7)
+     1143    1.3%  RandomPlayer (0x1a1e77)
+      914    1.0%  RandomPlayer (0x1a1faa)
+      772    0.9%  RandomPlayer (0x1a1c5b)
+      546    0.6%  RandomPlayer (0x1a1fab)
+      376    0.4%  RandomPlayer (0x1a1fb0)
+      362    0.4%  com.apple.SwiftUI.AsyncRenderer (0x1a1e61)
+      174    0.2%  com.apple.SwiftUI.AsyncRenderer (0x1a1d2a)
+      158    0.2%  com.apple.uikit.eventfetch-thread (0x193bb4)
+       76    0.1%  RandomPlayer (0x1a10b2)
+       55    0.1%  RandomPlayer (0x1a1b22)
+       43    0.0%  com.apple.SwiftUI.AsyncRenderer (0x1a18e7)
+       40    0.0%  com.apple.coremedia.sharedRootQueue.47 (0x1a1e6c)
+       34    0.0%  com.apple.SwiftUI.AsyncRenderer (0x1a1fdf)
+       28    0.0%  com.apple.coremedia.sharedRootQueue.47 (0x1a1c7c)
+       27    0.0%  com.apple.coremedia.sharedRootQueue.47 (0x1a1d31)
+       25    0.0%  com.apple.coremedia.sharedRootQueue.47 (0x1a1d94)
+       22    0.0%  com.apple.coremedia.sharedRootQueue.47 (0x1a1ed2)
+       21    0.0%  com.apple.SwiftUI.AsyncRenderer (0x1a1bfb)
+       21    0.0%  com.apple.coremedia.sharedRootQueue.47 (0x1a11e1)
+       19    0.0%  com.apple.coremedia.sharedRootQueue.47 (0x1a1f29)
+       17    0.0%  com.apple.SwiftUI.AsyncRenderer (0x1a1279)
+       17    0.0%  com.apple.SwiftUI.AsyncRenderer (0x1a1c31)
+       14    0.0%  com.apple.SwiftUI.AsyncRenderer (0x1a1dd9)
+       12    0.0%  com.apple.SwiftUI.AsyncRenderer (0x1a1b97)
+       12    0.0%  com.apple.SwiftUI.AsyncRenderer (0x1a2040)
+       11    0.0%  com.apple.SwiftUI.AsyncRenderer (0x1a14e6)
+       11    0.0%  com.apple.SwiftUI.AsyncRenderer (0x1a1b21)
+       11    0.0%  com.apple.SwiftUI.AsyncRenderer (0x1a1cd4)
+        9    0.0%  com.apple.SwiftUI.AsyncRenderer (0x1a12f6)
+        9    0.0%  com.apple.SwiftUI.AsyncRenderer (0x1a1e38)
+        8    0.0%  com.apple.SwiftUI.AsyncRenderer (0x1a15fe)
+        8    0.0%  com.apple.SwiftUI.AsyncRenderer (0x1a1747)
+        7    0.0%  com.apple.SwiftUI.AsyncRenderer (0x1a202d)
+        7    0.0%  com.apple.coremedia.sharedRootQueue.47 (0x1a1c81)
+        6    0.0%  com.apple.SwiftUI.AsyncRenderer (0x1a1db2)
+        6    0.0%  com.apple.coremedia.sharedRootQueue.47 (0x1a1d67)
+        6    0.0%  com.apple.coremedia.sharedRootQueue.47 (0x1a1e86)
+        5    0.0%  com.apple.SwiftUI.AsyncRenderer (0x1a1ba1)
+        4    0.0%  com.apple.coremedia.sharedRootQueue.47 (0x1a1f88)
+        3    0.0%  com.apple.coremedia.sharedRootQueue.47 (0x1a110f)
+        2    0.0%  RandomPlayer (0x1a1df1)
+        2    0.0%  com.apple.coremedia.sharedRootQueue.47 (0x1a1a58)
+        1    0.0%  com.apple.coremedia.sharedRootQueue.47 (0x1a1a56)
+        1    0.0%  com.apple.coremedia.sharedRootQueue.47 (0x1a1b9f)
+        1    0.0%  com.apple.coremedia.sharedRootQueue.47 (0x1a2031)
+
+Signposts (subsystem ro.SimpleKube.AMSMB2): 213141 rows, 2826 rows from other subsystems ignored
+  TransportRead    count 26494, bytes 491356162, size min 72 / median 14480 / p95 28960 / max 262144
+  InboundChunk     count 26494, bytes 491356162, size min 72 / median 14480 / p95 28960 / max 262144
+  RecvDrain        count 54203, bytes 491377882, copied 27715, EOF 0, would-block 26488, size min 4 / median 14480 / p95 28960 / max 262144
+  ServiceDispatch  count 26487, duration ms min 0.003 / median 0.014 / p95 0.038 / max 1.460, unpaired 0
+  ServicePass      count 26488, non-terminal 26488, terminal 0, duration ms min 0.002 / median 0.009 / p95 0.035 / max 7.491, unpaired 0
+  coalescing ratio: 1.00 (26494 TransportRead / 26494 InboundChunk)
+  reads per chunk: 1 read x26494
+  zero-byte TransportRead skipped: 0
+  pump-hop latency ms: min 0.001 / median 0.002 / p95 0.007 / max 2.078 (26494 pairs, 0 pairing errors)
+  buffered at end: -21720 bytes (InboundChunk 491356162 - RecvDrain 491377882)
+  throughput: 57.963 MB/s (RecvDrain 491377882 bytes over 8.477 s)
+  active throughput: 57.963 MB/s (RecvDrain 491377882 bytes over 8.477 s active; idle gaps > 1 s excluded)
 ```
 
-Delta against the Baseline (same script, same procedure). The merge condition is no regression in
-the dispatch/pass percentiles or active throughput, and no stalls.
+Stalls observed: none in any run (no freeze, spinner or audio drop).
 
-| Metric | Baseline (rc4) | After (rc5) | Delta |
+The other two runs, for spread. All three are complete fills captured inside the window; run 1
+(`GP2449_Sara_diamante.mp4`, 399 MB) ran at 35 MB/s over 13 concurrent connections with p95
+chunks three times the size of the other runs', and is the worst of the three on every per-event
+row — it is recorded as captured, and the median rule keeps it from setting the number. The
+operator did not note run 2's file name.
+
+| Metric | Run 1 | Run 2 | Run 3 (median) |
 |---|---|---|---|
-| Cooperative-pool per-thread shares | _pending_ | _pending_ | _pending_ |
-| `ServiceDispatch` median / p95 / max (ms) | _pending_ | _pending_ | _pending_ |
-| `ServicePass` median / p95 / max (ms) | _pending_ | _pending_ | _pending_ |
-| Active throughput (MB/s) | _pending_ | _pending_ | _pending_ |
-| Stalls | _pending_ | _pending_ | _pending_ |
-| Pump-hop latency median / p95 / max (ms) — residual | _pending_ | _pending_ | _pending_ |
-| Coalescing ratio | _pending_ | 1.00 (by construction) | — |
+| Bytes drained | 399 MB | 364 MB | 491 MB |
+| Active throughput | 35.3 MB/s | 63.0 MB/s | 58.0 MB/s |
+| Connections (threads emitting `TransportRead`) | 13 | 9 | 10 |
+| Coalescing ratio | 1.00 | 1.00 | 1.00 |
+| Pump-hop latency median / p95 / max (ms), per-thread pairing | 0.002 / 0.012 / 5.551 | 0.002 / 0.008 / 0.578 | 0.002 / 0.007 / 2.078 |
+| Dispatch latency median / p95 (ms) | 0.026 / 0.104 | 0.014 / 0.040 | 0.014 / 0.038 |
+| Service pass median / p95 (ms) | 0.016 / 0.090 | 0.008 / 0.036 | 0.009 / 0.035 |
+| Chunk size median / p95 (bytes) | 15928 / 92672 | 14480 / 27512 | 14480 / 28960 |
+| Main thread share of samples | 19.5% | 42.0% | 20.3% |
+| Largest unnamed-thread share | 4.8% | 9.5% | 11.8% |
+| Global-FIFO pairing errors reported by the script | 155 | 1 | 0 |
+
+Delta against the Baseline (same script, same procedure, median run against median run). The
+merge condition was no regression in the dispatch/pass percentiles or active throughput, and no
+stalls.
+
+| Metric | Baseline (rc4, run 2) | After (rc5, run 3) | Delta |
+|---|---|---|---|
+| Per-thread shares: main / largest unnamed / next three | 17.0% / 11.3% / 7.4%, 7.0%, 6.1% | 20.3% / 11.8% / 8.1%, 7.2%, 6.3% | no visible collapse — see reading |
+| `ServiceDispatch` median / p95 / max (ms) | 0.013 / 0.026 / 1.552 | 0.014 / 0.038 / 1.460 | +0.001 / +0.012 / −0.092 |
+| `ServicePass` median / p95 / max (ms) | 0.011 / 0.032 / 0.481 | 0.009 / 0.035 / 7.491 | −18% / +0.003 / one 7.5 ms pass |
+| Active throughput (MB/s) | 54.6 | 58.0 | +6% (link-bound) |
+| Stalls | none | none | — |
+| Pump-hop latency median / p95 / max (ms) — residual | 0.016 / 0.031 / 0.372 | 0.002 / 0.007 / 2.078 | −87% / −77% / +1.7 |
+| Coalescing ratio | 1.00 | 1.00 (by construction) | — |
+| Per-chunk chain, hop + dispatch + pass medians (µs) | 16 + 13 + 11 = 40 | 2 + 14 + 9 = 25 | −38% |
+
+Reading:
+
+- The hop is gone. The `TransportRead → InboundChunk` hand-off fell from a 16 µs median to
+  2 µs (the bridge lock and the append), and in every rc5 run the set of threads emitting
+  `InboundChunk` is exactly the set emitting `TransportRead` (13 = 13, 9 = 9, 10 = 10): the
+  chunk never touches a thread other than the one the network delivered it on. In the baseline
+  the chunk was appended from the pump task.
+- The per-thread table does not show the collapse the issue expected, and it cannot: on Apple
+  platforms the Swift cooperative pool and the NIOTS event loops are both Dispatch worker
+  threads, so the unnamed `RandomPlayer (0x…)` rows were never a pool-only signature. In the
+  baseline, 12 of the 13 threads that appended chunks were also threads that read from the
+  network. The thread sets from the signposts, not the sample shares, are the structural
+  evidence.
+- Dispatch median is unchanged within the baseline's own run-to-run spread (0.013 in all three
+  baseline runs; 0.014 in the two clean rc5 runs). Dispatch p95 is 2 µs above the baseline's
+  worst run (0.038 vs 0.026–0.036). Pass median is 18% lower; pass p95 is inside the baseline
+  range (0.032–0.040). Active throughput is link-bound and unchanged. The chain from network
+  delivery to the end of the drain shortened from about 40 µs to 25 µs per chunk at the median.
+- Run 1 is an outlier on every per-event row (dispatch 0.026 / 0.104, pass 0.016 / 0.090) with
+  13 concurrent connections, three-times-larger p95 chunks and the lowest link throughput; the
+  two clean runs and the median run do not reproduce it. It is the run to re-check if #46 or a
+  later change sees a similar shape.
+
+Procedure notes from this capture:
+
+- RandomPlayer starts a fill as soon as it is launched, so the "attach while idle" step means:
+  launch, wait for that first fill to finish (or navigate to the browse screen), then attach.
+  The 15 s pre-run attach here caught 463 MB of that launch fill.
+- `xcrun xctrace record --attach <pid>` failed once with `Cannot find process for provided pid`
+  for a pid that `devicectl device info processes` had just listed; the identical command a
+  minute later attached. Retry before falling back to `--attach RandomPlayer`.
+- The script pairs `TransportRead` to `InboundChunk` in one global FIFO across all connections.
+  RandomPlayer fills over 9–13 connections at once, so when two connections' reads interleave
+  the global pairing reports overshoot/underflow pairs that are not real (run 1: 155; run 2: 1;
+  run 3: 0). After the conversion every read and its chunk are on one thread, so pairing keyed
+  by thread is exact: recomputed that way the three runs give 15141 / 19708 / 26494 pairs with
+  at most one attach carry-over each and the same latency percentiles the script prints for
+  run 3. Keying the script's pairing by thread is a follow-up; until then read the hop row from
+  a run with zero reported errors, or recompute per thread.
+- Attach carry-over as documented above: run 3's `buffered at end` is −21720 bytes (one chunk
+  appended before the attach, drained inside it); runs 1 and 2 each have one `InboundChunk`
+  whose `TransportRead` preceded the attach.
+
+Bundles are kept locally in `../RandomPlayer/profiling/` as `rc5-run{1,2,3}.trace` (gitignored);
+the summaries above are the record.
 
 ## Using the baseline
 
