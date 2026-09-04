@@ -190,7 +190,7 @@ extension SMB2DisconnectReclaimTests {
         weak var weakClient: SMB2Client?
         weakClient = client
 
-        var bridge: TransportBridge? = TransportBridge(transport: MockTransport(sendsAreDropped: true))
+        var bridge: TransportBridge? = TransportBridge(transport: MockTransport())
         weak var weakBridge: TransportBridge?
         weakBridge = bridge
 

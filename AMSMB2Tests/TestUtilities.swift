@@ -43,6 +43,72 @@ func waitUntil(timeout: TimeInterval = 5, condition: () -> Bool) async -> Bool {
     return condition()
 }
 
+// MARK: - Inbound Recorder
+
+/// Records what a push transport delivers to the `onReceive` handler it was given at connect.
+///
+/// The receiver every `SMBTransport` conformer test passes to `connect(host:port:onReceive:)`:
+/// deliveries are appended under a lock (they arrive on the transport's own network queue) and
+/// read back from the test's task. `Result<Data, POSIXError>` mirrors the seam payload exactly,
+/// so a test asserts on the same values libsmb2's bridge would see.
+final class InboundRecorder: @unchecked Sendable {
+    /// The recorded state lives in its own reference so the stored `handler` closure captures
+    /// *it* rather than the recorder — a closure capturing `self` would make the recorder and
+    /// its handler a retain cycle that outlives every test that builds one.
+    private final class Storage: @unchecked Sendable {
+        let lock = NSLock()
+        var deliveries: [Result<Data, POSIXError>] = []
+    }
+
+    private let storage = Storage()
+
+    /// The `onReceive` handler to hand to `connect(host:port:onReceive:)`. Stored, so every
+    /// caller passes the same closure.
+    let handler: InboundReceiver
+
+    init() {
+        let storage = storage
+        handler = { result in
+            storage.lock.lock()
+            storage.deliveries.append(result)
+            storage.lock.unlock()
+        }
+    }
+
+    /// Every delivery so far, in arrival order.
+    var deliveries: [Result<Data, POSIXError>] {
+        storage.lock.lock()
+        defer { storage.lock.unlock() }
+        return storage.deliveries
+    }
+
+    /// Number of deliveries recorded so far.
+    var deliveryCount: Int {
+        storage.lock.lock()
+        defer { storage.lock.unlock() }
+        return storage.deliveries.count
+    }
+
+    /// The successfully delivered payloads, in arrival order (an empty `Data` is graceful EOF).
+    var deliveredData: [Data] {
+        deliveries.compactMap { try? $0.get() }
+    }
+
+    /// The failures delivered, in arrival order.
+    var deliveredErrors: [POSIXError] {
+        deliveries.compactMap {
+            if case .failure(let error) = $0 { return error }
+            return nil
+        }
+    }
+
+    /// Waits until at least `count` deliveries have been recorded, returning whether they were.
+    @discardableResult
+    func waitForDeliveries(count: Int, timeout: TimeInterval = 5) async -> Bool {
+        await waitUntil(timeout: timeout) { self.deliveryCount >= count }
+    }
+}
+
 // MARK: - Integration Test Base Class
 
 class SMBIntegrationTestCase: XCTestCase, @unchecked Sendable {

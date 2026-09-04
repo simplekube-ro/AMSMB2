@@ -302,7 +302,8 @@ final class BridgeOwnershipConnectTests: XCTestCase, @unchecked Sendable {
 // MARK: - Gated outcome transport (test double)
 
 /// A controllable `SMBTransport` whose eager `connect` parks (when `gated`) until `openGate()` and
-/// then completes with a configured `outcome`, and whose `close()` invocations are counted. Lets
+/// then completes with a configured `outcome`, and whose `close()` invocations are counted. It
+/// never delivers anything inbound, so the receiver it is handed is ignored. Lets
 /// tests drive the D12 cancellation-versus-eager-completion races deterministically: cancel the
 /// task while `connect` is parked, then release the gate to complete the connect after
 /// cancellation has won the handoff.
@@ -324,7 +325,10 @@ actor GatedOutcomeTransport: SMBTransport {
         self.gateOpened = !gated
     }
 
-    func connect(host _: String, port _: Int) async throws {
+    func connect(
+        host _: String, port _: Int,
+        onReceive _: @escaping InboundReceiver
+    ) async throws {
         isConnecting = true
         connectingWaiter?.resume()
         connectingWaiter = nil
@@ -343,12 +347,6 @@ actor GatedOutcomeTransport: SMBTransport {
     }
 
     func send(_: Data) async throws {}
-
-    /// Not exercised by the connect-phase tests (installation never starts on a cancellation or
-    /// eager-failure win). Return EOF immediately if ever called.
-    func receive() async throws -> Data {
-        Data()
-    }
 
     func close() async {
         closeCount += 1

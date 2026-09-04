@@ -1,9 +1,4 @@
-# transport-seam Specification
-
-## Purpose
-Define the abstraction boundary that decouples the SMB2 client from any specific wire implementation. The library SHALL provide a public `SMBTransport` protocol (NIO-free, libsmb2-free, `Data`-based) with an async connect that takes the inbound receiver, plus send/close, a public `SMBTransportKind` enum selecting `tcp`/`quic`/`automatic`, and full Swift 6 strict-concurrency compliance. The test target SHALL provide a `MockTransport` in-memory push double supporting injected inbound chunks, graceful EOF, errors, connection failure and never-replying, plus an observable sent log, so bridge and servicing tests run with no real socket and no libsmb2 dependency.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: SMBTransport protocol abstracts the wire layer
 
@@ -55,33 +50,19 @@ registration step: a connection cannot exist without its receiver.
 - **WHEN** `connect(host:port:onReceive:)` throws
 - **THEN** the handler passed to that call is never invoked
 
-### Requirement: SMBTransportKind enumerates selectable transports
+## REMOVED Requirements
 
-The library SHALL define a public `SMBTransportKind` enum with `tcp`, `quic`, and `automatic`
-cases, used to select which transport a connection uses. The `.quic` case SHALL select the
-implemented SMB-over-QUIC transport (`QUICTransportApple`) on supported OS versions; it is no
-longer a reserved placeholder.
+### Requirement: MockTransport in-memory loopback double
 
-#### Scenario: Kind cases exist and are Sendable
+**Reason**: The seam no longer has a `receive()` for a send-loopback to feed; a mock that echoed
+sent bytes back as inbound data would also feed libsmb2's own PDUs back to it, which the previous
+`sendsAreDropped` flag existed to suppress.
 
-- **WHEN** `SMBTransportKind` is referenced from Swift
-- **THEN** the cases `.tcp`, `.quic`, and `.automatic` are available
-- **AND** the type conforms to `Sendable`
+**Migration**: Replaced by "MockTransport in-memory push double" below. Tests that read
+`receive()` to observe sent bytes read the mock's sent log instead; tests that used the loopback
+to produce inbound data inject it through the mock's delivery helpers.
 
-#### Scenario: quic is an implemented kind
-
-- **WHEN** `.quic` is used to open a connection on a supported OS version
-- **THEN** the connection is carried by `QUICTransportApple` (not rejected with `ENOTSUP`)
-
-### Requirement: Seam satisfies Swift 6 strict concurrency
-
-`SMBTransport` SHALL be `Sendable`, and all seam types SHALL compile under
-`-strict-concurrency=complete` with zero new warnings.
-
-#### Scenario: No concurrency warnings
-
-- **WHEN** the seam types are compiled with complete strict-concurrency checking
-- **THEN** there are zero new Sendable or actor-isolation warnings
+## ADDED Requirements
 
 ### Requirement: MockTransport in-memory push double
 

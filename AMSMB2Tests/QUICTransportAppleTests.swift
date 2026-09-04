@@ -459,20 +459,18 @@ final class QUICTransportAppleTests: XCTestCase, @unchecked Sendable {
         XCTFail("timed out waiting: \(message)", file: file, line: line)
     }
 
-    // MARK: - 2.2 Skeleton / close / receive contracts
+    // MARK: - 2.2 Skeleton / close / delivery contracts
 
-    /// Never-connected `receive()` → `ENOTCONN`: distinguishes "never connected" from
-    /// "connected, then closed" (which returns empty `Data`).
-    func testReceiveOnNeverConnectedThrowsENOTCONN() async {
-        let transport = makeTransport(ScriptedQUICDriver(), ManualDeadlineScheduler())
-        do {
-            _ = try await transport.receive()
-            XCTFail("never-connected receive must throw ENOTCONN")
-        } catch let posix as POSIXError {
-            XCTAssertEqual(posix.code, .ENOTCONN)
-        } catch {
-            XCTFail("expected POSIXError(.ENOTCONN), got \(error)")
-        }
+    /// A never-connected transport holds no handler: nothing was supplied (there is no connect
+    /// to supply it), so closing or releasing it delivers nothing and releases nothing twice.
+    func testNeverConnectedTransportHoldsNoHandler() async {
+        let driver = ScriptedQUICDriver()
+        let transport = makeTransport(driver, ManualDeadlineScheduler())
+        XCTAssertFalse(transport.hasInboundHandler, "a transport that never connected holds no receiver")
+        await transport.close()
+        XCTAssertFalse(transport.hasInboundHandler)
+        XCTAssertFalse(driver.didStart, "a never-connected transport never starts a driver")
+        XCTAssertEqual(driver.cancelCount, 0, "a never-started driver is never cancelled")
     }
 
     /// Double `close()` is a no-op and does not crash.
@@ -482,12 +480,24 @@ final class QUICTransportAppleTests: XCTestCase, @unchecked Sendable {
         await transport.close() // must not crash / double-release.
     }
 
-    /// `receive()` after `close()` returns empty `Data` without throwing.
-    func testReceiveAfterCloseReturnsEmptyData() async throws {
-        let transport = makeTransport(ScriptedQUICDriver(), ManualDeadlineScheduler())
+    /// `close()` on an established connection makes no inbound delivery and releases the handler.
+    ///
+    /// WHY: a local, expected shutdown never surfaces on the inbound side at all — matching
+    /// `TCPTransportApple`, so the `TransportBridge` sees the identical silent teardown on both
+    /// conformers — and a conformer that kept the closure would retain a dead bridge's handler.
+    func testCloseMakesNoInboundDeliveryAndReleasesTheHandler() async throws {
+        let recorder = InboundRecorder()
+        let (transport, driver) = try await connectedTransport(recorder: recorder)
+        XCTAssertTrue(transport.hasInboundHandler, "a connected transport holds its receiver")
+
         await transport.close()
-        let data = try await transport.receive()
-        XCTAssertEqual(data, Data(), "receive after close is the close EOF signal")
+        driver.emit(.cancelled) // our own cancel's ack — must deliver nothing.
+
+        XCTAssertEqual(recorder.deliveryCount, 0, "close() delivers nothing on the inbound side")
+        XCTAssertFalse(transport.hasInboundHandler, "the handler is released once close() completes")
+        // The driver holds the transport weakly (in production the bridge owns it), so the
+        // test must keep it alive across the deliveries above.
+        withExtendedLifetime(transport) {}
     }
 
     /// `send(_:)` on a never-connected transport → `ENOTCONN`. `ENOTCONN` is the transport's
@@ -509,17 +519,18 @@ final class QUICTransportAppleTests: XCTestCase, @unchecked Sendable {
     /// `send(_:)` after a successful connect followed by `close()` → `ENOTCONN`.
     ///
     /// WHY this matters: the two directions are deliberately asymmetric after a local close.
-    /// `receive()` returns empty `Data` because that empty `Data` *is* the teardown signal the
-    /// `TransportBridge` inbound pump consumes; the outbound direction has no such convention, so
-    /// a write with nowhere to go must surface as an error rather than silently succeeding. This
+    /// The inbound side is simply silent (a local close is never delivered to the handler); the
+    /// outbound direction has no such convention, so a write with nowhere to go must surface as
+    /// an error rather than silently succeeding. This
     /// mirrors `TCPTransportApple`, whose `close()` nils `_channel` so `send` hits the identical
     /// `ENOTCONN` guard — if this ever diverged, the two conformers would report different errors
     /// for the same post-teardown write.
     func testSendAfterCloseThrowsENOTCONN() async throws {
+        let recorder = InboundRecorder()
         let driver = ScriptedQUICDriver()
         let transport = makeTransport(driver, ManualDeadlineScheduler())
 
-        let task = Task { try await transport.connect(host: "fs.example.com", port: 443) }
+        let task = Task { try await transport.connect(host: "fs.example.com", port: 443, onReceive: recorder.handler) }
         await waitUntil({ driver.didStart }, "driver started")
         driver.emit(.ready)
         try await task.value
@@ -542,11 +553,12 @@ final class QUICTransportAppleTests: XCTestCase, @unchecked Sendable {
     /// Successful connect: `.ready` wins, the connection is retained (send works), and the
     /// deadline timer is cancelled while the connection is NOT cancelled.
     func testReadyResolvesSuccessAndKeepsConnection() async throws {
+        let recorder = InboundRecorder()
         let driver = ScriptedQUICDriver()
         let scheduler = ManualDeadlineScheduler()
         let transport = makeTransport(driver, scheduler)
 
-        let task = Task { try await transport.connect(host: "fs.example.com", port: 443) }
+        let task = Task { try await transport.connect(host: "fs.example.com", port: 443, onReceive: recorder.handler) }
         await waitUntil({ driver.didStart }, "driver started")
         XCTAssertEqual(scheduler.scheduledTimeout, 30, "deadline armed from connectTimeout")
         driver.emit(.ready)
@@ -564,11 +576,12 @@ final class QUICTransportAppleTests: XCTestCase, @unchecked Sendable {
     /// ends a wait. WHY: classifying `.waiting` (this change) must not regress the transient
     /// class into the new fail-fast path; the still-armed deadline is what bounds a stuck wait.
     func testWaitingIsNonTerminalThenReadySucceeds() async throws {
+        let recorder = InboundRecorder()
         let driver = ScriptedQUICDriver()
         let scheduler = ManualDeadlineScheduler()
         let transport = makeTransport(driver, scheduler)
 
-        let task = Task { try await transport.connect(host: "h", port: 443) }
+        let task = Task { try await transport.connect(host: "h", port: 443, onReceive: recorder.handler) }
         await waitUntil({ driver.didStart }, "driver started")
         driver.emit(.setup)
         driver.emit(.preparing)
@@ -585,11 +598,12 @@ final class QUICTransportAppleTests: XCTestCase, @unchecked Sendable {
 
     /// `.failed` during connect maps to the `POSIXError` and cancels/releases the connection.
     func testFailedResolvesMappedPOSIXError() async {
+        let recorder = InboundRecorder()
         let driver = ScriptedQUICDriver()
         let scheduler = ManualDeadlineScheduler()
         let transport = makeTransport(driver, scheduler)
 
-        let task = Task { try await transport.connect(host: "h", port: 443) }
+        let task = Task { try await transport.connect(host: "h", port: 443, onReceive: recorder.handler) }
         await waitUntil({ driver.didStart }, "driver started")
         driver.emit(.failed(POSIXError(.ECONNREFUSED)))
 
@@ -602,6 +616,7 @@ final class QUICTransportAppleTests: XCTestCase, @unchecked Sendable {
             XCTFail("expected POSIXError, got \(error)")
         }
         XCTAssertEqual(driver.cancelCount, 1, "a losing outcome cancels the connection exactly once")
+        XCTAssertEqual(recorder.deliveryCount, 0, "a failed connect delivers nothing to its handler")
     }
 
     /// Spec "Fatal waiting fails fast": a fatal `.waiting` (a TLS handshake/trust rejection)
@@ -636,6 +651,7 @@ final class QUICTransportAppleTests: XCTestCase, @unchecked Sendable {
     /// `Task.checkCancellation()` and the continuation store: cancelling the current task there
     /// exercises the store's cancellation re-check at any executor width.
     func testCancellationBeforeStartThrowsAndNeverStartsDriver() async {
+        let recorder = InboundRecorder()
         let driver = ScriptedQUICDriver()
         let scheduler = ManualDeadlineScheduler()
         let transport = QUICTransportApple(
@@ -648,7 +664,7 @@ final class QUICTransportAppleTests: XCTestCase, @unchecked Sendable {
             deadline: scheduler
         )
 
-        let task = Task { try await transport.connect(host: "h", port: 443) }
+        let task = Task { try await transport.connect(host: "h", port: 443, onReceive: recorder.handler) }
         do {
             try await task.value
             XCTFail("cancel before start must throw")
@@ -664,11 +680,12 @@ final class QUICTransportAppleTests: XCTestCase, @unchecked Sendable {
     /// Cancellation while `.waiting`: the cancellation claims the outcome, cancels the connection
     /// exactly once, and connect throws `CancellationError`.
     func testCancellationWhileWaitingClaimsAndCancels() async {
+        let recorder = InboundRecorder()
         let driver = ScriptedQUICDriver()
         let scheduler = ManualDeadlineScheduler()
         let transport = makeTransport(driver, scheduler)
 
-        let task = Task { try await transport.connect(host: "h", port: 443) }
+        let task = Task { try await transport.connect(host: "h", port: 443, onReceive: recorder.handler) }
         await waitUntil({ driver.didStart }, "driver started")
         driver.emit(.waiting(POSIXError(.ETIMEDOUT), .transient)) // driver holds .waiting.
         task.cancel()
@@ -682,16 +699,18 @@ final class QUICTransportAppleTests: XCTestCase, @unchecked Sendable {
             XCTFail("expected CancellationError, got \(error)")
         }
         XCTAssertEqual(driver.cancelCount, 1, "exactly one cancel() issued")
+        XCTAssertEqual(recorder.deliveryCount, 0, "a cancelled connect delivers nothing to its handler")
     }
 
     /// Ready-versus-cancel, ready wins: a cancel arriving after `.ready` performs NO `cancel()`
     /// and the connection stays usable.
     func testReadyWinsRaceLosingCancelHasNoSideEffect() async throws {
+        let recorder = InboundRecorder()
         let driver = ScriptedQUICDriver()
         let scheduler = ManualDeadlineScheduler()
         let transport = makeTransport(driver, scheduler)
 
-        let task = Task { try await transport.connect(host: "h", port: 443) }
+        let task = Task { try await transport.connect(host: "h", port: 443, onReceive: recorder.handler) }
         await waitUntil({ driver.didStart }, "driver started")
         driver.emit(.ready)
         try await task.value // ready won.
@@ -705,11 +724,12 @@ final class QUICTransportAppleTests: XCTestCase, @unchecked Sendable {
     /// Ready-versus-cancel, cancel wins: cancellation claims first, then a late `.ready` is a
     /// no-op; connect throws `CancellationError`, exactly one `cancel()`.
     func testCancelWinsRaceLateReadyIsNoOp() async {
+        let recorder = InboundRecorder()
         let driver = ScriptedQUICDriver()
         let scheduler = ManualDeadlineScheduler()
         let transport = makeTransport(driver, scheduler)
 
-        let task = Task { try await transport.connect(host: "h", port: 443) }
+        let task = Task { try await transport.connect(host: "h", port: 443, onReceive: recorder.handler) }
         await waitUntil({ driver.didStart }, "driver started")
         task.cancel()
         // Give onCancel time to claim, then a late .ready must not resurrect success.
@@ -729,11 +749,12 @@ final class QUICTransportAppleTests: XCTestCase, @unchecked Sendable {
     /// Ready-versus-cancel, cancel wins, with a late `.failed` (sibling of the late-`.ready`
     /// case): cancellation claims first, then a late `.failed` is a no-op.
     func testCancelWinsRaceLateFailedIsNoOp() async {
+        let recorder = InboundRecorder()
         let driver = ScriptedQUICDriver()
         let scheduler = ManualDeadlineScheduler()
         let transport = makeTransport(driver, scheduler)
 
-        let task = Task { try await transport.connect(host: "h", port: 443) }
+        let task = Task { try await transport.connect(host: "h", port: 443, onReceive: recorder.handler) }
         await waitUntil({ driver.didStart }, "driver started")
         task.cancel()
         await waitUntil({ driver.cancelCount == 1 }, "cancel claimed")
@@ -754,6 +775,7 @@ final class QUICTransportAppleTests: XCTestCase, @unchecked Sendable {
     /// entirely — the setup body performs no side effects once the claim is consumed (design D7).
     /// Driven deterministically by a scheduler that fires synchronously inside `schedule()`.
     func testDeadlineWinsBeforeStartSuppressesDriverStart() async {
+        let recorder = InboundRecorder()
         let driver = ScriptedQUICDriver()
         let scheduler = ImmediateFireScheduler()
         let transport = QUICTransportApple(
@@ -763,7 +785,7 @@ final class QUICTransportAppleTests: XCTestCase, @unchecked Sendable {
             deadline: scheduler
         )
 
-        let task = Task { try await transport.connect(host: "h", port: 443) }
+        let task = Task { try await transport.connect(host: "h", port: 443, onReceive: recorder.handler) }
         do {
             try await task.value
             XCTFail("deadline win must throw")
@@ -799,10 +821,11 @@ final class QUICTransportAppleTests: XCTestCase, @unchecked Sendable {
     /// after `close()` has returned. Proven by ordering `close-returned` in the same
     /// event stream as `start`/`cancel`.
     func testCloseInCommitToStartGapWaitsForTeardownAndCancelsAfterStartOnce() async {
+        let recorder = InboundRecorder()
         let driver = GatedStartDriver()
         let transport = makeGatedTransport(driver, ManualDeadlineScheduler())
 
-        let task = Task { try await transport.connect(host: "h", port: 443) }
+        let task = Task { try await transport.connect(host: "h", port: 443, onReceive: recorder.handler) }
         await waitUntil({ driver.didEnterStart }, "transport committed toward start")
 
         let closeDone = TestFlag()
@@ -841,10 +864,11 @@ final class QUICTransportAppleTests: XCTestCase, @unchecked Sendable {
     /// Regression (P1): two concurrent `close()` callers racing the same commit-to-start gap
     /// must BOTH wait for the same teardown, and the teardown still cancels exactly once.
     func testConcurrentClosesInCommitToStartGapBothWaitForTeardownOneCancel() async {
+        let recorder = InboundRecorder()
         let driver = GatedStartDriver()
         let transport = makeGatedTransport(driver, ManualDeadlineScheduler())
 
-        let task = Task { try await transport.connect(host: "h", port: 443) }
+        let task = Task { try await transport.connect(host: "h", port: 443, onReceive: recorder.handler) }
         await waitUntil({ driver.didEnterStart }, "transport committed toward start")
 
         let firstDone = TestFlag()
@@ -885,10 +909,11 @@ final class QUICTransportAppleTests: XCTestCase, @unchecked Sendable {
     /// subsequent `close()` must still wait for the committed start's teardown — otherwise the
     /// driver would start after `close()` returned even though close never owned the claim.
     func testCloseAfterCancelParkedLossWaitsForTeardown() async {
+        let recorder = InboundRecorder()
         let driver = GatedStartDriver()
         let transport = makeGatedTransport(driver, ManualDeadlineScheduler())
 
-        let task = Task { try await transport.connect(host: "h", port: 443) }
+        let task = Task { try await transport.connect(host: "h", port: 443, onReceive: recorder.handler) }
         await waitUntil({ driver.didEnterStart }, "transport committed toward start")
         task.cancel() // parks the loss in the gap; teardown is now pending.
 
@@ -923,10 +948,11 @@ final class QUICTransportAppleTests: XCTestCase, @unchecked Sendable {
     /// Regression (P1): task cancellation winning in the commit-to-start gap — same contract as
     /// the close-in-gap case, surfacing `CancellationError`.
     func testTaskCancelInCommitToStartGapCancelsAfterStartExactlyOnce() async {
+        let recorder = InboundRecorder()
         let driver = GatedStartDriver()
         let transport = makeGatedTransport(driver, ManualDeadlineScheduler())
 
-        let task = Task { try await transport.connect(host: "h", port: 443) }
+        let task = Task { try await transport.connect(host: "h", port: 443, onReceive: recorder.handler) }
         await waitUntil({ driver.didEnterStart }, "transport committed toward start")
         task.cancel() // loser in the gap.
         XCTAssertEqual(driver.events, [], "no cancel may precede the driver's start side effect")
@@ -949,11 +975,12 @@ final class QUICTransportAppleTests: XCTestCase, @unchecked Sendable {
     /// Regression (P1): deadline expiry winning in the commit-to-start gap — same contract,
     /// surfacing `POSIXError(.ETIMEDOUT)`.
     func testDeadlineInCommitToStartGapCancelsAfterStartExactlyOnce() async {
+        let recorder = InboundRecorder()
         let driver = GatedStartDriver()
         let scheduler = ManualDeadlineScheduler()
         let transport = makeGatedTransport(driver, scheduler)
 
-        let task = Task { try await transport.connect(host: "h", port: 443) }
+        let task = Task { try await transport.connect(host: "h", port: 443, onReceive: recorder.handler) }
         await waitUntil({ driver.didEnterStart }, "transport committed toward start")
         scheduler.fireNow() // loser in the gap.
         XCTAssertEqual(driver.events, [], "no cancel may precede the driver's start side effect")
@@ -979,10 +1006,11 @@ final class QUICTransportAppleTests: XCTestCase, @unchecked Sendable {
     /// `handleFailed` (design D2) is only safe if it inherits the parked-loss handoff —
     /// cancelling inside the window would cancel a driver before its start side effect.
     func testFatalWaitingInCommitToStartGapCancelsAfterStartExactlyOnce() async {
+        let recorder = InboundRecorder()
         let driver = GatedStartDriver()
         let transport = makeGatedTransport(driver, ManualDeadlineScheduler())
 
-        let task = Task { try await transport.connect(host: "h", port: 443) }
+        let task = Task { try await transport.connect(host: "h", port: 443, onReceive: recorder.handler) }
         await waitUntil({ driver.didEnterStart }, "transport committed toward start")
         driver.emit(.waiting(POSIXError(.EPROTO), .fatal)) // loser parked inside the window.
         XCTAssertEqual(driver.events, [], "no cancel may precede the driver's start side effect")
@@ -1005,11 +1033,12 @@ final class QUICTransportAppleTests: XCTestCase, @unchecked Sendable {
     /// Failure-versus-cancel: whichever is emitted first wins; the other is a no-op. Here the
     /// failure wins and the late cancel performs nothing extra.
     func testFailureWinsRaceLateCancelIsNoOp() async {
+        let recorder = InboundRecorder()
         let driver = ScriptedQUICDriver()
         let scheduler = ManualDeadlineScheduler()
         let transport = makeTransport(driver, scheduler)
 
-        let task = Task { try await transport.connect(host: "h", port: 443) }
+        let task = Task { try await transport.connect(host: "h", port: 443, onReceive: recorder.handler) }
         await waitUntil({ driver.didStart }, "driver started")
         driver.emit(.failed(POSIXError(.ECONNRESET)))
 
@@ -1028,11 +1057,12 @@ final class QUICTransportAppleTests: XCTestCase, @unchecked Sendable {
     /// `close()` while connecting wins the claim: the connection is cancelled once and connect
     /// throws `POSIXError(.ECONNABORTED)`.
     func testCloseWhileConnectingThrowsECONNABORTED() async {
+        let recorder = InboundRecorder()
         let driver = ScriptedQUICDriver()
         let scheduler = ManualDeadlineScheduler()
         let transport = makeTransport(driver, scheduler)
 
-        let task = Task { try await transport.connect(host: "h", port: 443) }
+        let task = Task { try await transport.connect(host: "h", port: 443, onReceive: recorder.handler) }
         await waitUntil({ driver.didStart }, "driver started")
         await transport.close()
 
@@ -1050,11 +1080,12 @@ final class QUICTransportAppleTests: XCTestCase, @unchecked Sendable {
     /// Deadline expiry before `.ready`: the scheduler fires, the connection is cancelled once, and
     /// connect throws `POSIXError(.ETIMEDOUT)` whose description mentions the last `.waiting` error.
     func testDeadlineExpiryThrowsETIMEDOUT() async {
+        let recorder = InboundRecorder()
         let driver = ScriptedQUICDriver()
         let scheduler = ManualDeadlineScheduler()
         let transport = makeTransport(driver, scheduler, connectTimeout: 12)
 
-        let task = Task { try await transport.connect(host: "h", port: 443) }
+        let task = Task { try await transport.connect(host: "h", port: 443, onReceive: recorder.handler) }
         await waitUntil({ driver.didStart }, "driver started")
         driver.emit(.waiting(POSIXError(.EHOSTUNREACH), .transient))
         scheduler.fireNow()
@@ -1072,6 +1103,7 @@ final class QUICTransportAppleTests: XCTestCase, @unchecked Sendable {
             XCTFail("expected POSIXError(.ETIMEDOUT), got \(error)")
         }
         XCTAssertEqual(driver.cancelCount, 1, "deadline cancels the connection once")
+        XCTAssertEqual(recorder.deliveryCount, 0, "a timed-out connect delivers nothing to its handler")
     }
 
     /// Spec "Deadline expiry" + "No double resume": a fatal `.waiting` that arrives after the
@@ -1103,11 +1135,12 @@ final class QUICTransportAppleTests: XCTestCase, @unchecked Sendable {
 
     /// A deadline that fires AFTER `.ready` has won is a side-effect-free no-op.
     func testDeadlineAfterReadyIsNoOp() async throws {
+        let recorder = InboundRecorder()
         let driver = ScriptedQUICDriver()
         let scheduler = ManualDeadlineScheduler()
         let transport = makeTransport(driver, scheduler)
 
-        let task = Task { try await transport.connect(host: "h", port: 443) }
+        let task = Task { try await transport.connect(host: "h", port: 443, onReceive: recorder.handler) }
         await waitUntil({ driver.didStart }, "driver started")
         driver.emit(.ready)
         try await task.value
@@ -1118,116 +1151,287 @@ final class QUICTransportAppleTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(driver.sentChunks, [Data([0x03])], "connection still usable")
     }
 
-    // MARK: - 2.5 send / receive + D8 established-connection lifecycle
+    // MARK: - 2.5 send / pushed inbound delivery + D8 established-connection lifecycle
 
-    /// Peer-originated graceful EOF: an empty inbound delivery resumes a parked `receive()` with
-    /// empty `Data`.
-    func testPeerGracefulEOFReturnsEmptyData() async throws {
-        let (transport, driver) = try await connectedTransport()
-        async let received = transport.receive()
-        await waitUntil({ true }, "scheduled") // let receive() park.
-        try? await Task.sleep(nanoseconds: 5_000_000)
+    /// Peer-originated graceful EOF: an empty inbound delivery reaches the handler exactly once.
+    func testPeerGracefulEOFDeliversEmptyDataOnce() async throws {
+        let recorder = InboundRecorder()
+        let (transport, driver) = try await connectedTransport(recorder: recorder)
+
         driver.deliver(.success(Data())) // stream EOF.
-        let data = try await received
-        XCTAssertEqual(data, Data(), "peer EOF surfaces as empty Data")
+
+        XCTAssertEqual(recorder.deliveredData, [Data()], "peer EOF surfaces as one empty delivery")
+        // The driver holds the transport weakly (in production the bridge owns it), so the
+        // test must keep it alive across the deliveries above.
+        withExtendedLifetime(transport) {}
     }
 
-    /// Inbound bytes buffer when they arrive before a `receive()`, then drain FIFO.
-    func testInboundBuffersThenDrains() async throws {
-        let (transport, driver) = try await connectedTransport()
+    /// Chunks are delivered in arrival order, each as its own delivery — the transport holds no
+    /// buffer, so nothing waits for a consumer and nothing is coalesced.
+    func testInboundChunksAreDeliveredInArrivalOrder() async throws {
+        let recorder = InboundRecorder()
+        let (transport, driver) = try await connectedTransport(recorder: recorder)
+
         driver.deliver(.success(Data([0xaa, 0xbb])))
         driver.deliver(.success(Data([0xcc])))
-        let first = try await transport.receive()
-        let second = try await transport.receive()
-        XCTAssertEqual(first, Data([0xaa, 0xbb]))
-        XCTAssertEqual(second, Data([0xcc]))
+
+        XCTAssertEqual(recorder.deliveredData, [Data([0xaa, 0xbb]), Data([0xcc])])
+        // The driver holds the transport weakly (in production the bridge owns it), so the
+        // test must keep it alive across the deliveries above.
+        withExtendedLifetime(transport) {}
     }
 
-    /// Local close then `.cancelled`: the parked `receive()` sees empty `Data`, and the trailing
-    /// `.cancelled` event is a no-op (never abnormal loss). Subsequent receive stays empty.
+    /// Local close then `.cancelled`: the close itself delivers nothing, and the trailing
+    /// `.cancelled` event is a no-op (never abnormal loss).
     func testLocalCloseThenCancelledIsNotAbnormalLoss() async throws {
-        let (transport, driver) = try await connectedTransport()
-        async let parked = transport.receive()
-        try? await Task.sleep(nanoseconds: 5_000_000)
-        await transport.close() // records local-close cause before cancel.
-        let data = try await parked
-        XCTAssertEqual(data, Data(), "local close resumes the parked receiver with empty Data")
+        let recorder = InboundRecorder()
+        let (transport, driver) = try await connectedTransport(recorder: recorder)
 
+        await transport.close() // records local-close cause before cancel.
         driver.emit(.cancelled) // our own cancel's ack — must be a no-op.
-        let again = try await transport.receive()
-        XCTAssertEqual(again, Data(), "post-close receive stays empty; cancelled did not become an error")
+
+        XCTAssertEqual(
+            recorder.deliveryCount, 0,
+            "a local close is silent inbound, and its own .cancelled never becomes an error"
+        )
+        // The driver holds the transport weakly (in production the bridge owns it), so the
+        // test must keep it alive across the deliveries above.
+        withExtendedLifetime(transport) {}
     }
 
     /// `.cancelled` racing a local close has one deterministic winner: close records `.closed`
-    /// first, so the trailing `.cancelled` never overwrites the empty-Data result.
+    /// first, so the trailing `.cancelled` never turns into an abnormal-loss delivery.
     func testCancelledRacingLocalCloseHasCloseAsWinner() async throws {
-        let (transport, driver) = try await connectedTransport()
+        let recorder = InboundRecorder()
+        let (transport, driver) = try await connectedTransport(recorder: recorder)
+
         await transport.close() // local close wins under the lock.
         driver.emit(.cancelled) // racing event — must not overwrite.
-        let data = try await transport.receive()
-        XCTAssertEqual(data, Data(), "recorded local-close result is never overwritten")
+
+        XCTAssertEqual(recorder.deliveryCount, 0, "a recorded local-close result is never overwritten")
+        // The driver holds the transport weakly (in production the bridge owns it), so the
+        // test must keep it alive across the deliveries above.
+        withExtendedLifetime(transport) {}
     }
 
-    /// Unsolicited post-ready `.failed` is abnormal loss: a parked `receive()` throws the mapped
-    /// `POSIXError`.
+    /// Unsolicited post-ready `.failed` is abnormal loss: one mapped `POSIXError` failure.
     func testUnsolicitedPostReadyFailedIsAbnormalLoss() async throws {
-        let (transport, driver) = try await connectedTransport()
-        async let parked = transport.receive()
-        try? await Task.sleep(nanoseconds: 5_000_000)
+        let recorder = InboundRecorder()
+        let (transport, driver) = try await connectedTransport(recorder: recorder)
+
         driver.emit(.failed(POSIXError(.ENETRESET)))
-        do {
-            _ = try await parked
-            XCTFail("abnormal loss must throw")
-        } catch let posix as POSIXError {
-            XCTAssertEqual(posix.code, .ENETRESET)
-        }
+
+        XCTAssertEqual(recorder.deliveredErrors.map(\.code), [.ENETRESET])
+        // The driver holds the transport weakly (in production the bridge owns it), so the
+        // test must keep it alive across the deliveries above.
+        withExtendedLifetime(transport) {}
     }
 
     /// Spec "Fatal waiting fails fast" (second bullet): a fatal `.waiting` landing after `.ready`
     /// won the claim never re-enters connect completion — it is routed like any post-ready
-    /// `.failed`, i.e. abnormal transport loss delivered to a parked `receive()` (design D8).
+    /// `.failed`, i.e. abnormal transport loss delivered to the handler (design D8).
     /// WHY: re-entering connect completion would resume an already-consumed continuation (a
     /// trap); silently ignoring it would leave a session whose TLS layer reported failure looking
     /// healthy until the next I/O hung.
     func testPostReadyFatalWaitingIsAbnormalLoss() async throws {
-        let (transport, driver) = try await connectedTransport()
-        async let parked = transport.receive()
-        try? await Task.sleep(nanoseconds: 5_000_000)
+        let recorder = InboundRecorder()
+        let (transport, driver) = try await connectedTransport(recorder: recorder)
+
         driver.emit(.waiting(POSIXError(.EPROTO), .fatal))
-        do {
-            _ = try await parked
-            XCTFail("post-ready fatal waiting must surface as abnormal loss")
-        } catch let posix as POSIXError {
-            XCTAssertEqual(posix.code, .EPROTO)
-        }
+
+        XCTAssertEqual(recorder.deliveredErrors.map(\.code), [.EPROTO])
+        // The driver holds the transport weakly (in production the bridge owns it), so the
+        // test must keep it alive across the deliveries above.
+        withExtendedLifetime(transport) {}
     }
 
     /// Unsolicited post-ready `.cancelled` with no recorded local close is abnormal loss.
     func testUnsolicitedPostReadyCancelledIsAbnormalLoss() async throws {
-        let (transport, driver) = try await connectedTransport()
-        async let parked = transport.receive()
-        try? await Task.sleep(nanoseconds: 5_000_000)
+        let recorder = InboundRecorder()
+        let (transport, driver) = try await connectedTransport(recorder: recorder)
+
         driver.emit(.cancelled) // no local close recorded → abnormal.
-        do {
-            _ = try await parked
-            XCTFail("unsolicited cancelled must throw")
-        } catch let posix as POSIXError {
-            XCTAssertEqual(posix.code, .ECONNRESET)
-        }
+
+        XCTAssertEqual(recorder.deliveredErrors.map(\.code), [.ECONNRESET])
+        // The driver holds the transport weakly (in production the bridge owns it), so the
+        // test must keep it alive across the deliveries above.
+        withExtendedLifetime(transport) {}
     }
 
-    /// A receive-side error surfaces as abnormal loss through `receive()`.
+    /// A receive-side driver error surfaces as one abnormal-loss delivery.
     func testReceiveErrorSurfacesAsAbnormalLoss() async throws {
-        let (transport, driver) = try await connectedTransport()
-        async let parked = transport.receive()
-        try? await Task.sleep(nanoseconds: 5_000_000)
+        let recorder = InboundRecorder()
+        let (transport, driver) = try await connectedTransport(recorder: recorder)
+
         driver.deliver(.failure(POSIXError(.EIO)))
+
+        XCTAssertEqual(recorder.deliveredErrors.map(\.code), [.EIO])
+        // The driver holds the transport weakly (in production the bridge owns it), so the
+        // test must keep it alive across the deliveries above.
+        withExtendedLifetime(transport) {}
+    }
+
+    /// Nothing follows a terminal delivery: a peer EOF followed by the connection's routine
+    /// `.cancelled` delivers exactly one thing in total.
+    ///
+    /// WHY this ordering specifically: the EOF branch does not move `lifecycle` (a peer EOF is
+    /// not a failure), so without the dedicated terminal-once flag the later `.cancelled` would
+    /// be classified as abnormal loss and deliver a failure AFTER a terminal delivery.
+    func testPeerEOFFollowedByCancelledDeliversNothingFurther() async throws {
+        let recorder = InboundRecorder()
+        let (transport, driver) = try await connectedTransport(recorder: recorder)
+
+        driver.deliver(.success(Data())) // peer EOF — terminal.
+        driver.emit(.cancelled)
+
+        XCTAssertEqual(recorder.deliveryCount, 1, "EOF is terminal — the later event delivers nothing")
+        XCTAssertEqual(recorder.deliveredData, [Data()])
+        // The driver holds the transport weakly (in production the bridge owns it), so the
+        // test must keep it alive across the deliveries above.
+        withExtendedLifetime(transport) {}
+    }
+
+    /// The `.failed` flavour of the same ordering.
+    func testPeerEOFFollowedByFailedDeliversNothingFurther() async throws {
+        let recorder = InboundRecorder()
+        let (transport, driver) = try await connectedTransport(recorder: recorder)
+
+        driver.deliver(.success(Data())) // peer EOF — terminal.
+        driver.emit(.failed(POSIXError(.ENETRESET)))
+
+        XCTAssertEqual(recorder.deliveryCount, 1, "EOF is terminal — the later failure delivers nothing")
+        XCTAssertEqual(recorder.deliveredData, [Data()])
+        // The driver holds the transport weakly (in production the bridge owns it), so the
+        // test must keep it alive across the deliveries above.
+        withExtendedLifetime(transport) {}
+    }
+
+    /// Nothing follows an abnormal-loss delivery either.
+    func testNothingIsDeliveredAfterAnAbnormalLossDelivery() async throws {
+        let recorder = InboundRecorder()
+        let (transport, driver) = try await connectedTransport(recorder: recorder)
+
+        driver.deliver(.failure(POSIXError(.EIO)))
+        driver.deliver(.success(Data([0x01])))
+        driver.emit(.cancelled)
+
+        XCTAssertEqual(recorder.deliveryCount, 1, "a failure delivery is terminal")
+        XCTAssertEqual(recorder.deliveredErrors.map(\.code), [.EIO])
+        // The driver holds the transport weakly (in production the bridge owns it), so the
+        // test must keep it alive across the deliveries above.
+        withExtendedLifetime(transport) {}
+    }
+
+    /// A rejected repeat `connect` — carrying a different handler — never replaces the live
+    /// receiver: inbound bytes keep reaching the first call's recorder.
+    func testRejectedRepeatConnectKeepsTheFirstReceiver() async throws {
+        let recorder = InboundRecorder()
+        let (transport, driver) = try await connectedTransport(recorder: recorder)
+
+        let rejectedRecorder = InboundRecorder()
         do {
-            _ = try await parked
-            XCTFail("receive error must throw")
+            try await transport.connect(host: "h", port: 443, onReceive: rejectedRecorder.handler)
+            XCTFail("connect after an established connection must be rejected")
         } catch let posix as POSIXError {
-            XCTAssertEqual(posix.code, .EIO)
+            XCTAssertEqual(posix.code, .EISCONN)
         }
+
+        driver.deliver(.success(Data([0x42])))
+        XCTAssertEqual(recorder.deliveredData, [Data([0x42])], "the first receiver still receives")
+        XCTAssertEqual(rejectedRecorder.deliveryCount, 0, "the rejected call's handler is never invoked")
+        // The driver holds the transport weakly (in production the bridge owns it), so the
+        // test must keep it alive across the deliveries above.
+        withExtendedLifetime(transport) {}
+    }
+
+
+    /// Nothing the driver emits before `.ready` reaches the handler: the connect has not
+    /// succeeded yet, so its caller may still be about to receive a thrown error.
+    ///
+    /// WHY: the real driver arms its receive before `.ready`, so a chunk or a receive-side error
+    /// during setup would otherwise be delivered to the handler of a `connect` that goes on to
+    /// throw. A setup failure still reaches the caller through the state handler
+    /// (`.failed` → `resolveConnect`), which is the path that resolves the connect.
+    func testPreReadyDeliveriesAreDropped() async throws {
+        let recorder = InboundRecorder()
+        let driver = ScriptedQUICDriver()
+        let transport = makeTransport(driver, ManualDeadlineScheduler())
+
+        let (task, outcome) = launchConnect(transport, recorder: recorder)
+        await waitUntil({ driver.didStart }, "driver started")
+
+        // Emitted while the connect is still in flight — before `.ready` won the claim.
+        driver.deliver(.success(Data([0xaa, 0xbb])))
+        driver.deliver(.failure(POSIXError(.EIO)))
+        driver.deliver(.success(Data()))
+        XCTAssertEqual(recorder.deliveryCount, 0, "nothing may be delivered before .ready wins")
+        XCTAssertFalse(outcome.isCompleted, "a dropped receive event must not resolve the connect")
+
+        // Dropping them must also leave the attempt intact: `.ready` still succeeds and the
+        // connection is still usable, so the drop cannot have torn down the driver.
+        driver.emit(.ready)
+        await waitUntil({ outcome.isCompleted }, "connect resolved")
+        XCTAssertNil(outcome.error, "the dropped events must not have failed the connect")
+        try await transport.send(Data([0x01]))
+        XCTAssertEqual(driver.sentChunks, [Data([0x01])], "the connection is usable after the drop")
+
+        _ = task
+        withExtendedLifetime(transport) {}
+    }
+
+    /// The readiness gate must not over-gate: once `.ready` has won, chunks are delivered.
+    func testDeliveryResumesOnceReadyHasWon() async throws {
+        let recorder = InboundRecorder()
+        let driver = ScriptedQUICDriver()
+        let transport = makeTransport(driver, ManualDeadlineScheduler())
+
+        let (task, outcome) = launchConnect(transport, recorder: recorder)
+        await waitUntil({ driver.didStart }, "driver started")
+        driver.emit(.ready)
+        await waitUntil({ outcome.isCompleted }, "connect resolved")
+        XCTAssertNil(outcome.error)
+
+        driver.deliver(.success(Data([0x42])))
+        XCTAssertEqual(
+            recorder.deliveredData, [Data([0x42])],
+            "a post-ready chunk must still be delivered — the gate is readiness, not silence"
+        )
+
+        _ = task
+        withExtendedLifetime(transport) {}
+    }
+
+    /// A connect that throws must never invoke its handler — including after the loss has claimed
+    /// the connect outcome, while the driver is still alive enough to emit.
+    ///
+    /// WHY: `onReceive` is stored in the reservation critical section and the real driver arms its
+    /// receive before `.ready`, so the receiver is reachable throughout a failing connect. Without
+    /// terminating delivery when the connect loss claims the outcome, a post-claim chunk (the
+    /// chunk path has no lifecycle guard) or a post-claim failure reaches the handler of a call
+    /// that threw.
+    func testConnectThatThrowsNeverDeliversAfterTheLossClaim() async {
+        let recorder = InboundRecorder()
+        let driver = ScriptedQUICDriver()
+        let transport = makeTransport(driver, ManualDeadlineScheduler())
+
+        let (task, outcome) = launchConnect(transport, recorder: recorder)
+        await waitUntil({ driver.didStart }, "driver started")
+        driver.emit(.failed(POSIXError(.ECONNREFUSED)))
+        await waitUntil({ outcome.isCompleted }, "connect resolved")
+        XCTAssertNotNil(outcome.error, "connect must have thrown")
+
+        // The driver is still holding the transport's callbacks; nothing it emits now may reach
+        // the receiver of the call that just threw.
+        driver.deliver(.success(Data([0x01, 0x02])))
+        driver.deliver(.failure(POSIXError(.EIO)))
+        driver.deliver(.success(Data()))
+
+        XCTAssertEqual(
+            recorder.deliveryCount, 0,
+            "a connect that throws must never invoke its handler"
+        )
+        task.cancel()
+        withExtendedLifetime(transport) {}
     }
 
     // MARK: - Helpers: bounded connect/close probes (no unbounded awaits on possibly-hung tasks)
@@ -1236,12 +1440,13 @@ final class QUICTransportAppleTests: XCTestCase, @unchecked Sendable {
     /// Tests bound-wait on `outcome.isCompleted` instead of awaiting a task that a regression
     /// could leave suspended forever.
     private func launchConnect(
-        _ transport: QUICTransportApple, host: String = "h", port: Int = 443
+        _ transport: QUICTransportApple, host: String = "h", port: Int = 443,
+        recorder: InboundRecorder = InboundRecorder()
     ) -> (task: Task<Void, Never>, outcome: ErrorBox) {
         let outcome = ErrorBox()
         let task = Task {
             do {
-                try await transport.connect(host: host, port: port)
+                try await transport.connect(host: host, port: port, onReceive: recorder.handler)
                 outcome.complete(with: nil)
             } catch {
                 outcome.complete(with: error)
@@ -1639,11 +1844,15 @@ final class QUICTransportAppleTests: XCTestCase, @unchecked Sendable {
 
     // MARK: - Helper: a transport driven to .ready
 
-    private func connectedTransport() async throws -> (QUICTransportApple, ScriptedQUICDriver) {
+    private func connectedTransport(
+        recorder: InboundRecorder = InboundRecorder()
+    ) async throws -> (QUICTransportApple, ScriptedQUICDriver) {
         let driver = ScriptedQUICDriver()
         let scheduler = ManualDeadlineScheduler()
         let transport = makeTransport(driver, scheduler)
-        let task = Task { try await transport.connect(host: "h", port: 443) }
+        let task = Task {
+            try await transport.connect(host: "h", port: 443, onReceive: recorder.handler)
+        }
         await waitUntil({ driver.didStart }, "driver started")
         driver.emit(.ready)
         try await task.value
@@ -1699,9 +1908,10 @@ final class QUICTransportApplePublicInitTests: XCTestCase {
     /// out-of-range port surfaces as `POSIXError(.EINVAL)` from `connect` — the invalid-port
     /// driver emits `.failed` without ever creating an `NWConnection`.
     func testPublicTransportConnectRejectsOutOfRangePort() async throws {
+        let recorder = InboundRecorder()
         let transport = try QUICTransportApple(configuration: SMBQUICConfiguration())
         do {
-            try await transport.connect(host: "fs.example.com", port: 65536)
+            try await transport.connect(host: "fs.example.com", port: 65536, onReceive: recorder.handler)
             XCTFail("out-of-range port must throw EINVAL")
         } catch let posix as POSIXError {
             XCTAssertEqual(posix.code, .EINVAL)

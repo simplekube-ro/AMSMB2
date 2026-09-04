@@ -22,13 +22,16 @@ import SMB2
 /// `Data` value (design D4 — libsmb2 may free the buffer immediately after `send` returns) and
 /// enqueues it. The outbound pump `Task` drains the queue by calling `transport.send(_:)` async.
 ///
-/// **Inbound path** (peer → libsmb2): The inbound pump `Task` calls `transport.receive()` and
-/// appends results to the inbound buffer. The C `recv` callback drains synchronously from that
-/// buffer, returning the would-block signal when the buffer is empty and the transport is open.
+/// **Inbound path** (peer → libsmb2): The bridge hands `deliverInbound(_:)` to the transport as
+/// the receiver when it connects it (design D2). The transport invokes it on its own delivery
+/// queue for every chunk, for graceful EOF and for abnormal loss — no task and no executor hop
+/// in between — and it records the delivery in the inbound store and fires the inbound-ready
+/// signal. The C `recv` callback drains synchronously from that store, returning the would-block
+/// signal when it is empty and the transport is open.
 ///
-/// **Concurrency model** (design D3): All mutable state — including `outboundPumpTask` and
-/// `inboundPumpTask` — is guarded by `NSLock`. Lock sections never contain `await`; async work
-/// happens outside the locked sections.
+/// **Concurrency model** (design D3): All mutable state — including `outboundPumpTask` — is
+/// guarded by `NSLock`. Lock sections never contain `await`; async work happens outside the
+/// locked sections, and the inbound-ready handler is always invoked outside the lock.
 ///
 /// **Lifetime**: `makeExternalTransport()` calls `Unmanaged.passRetained(self)` to hand the
 /// bridge to libsmb2 as `ext.userdata`. The single retained reference is consumed exactly once
@@ -59,9 +62,9 @@ final class TransportBridge: @unchecked Sendable {
     /// Running total of buffered-but-unconsumed inbound bytes. Maintained incrementally so
     /// `cRecv` can test emptiness and clamp `maxLen` in O(1) without summing the FIFO.
     private var inboundCount = 0
-    /// Set when `transport.receive()` returns empty Data (graceful peer close).
+    /// Set when the transport delivers empty Data (graceful peer close).
     private var inboundEOF = false
-    /// Set when the transport throws an error.
+    /// Set when the transport delivers a failure, or an outbound `send` fails.
     private var inboundError: (any Error)?
 
     // MARK: - Outbound state (libsmb2 → transport)
@@ -83,16 +86,15 @@ final class TransportBridge: @unchecked Sendable {
 
     // MARK: - Inbound-ready signal
 
-    /// Called (from any thread) immediately after bytes, EOF, or an error are appended to the
-    /// inbound buffer. SMB2Client sets this to `eventLoopQueue.async { serviceContextForSeam() }`.
-    /// Must be assigned once before `startPumps()` / `startInboundPump()` is called; all
-    /// subsequent calls come from the async inbound-pump Task.
+    /// Called (from any thread) immediately after bytes, EOF, or an error are recorded in the
+    /// inbound store. SMB2Client sets this to `eventLoopQueue.async { serviceContextForSeam() }`.
+    /// Every call after registration comes from the transport's own delivery queue (or, for an
+    /// outbound send failure, from the outbound pump Task).
     private var _onInboundReady: (@Sendable () -> Void)?
 
-    // MARK: - Pump tasks
+    // MARK: - Pump task
 
     private var outboundPumpTask: Task<Void, Never>?
-    private var inboundPumpTask: Task<Void, Never>?
 
     // MARK: - Init
 
@@ -103,29 +105,36 @@ final class TransportBridge: @unchecked Sendable {
     // MARK: - Inbound-ready signal API
 
     /// Registers a callback that fires (on an unspecified thread) after each inbound
-    /// append, EOF, or error. The callback MUST NOT acquire the bridge's internal lock.
-    /// Call this once before `startInboundPump()` / `startPumps()`.
+    /// delivery — bytes, EOF, or an error. The callback MUST NOT acquire the bridge's
+    /// internal lock. Call this once, before `startOutboundPump()`.
+    ///
+    /// Registration itself fires the callback once, outside the lock, when the store already
+    /// holds bytes, EOF or an error. That closes the window between the eager transport connect
+    /// (which installs the inbound handler on the transport) and this registration: a delivery
+    /// landing in it would otherwise be a lost wakeup, because `serviceContextForSeam` — reached
+    /// only from this callback — is the one path that services libsmb2 with `POLLIN`
+    /// (`flushOutboundForSeam` services `POLLOUT` only and the seam timer reads nothing), so such
+    /// a chunk would wait for a *later* delivery's signal and, if it were the last one, hang the
+    /// connect to its timeout.
     ///
     /// Typical usage: `bridge.setInboundReadyHandler { [weak client] in
     ///     client?.eventLoopQueue.async { client?.serviceContextForSeam() } }`
     func setInboundReadyHandler(_ handler: @Sendable @escaping () -> Void) {
         lock.lock()
         _onInboundReady = handler
+        // A pre-registration delivery must not be a lost wakeup (design D2).
+        let signalNow = !isClosed && (inboundCount > 0 || inboundEOF || inboundError != nil)
         lock.unlock()
+        if signalNow { handler() }
     }
 
     // MARK: - Lifecycle
 
-    /// Starts both the outbound-drain and inbound-fill pump Tasks.
-    /// Must be called after the transport has been connected.
-    func startPumps() {
-        startOutboundPump()
-        startInboundPump()
-    }
-
-    /// Starts only the outbound pump (libsmb2 → transport direction).
-    /// Used in unit tests that need to verify outbound delivery without the inbound pump
-    /// competing for `transport.receive()` — see MockTransport loopback semantics.
+    /// Starts the outbound pump (libsmb2 → transport direction). The inbound direction has no
+    /// pump: the transport pushes into `deliverInbound(_:)` (design D2/D5).
+    ///
+    /// Must be called after the transport has been connected, and after the inbound-ready
+    /// handler has been registered (design D2 — see the call site in `SMB2Client`).
     ///
     /// Guards the task assignment under `lock` to prevent data races on `outboundPumpTask`
     /// and to guard against accidental double-start (which would leak the previous task).
@@ -136,20 +145,9 @@ final class TransportBridge: @unchecked Sendable {
         outboundPumpTask = Task { [self] in await outboundPump() }
     }
 
-    /// Starts only the inbound pump (transport → libsmb2 direction).
-    ///
-    /// Guards the task assignment under `lock` to prevent data races on `inboundPumpTask`
-    /// and to guard against accidental double-start (which would leak the previous task).
-    func startInboundPump() {
-        lock.lock()
-        defer { lock.unlock() }
-        guard inboundPumpTask == nil else { return }
-        inboundPumpTask = Task { [self] in await inboundPump() }
-    }
-
-    /// Tears down the bridge: marks closed, cancels pump tasks, and fires `transport.close()`
-    /// in a background Task. Idempotent — safe to call more than once.
-    /// Called from the C close trampoline.
+    /// Tears down the bridge: marks closed, cancels the outbound pump task, and fires
+    /// `transport.close()` in a background Task. Idempotent — safe to call more than once.
+    /// Called from the C close trampoline. Deliveries that arrive afterwards are ignored.
     func close() {
         lock.lock()
         guard !isClosed else {
@@ -159,12 +157,10 @@ final class TransportBridge: @unchecked Sendable {
         isClosed = true
         let pendingContinuation = outboundContinuation
         outboundContinuation = nil
-        // Capture and nil the pump tasks under the lock so their Task references are only
+        // Capture and nil the pump task under the lock so its Task reference is only
         // accessed while the lock is held — satisfying the @unchecked Sendable contract.
         let capturedOutbound = outboundPumpTask
         outboundPumpTask = nil
-        let capturedInbound = inboundPumpTask
-        inboundPumpTask = nil
         // Clear the inbound-ready handler; bridge is closing, no more signalling needed.
         _onInboundReady = nil
         lock.unlock()
@@ -173,7 +169,6 @@ final class TransportBridge: @unchecked Sendable {
         pendingContinuation?.resume(returning: nil)
 
         capturedOutbound?.cancel()
-        capturedInbound?.cancel()
 
         // transport.close() is async; fire-and-forget. Captures transport (not self) so the
         // bridge's own retain count does not prolong the Task's lifetime unnecessarily.
@@ -255,7 +250,12 @@ final class TransportBridge: @unchecked Sendable {
     /// - Important: Call exactly once per bridge. The `ext.connect` trampoline performs no second
     ///   connect — it only reports the state recorded here.
     func connect(host: String, port: Int) async throws {
-        try await transport.connect(host: host, port: port)
+        // `[weak self]`: bridge → transport → closure → bridge would otherwise be a cycle held
+        // until the transport released the closure. Weak keeps the bridge's lifetime exactly the
+        // `userdata` retain that the C close trampoline balances (design D2).
+        try await transport.connect(host: host, port: port) { [weak self] result in
+            self?.deliverInbound(result)
+        }
         // Synchronous helper wraps the lock — NSLock.lock() is unavailable in async bodies.
         markPreConnected()
     }
@@ -277,6 +277,17 @@ final class TransportBridge: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return isPreConnected ? 0 : -ECONNREFUSED
+    }
+
+    /// The transport's inbound entry point: the receiver handed to `transport.connect` invokes
+    /// this on the transport's own serial delivery queue, once per chunk in arrival order, once
+    /// with empty `Data` for graceful EOF, or once with a `POSIXError` for abnormal loss.
+    ///
+    /// Runs synchronously on that queue — there is no task between the transport and the store —
+    /// so the bytes are drainable by `cRecv` and the inbound-ready signal has fired before this
+    /// returns.
+    func deliverInbound(_ result: Result<Data, POSIXError>) {
+        applyInbound(result.mapError { $0 as any Error })
     }
 
     /// Called from the C send trampoline. Copies bytes synchronously (design D4), enqueues.
@@ -371,27 +382,11 @@ final class TransportBridge: @unchecked Sendable {
             do {
                 try await transport.send(chunk)
             } catch {
-                // Transport send failed; mark so cRecv() returns ECONNRESET.
-                setInboundError(error)
+                // Transport send failed; record it through the same inbound entry point the
+                // transport uses, so cRecv() returns ECONNRESET after any buffered bytes.
+                applyInbound(.failure(error))
                 break
             }
-        }
-    }
-
-    private func inboundPump() async {
-        while !Task.isCancelled {
-            let data: Data
-            do {
-                data = try await transport.receive()
-            } catch {
-                setInboundError(error)
-                return
-            }
-            if data.isEmpty {
-                setInboundEOF()
-                return
-            }
-            appendInbound(data)
         }
     }
 
@@ -475,32 +470,33 @@ final class TransportBridge: @unchecked Sendable {
         }
     }
 
-    private func appendInbound(_ data: Data) {
+    /// Records one delivery in the inbound store and fires the inbound-ready signal.
+    ///
+    /// The bridge keeps exactly one guard — `isClosed` — and deliberately no terminal-once flag
+    /// of its own: `cRecv`'s return precedence (closed → bytes → EOF → error → would-block) stays
+    /// byte-for-byte what it was, and terminal-once is the conformer's obligation (design D2).
+    private func applyInbound(_ result: Result<Data, any Error>) {
         lock.lock()
-        // Enqueue by reference (the bytes are already owned — copied out of the NIO ByteBuffer
-        // at the transport boundary), avoiding a second full-payload copy. Empty chunks are
-        // skipped so the FIFO head always has unconsumed bytes (cRecv's loop invariant).
-        if !data.isEmpty {
+        guard !isClosed else {
+            // The bridge is gone: cRecv answers ECONNRESET regardless, and no signal may fire
+            // after `_onInboundReady` was cleared.
+            lock.unlock()
+            return
+        }
+        switch result {
+        case .success(let data) where !data.isEmpty:
+            // Enqueue by reference (the bytes are already owned — copied out of the NIO
+            // ByteBuffer at the transport boundary), avoiding a second full-payload copy. Empty
+            // chunks never reach here, so the FIFO head always has unconsumed bytes (cRecv's
+            // loop invariant).
             InboundSignposts.chunk(bytes: data.count)
             inboundChunks.append(data)
             inboundCount += data.count
+        case .success:
+            inboundEOF = true
+        case .failure(let error):
+            inboundError = error
         }
-        let handler = _onInboundReady
-        lock.unlock()
-        handler?()
-    }
-
-    private func setInboundEOF() {
-        lock.lock()
-        inboundEOF = true
-        let handler = _onInboundReady
-        lock.unlock()
-        handler?()
-    }
-
-    private func setInboundError(_ error: any Error) {
-        lock.lock()
-        inboundError = error
         let handler = _onInboundReady
         lock.unlock()
         handler?()

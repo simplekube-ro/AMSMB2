@@ -14,9 +14,10 @@
 //  live *inside* this file so the protocol stays NIO-free.
 //
 //  **Design D3**: `@unchecked Sendable` is justified because all mutable state
-//  (`_channel`, `_closeState`, `_connectAttempt`, …) is guarded by `NSLock`. The `InboundBufferingHandler`
-//  also guards its own mutable state with a separate `NSLock`; it runs on the NIO
-//  event loop for NIO callbacks and under the lock for async `receive()` callers.
+//  (`_channel`, `_closeState`, `_connectAttempt`, …) is guarded by `NSLock`. The
+//  `InboundForwardingHandler` also guards its own mutable state (the receiver closure and its
+//  terminal-once flag) with a separate `NSLock`; it reads the closure under that lock and
+//  invokes it outside, on the NIO event loop.
 //
 //  **Error mapping**: All NWError / ChannelError values are converted to `POSIXError`
 //  before propagating to callers, matching the CLAUDE.md convention.
@@ -97,8 +98,8 @@ public final class TCPTransportApple: SMBTransport, @unchecked Sendable {
 
     private var _connectAttempt: ConnectAttempt = .idle
     private let lock = NSLock()
-    /// Accumulates inbound bytes from the NIO channel for async `receive()` calls.
-    private let inboundHandler = InboundBufferingHandler()
+    /// Forwards each inbound chunk from the NIO channel to the receiver `connect` installed.
+    private let inboundHandler = InboundForwardingHandler()
 
     // MARK: - Test seams (design D8; internal, inert in production)
 
@@ -188,12 +189,16 @@ public final class TCPTransportApple: SMBTransport, @unchecked Sendable {
 
     // MARK: - SMBTransport
 
-    /// Establishes a TCP connection to `host:port` via Network.framework.
+    /// Establishes a TCP connection to `host:port` via Network.framework and installs
+    /// `onReceive` as the connection's inbound receiver.
     ///
     /// Supports task cancellation: if the enclosing `Task` is cancelled while the
     /// NIO bootstrap is still connecting, the underlying NWConnection is closed as
     /// soon as it becomes available and `POSIXError(.ECANCELED)` is thrown.
-    public func connect(host: String, port: Int) async throws {
+    public func connect(
+        host: String, port: Int,
+        onReceive: @escaping InboundReceiver
+    ) async throws {
         // One-shot attempt reservation (atomic; before any bootstrap work). The closed guard
         // keeps its existing contract and precedence. In `.idle` on an open transport,
         // `_connectCancelled` cannot be set (its only writers are an in-flight attempt's
@@ -224,6 +229,14 @@ public final class TCPTransportApple: SMBTransport, @unchecked Sendable {
         // after all other state cleanup — which is what lets a parked close owner treat
         // its resumption as "the tail can no longer create or retain resources".
         defer { finishConnectWork() }
+
+        // Installed only now — after the one-shot reservation succeeded and before the bootstrap
+        // (and therefore any `channelRead`) can run. A rejected repeat `connect` threw above and
+        // never reaches this line, so it can never replace the live receiver. Every *throwing*
+        // exit below terminates delivery before the channel teardown that would otherwise
+        // produce a spurious `channelInactive` EOF — see the two `signalClosed()` calls — so a
+        // `connect` that throws never invokes its handler either.
+        inboundHandler.install(onReceive)
 
         let bootstrap = NIOTSConnectionBootstrap(group: group)
             .connectTimeout(.seconds(Int64(connectTimeoutSeconds)))
@@ -320,6 +333,13 @@ public final class TCPTransportApple: SMBTransport, @unchecked Sendable {
                 _connectAttempt = .connected
                 return (.published, nil)
             }
+            // A losing claim means this `connect` throws below. The bootstrap succeeded, so the
+            // never-published channel is live with `inboundHandler` in its pipeline: closing it
+            // fires `channelInactive`, which would reach this call's receiver as a graceful EOF.
+            // Terminate delivery first, so a throwing connect never invokes its handler.
+            if outcome != .published {
+                inboundHandler.signalClosed()
+            }
             orphan?.close(promise: nil)
             switch outcome {
             case .published:
@@ -331,7 +351,10 @@ public final class TCPTransportApple: SMBTransport, @unchecked Sendable {
             }
         } catch {
             // Every failure path consumes the one-shot attempt (retry is unsupported), then
-            // applies the pre-existing error mapping unchanged.
+            // applies the pre-existing error mapping unchanged. Delivery is terminated first:
+            // a bootstrap that failed (or was aborted) can still be draining a channel whose
+            // pipeline holds `inboundHandler`, and this call is about to throw.
+            inboundHandler.signalClosed()
             lock.withLock { _connectAttempt = .failed }
             if error is CancellationError {
                 throw POSIXError(.ECANCELED)
@@ -364,40 +387,14 @@ public final class TCPTransportApple: SMBTransport, @unchecked Sendable {
         }
     }
 
-    /// Returns the next chunk of bytes from the remote peer.
-    ///
-    /// Delegates to `InboundBufferingHandler.receive()`. Returns empty `Data` on
-    /// graceful EOF (including after `close()`). Supports task cancellation.
-    ///
-    /// All NWError / ChannelError values thrown by the inbound handler are mapped
-    /// to `POSIXError` before propagating (CLAUDE.md convention).
-    public func receive() async throws -> Data {
-        // EOF convention (SMBTransport contract): return empty Data after close()
-        // rather than throwing, consistent with graceful peer-close signalling. A transport
-        // in `.closing` is already closed from the caller's perspective.
-        if lock.withLock({ _closeState != .open }) {
-            return Data()
-        }
-        guard lock.withLock({ _channel }) != nil else {
-            throw POSIXError(.ENOTCONN, description: "TCPTransportApple: not connected")
-        }
-        // Map any raw NIO / NW errors from the handler to POSIXError before
-        // they reach the caller, satisfying the file-level invariant.
-        do {
-            return try await inboundHandler.receive()
-        } catch {
-            throw Self.mapError(error)
-        }
-    }
-
     /// Closes the connection and shuts down the NIO event loop group through the owned
     /// close lifecycle `open → closing(waiters) → closed` (design D6/D7).
     ///
     /// The first caller atomically becomes the teardown **owner**: it aborts any in-flight
     /// connect (cancel latch + taking/closing whichever channel exists, which also prevents
-    /// any later publication — the D5 claim cannot publish once `.closing` is set), unblocks
-    /// a suspended `receive()`, drains the connect tail, shuts the event-loop group down
-    /// strictly last, then publishes `.closed` and resumes every parked caller exactly once.
+    /// any later publication — the D5 claim cannot publish once `.closing` is set), terminates
+    /// inbound delivery and releases the receiver, drains the connect tail, shuts the event-loop
+    /// group down strictly last, then publishes `.closed` and resumes every parked caller once.
     /// A `close()` arriving during `.closing` returns only after that same completed
     /// teardown; only a call after `.closed` returns immediately as the terminal no-op.
     /// Teardown failures are swallowed (`close()` is non-throwing) but never let a waiter
@@ -450,12 +447,14 @@ public final class TCPTransportApple: SMBTransport, @unchecked Sendable {
             }
 
         case .own(let channel):
+            // Delivery stops the moment close() begins (design D4): the channelInactive /
+            // errorCaught the teardown below produces must never reach the receiver, so the
+            // bridge sees the same silent teardown it always has.
+            inboundHandler.signalClosed()
+
             if let channel {
                 try? await channel.close().get()
             }
-
-            // Close the inbound handler's waiting receiver so any suspended receive() unblocks.
-            inboundHandler.signalClosed()
 
             // Test seam (D8): hold the owner's teardown before the connect-tail drain and
             // the event-loop-group shutdown.
@@ -496,18 +495,37 @@ public final class TCPTransportApple: SMBTransport, @unchecked Sendable {
     // MARK: - Error mapping
 
     /// Maps NIO / Network.framework errors to `POSIXError`, matching the CLAUDE.md convention.
+    ///
+    /// Layered on the total `mapErrorToPOSIX(_:)`: cancellation is normalized to `ECANCELED`,
+    /// and an error the total mapping could only classify as a generic `EIO` is passed through
+    /// unchanged instead, so a caller still sees the original error type.
     private static func mapError(_ error: any Error) -> any Error {
         if error is CancellationError {
             return POSIXError(.ECANCELED)
         }
-        if let nwError = error as? NWError {
-            return nwError.asPOSIXError()
+        guard error is NWError || error is ChannelError || error is POSIXError else {
+            return error
         }
-        if let channelError = error as? ChannelError {
-            return channelError.asPOSIXError()
-        }
-        return error
+        return mapErrorToPOSIX(error)
     }
+}
+
+// MARK: - Error mapping (shared)
+
+/// Total NIO / Network.framework → `POSIXError` mapping shared by `TCPTransportApple` and
+/// `InboundForwardingHandler`. Total because the seam payload has no `any Error` case: an
+/// unrecognised error still has to become some `POSIXError`.
+private func mapErrorToPOSIX(_ error: any Error) -> POSIXError {
+    if let posixError = error as? POSIXError {
+        return posixError
+    }
+    if let nwError = error as? NWError {
+        return nwError.asPOSIXError()
+    }
+    if let channelError = error as? ChannelError {
+        return channelError.asPOSIXError()
+    }
+    return POSIXError(.EIO, description: "Channel error: \(error)")
 }
 
 // MARK: - NWError → POSIXError
@@ -556,131 +574,87 @@ private extension ChannelError {
     }
 }
 
-// MARK: - InboundBufferingHandler
+// MARK: - InboundForwardingHandler
 
-/// NIO `ChannelInboundHandler` that accumulates inbound bytes and delivers them to
-/// async `receive()` callers via a lock-guarded continuation.
+/// NIO `ChannelInboundHandler` that forwards each inbound event straight to the receiver
+/// `TCPTransportApple.connect(host:port:onReceive:)` installed — the transport keeps no inbound
+/// buffer and parks no waiter (design D3).
 ///
 /// **Concurrency model** (design D3):
 /// - NIO event-loop callbacks (`channelRead`, `channelInactive`, `errorCaught`) run on the
-///   channel's event loop — never from async Swift tasks.
-/// - `receive()` is called from async Swift tasks (on any executor).
-/// - All shared mutable state is protected by `lock` so neither side needs `await` in
-///   the critical section (CLAUDE.md: no `NSLock.lock()` inside an async function body).
-final class InboundBufferingHandler: ChannelInboundHandler, @unchecked Sendable {
+///   channel's event loop, which is this connection's single serial delivery queue, so the
+///   receiver sees every chunk exactly once and in arrival order.
+/// - The receiver closure and the `terminated` flag are guarded by `lock`; the closure is read
+///   under the lock and invoked **outside** it (the receiver takes the bridge's own lock — the
+///   two are never nested).
+/// - EOF and errors are terminal: `terminated` short-circuits every later callback, and
+///   `signalClosed()` sets it (and drops the closure) the moment `close()` begins, so the
+///   teardown the close itself produces is never forwarded.
+final class InboundForwardingHandler: ChannelInboundHandler, @unchecked Sendable {
 
     typealias InboundIn = ByteBuffer
 
     // MARK: - State
 
     private let lock = NSLock()
-    /// Bytes received from the channel but not yet consumed by `receive()`.
-    private var buffer = Data()
-    /// `true` when `channelInactive` fires (graceful or forced close).
-    private var isEOF = false
-    /// Error caught from `errorCaught`; `receive()` re-throws it.
-    private var pendingError: (any Error)?
-    /// A continuation suspended in `receive()` waiting for the next chunk.
-    private var waitingContinuation: CheckedContinuation<Data, any Error>?
+    /// The receiver supplied to `connect`; `nil` before it is installed and after close.
+    private var receiver: InboundReceiver?
+    /// Set once a terminal delivery (EOF or error) has been made, or `close()` has begun.
+    private var terminated = false
+
+    // MARK: - Receiver installation
+
+    /// Installs the receiver. Called by `connect` after the one-shot reservation succeeded and
+    /// before the bootstrap runs, so no channel callback can precede it.
+    func install(_ receiver: @escaping InboundReceiver) {
+        lock.withLock { self.receiver = receiver }
+    }
 
     // MARK: - ChannelInboundHandler
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
         let byteBuffer = Self.unwrapInboundIn(data)
+        // A zero-length read is NOT end-of-stream: empty `Data` at the seam *means* graceful
+        // EOF, so forwarding one would tear the connection down spuriously. Returning before
+        // the signpost also keeps every `TransportRead` paired with exactly one `InboundChunk`.
+        guard byteBuffer.readableBytes > 0 else { return }
         // ByteBuffer → Data conversion (design D2). readableBytesView is a contiguous
         // slice — copying it here is the canonical NIO pattern and satisfies design D4
         // (copy at the boundary before the ByteBuffer may be returned to the pool).
         let received = Data(byteBuffer.readableBytesView)
         InboundSignposts.transportRead(bytes: received.count)
-
-        // Capture the continuation under the lock, then resume outside it.
-        let continuation: CheckedContinuation<Data, any Error>? = lock.withLock {
-            if let cont = waitingContinuation {
-                // Fast path: deliver directly to the suspended receive() caller.
-                waitingContinuation = nil
-                return cont
-            } else {
-                buffer.append(received)
-                return nil
-            }
-        }
-        continuation?.resume(returning: received)
+        forward(.success(received), terminal: false)
     }
 
     func channelInactive(context: ChannelHandlerContext) {
-        let continuation: CheckedContinuation<Data, any Error>? = lock.withLock {
-            isEOF = true
-            let cont = waitingContinuation
-            waitingContinuation = nil
-            return cont
-        }
-        continuation?.resume(returning: Data())
+        forward(.success(Data()), terminal: true) // graceful EOF.
     }
 
     func errorCaught(context: ChannelHandlerContext, error: any Error) {
-        let continuation: CheckedContinuation<Data, any Error>? = lock.withLock {
-            pendingError = error
-            let cont = waitingContinuation
-            waitingContinuation = nil
-            return cont
-        }
-        continuation?.resume(throwing: error)
+        forward(.failure(mapErrorToPOSIX(error)), terminal: true)
         context.close(promise: nil)
     }
 
-    // MARK: - Async receive
+    // MARK: - Delivery
 
-    /// Returns the next available chunk of bytes, suspending if none are buffered.
-    ///
-    /// Returns empty `Data` on EOF. Supports task cancellation.
-    func receive() async throws -> Data {
-        return try await withTaskCancellationHandler(
-            operation: {
-                try await withCheckedThrowingContinuation { continuation in
-                    // All state reads and the continuation store happen under the lock so
-                    // NIO event-loop callbacks can't race with us.
-                    self.lock.withLock {
-                        if !self.buffer.isEmpty {
-                            // Fast path: data already available.
-                            let data = self.buffer
-                            self.buffer = Data()
-                            continuation.resume(returning: data)
-                        } else if self.isEOF {
-                            continuation.resume(returning: Data())
-                        } else if let error = self.pendingError {
-                            continuation.resume(throwing: error)
-                        } else if Task.isCancelled {
-                            // Check cancellation before storing the continuation to close
-                            // the race where onCancel fired before we got here.
-                            continuation.resume(throwing: CancellationError())
-                        } else {
-                            self.waitingContinuation = continuation
-                        }
-                    }
-                }
-            },
-            onCancel: { [self] in
-                // Fires on an arbitrary thread; the lock is re-entrant-safe here because
-                // onCancel only runs when the continuation is stored — not inside withLock.
-                let continuation: CheckedContinuation<Data, any Error>? = lock.withLock {
-                    let cont = waitingContinuation
-                    waitingContinuation = nil
-                    return cont
-                }
-                continuation?.resume(throwing: CancellationError())
-            }
-        )
+    /// Called by `TCPTransportApple.close()` at the `open → closing` transition: delivery stops
+    /// before the channel is torn down, and the receiver reference is dropped.
+    func signalClosed() {
+        lock.withLock {
+            terminated = true
+            receiver = nil
+        }
     }
 
-    /// Called by `TCPTransportApple.close()` to unblock any suspended `receive()` call.
-    func signalClosed() {
-        let continuation: CheckedContinuation<Data, any Error>? = lock.withLock {
-            isEOF = true
-            let cont = waitingContinuation
-            waitingContinuation = nil
-            return cont
+    /// Reads the receiver under the lock (consuming the terminal-once flag when `terminal` is
+    /// set) and invokes it outside the lock.
+    private func forward(_ result: Result<Data, POSIXError>, terminal: Bool) {
+        let receiver: InboundReceiver? = lock.withLock {
+            guard !terminated, let receiver = self.receiver else { return nil }
+            if terminal { terminated = true }
+            return receiver
         }
-        continuation?.resume(returning: Data())
+        receiver?(result)
     }
 }
 

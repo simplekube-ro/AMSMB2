@@ -156,7 +156,9 @@ public enum SMBQUICCertificateProbe {
 
         let result: Result<Void, any Error>
         do {
-            try await transport.connect(host: endpoint.host, port: endpoint.port)
+            // The probe only wants the certificate chain the handshake produces; it never reads
+            // the connection, so the seam's mandatory receiver is a no-op.
+            try await transport.connect(host: endpoint.host, port: endpoint.port) { _ in }
             result = .success(())
         } catch {
             result = .failure(error)

@@ -48,13 +48,14 @@ final class SMB2CBDataLifetimeTests: XCTestCase, @unchecked Sendable {
         /// Waiter resumed when `connect` begins, backing `waitUntilConnecting()`.
         private var connectingWaiter: CheckedContinuation<Void, Never>?
 
-        /// Continuation parked in `receive()` (never-reply until `close()`).
-        private var receiveContinuation: CheckedContinuation<Data, any Error>?
         private var isClosed = false
 
         // MARK: SMBTransport conformance
 
-        func connect(host: String, port: Int) async throws {
+        func connect(
+            host: String, port: Int,
+            onReceive _: @escaping InboundReceiver
+        ) async throws {
             // Signal that connect has begun, before parking, so `waitUntilConnecting()` unblocks.
             isConnecting = true
             if let waiter = connectingWaiter {
@@ -71,23 +72,13 @@ final class SMB2CBDataLifetimeTests: XCTestCase, @unchecked Sendable {
         }
 
         func send(_ bytes: Data) async throws {
-            // Drop bytes (like MockTransport sendsAreDropped: true): never loop libsmb2's own
-            // NEGOTIATE PDU back as a "server response" (which would SIGSEGV libsmb2's parser).
-        }
-
-        func receive() async throws -> Data {
-            if isClosed { throw POSIXError(.ECONNRESET) }
-            return try await withCheckedThrowingContinuation { continuation in
-                self.receiveContinuation = continuation
-            }
+            // Drop bytes: never loop libsmb2's own NEGOTIATE PDU back as a "server response"
+            // (which would SIGSEGV libsmb2's parser). The receiver is never invoked either —
+            // this double models a server that accepts the connection and then says nothing.
         }
 
         func close() async {
             isClosed = true
-            if let continuation = receiveContinuation {
-                receiveContinuation = nil
-                continuation.resume(throwing: POSIXError(.ECONNRESET))
-            }
         }
 
         // MARK: Test gate helpers

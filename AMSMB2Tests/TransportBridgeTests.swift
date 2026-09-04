@@ -5,29 +5,28 @@
 //  Copyright © 2024 Mousavian. Distributed under MIT license.
 //  All rights reserved.
 //
-//  Unit tests for the TransportBridge (T5 / issue #24).
+//  Unit tests for the TransportBridge (T5 / issue #24, push-converted by #45).
 //
 //  These tests are Apple-only (#if canImport(Network)) because TransportBridge
 //  is guarded the same way per design D7.
 //
-//  Acceptance criteria (issue #24 / T5):
+//  Acceptance criteria (issue #24 / T5, as amended by #45):
 //    - ext struct is populated with non-null C trampolines
 //    - Bytes pushed through C send callback arrive at SMBTransport (copy-at-boundary)
-//    - Bytes received from SMBTransport are drainable via C recv callback
+//    - Bytes the transport delivers are drainable via C recv callback
 //    - C recv returns EAGAIN (would-block) when inbound buffer is empty and open
 //    - C recv returns 0 on graceful EOF
 //    - Clean teardown: after close, recv returns ECONNRESET
 //    - Zero Swift 6 strict-concurrency warnings
 //
-//  IMPORTANT — MockTransport loopback semantics:
-//  MockTransport is a loopback: `send(_:)` delivers bytes to `receive()`. When both
-//  outbound and inbound pumps are running concurrently, the inbound pump's waiting
-//  `receive()` call will consume bytes that the outbound pump writes via `transport.send(_:)`
-//  before the test's own `mock.receive()` call can get them. To avoid this:
-//    - Outbound-path tests use `startOutboundPump()` (no inbound pump competing).
-//    - Inbound-path tests use `startInboundPump()` (or both pumps — test sends directly).
-//    - Full-loopback tests start both pumps and exercise C send → outbound → mock →
-//      inbound → bridge buffer → C recv (complete loopback through both pumps).
+//  IMPORTANT — MockTransport is push-shaped, not a loopback:
+//  `send(_:)` records bytes in the mock's sent log (read with `sentChunks()` /
+//  `waitForSent(count:)`); inbound data is injected by the test with `deliver(_:)`,
+//  `signalGracefulEOF()` and `signalError(_:)`, which invoke the handler the bridge
+//  supplied to `connect(host:port:onReceive:)`. The two directions never cross, so no
+//  test needs to suppress a loopback and every inbound delivery is synchronous: once
+//  `await mock.deliver(...)` returns, the bridge's store and signal have already been
+//  updated — no sleeps, no expectations.
 //
 //  Requires: import SMB2 (C symbols not re-exported via @testable import AMSMB2)
 //
@@ -40,6 +39,27 @@ import XCTest
 @testable import AMSMB2
 
 final class TransportBridgeTests: XCTestCase, @unchecked Sendable {
+
+    // MARK: - Helpers
+
+    /// A bridge already connected to `mock` — i.e. the mock holds the bridge's inbound handler,
+    /// which is what every push-path test needs before it can inject anything.
+    private func connectedBridge(
+        to mock: MockTransport
+    ) async throws -> TransportBridge {
+        let bridge = TransportBridge(transport: mock)
+        try await bridge.connect(host: "localhost", port: 445)
+        return bridge
+    }
+
+    /// Drains the bridge through the C recv trampoline, returning `(result, bytes)`.
+    private func drain(_ ext: smb2_external_transport, maxLen: Int = 64) -> (Int32, Data) {
+        var buffer = [UInt8](repeating: 0, count: maxLen)
+        let count: Int32 = buffer.withUnsafeMutableBufferPointer { pointer in
+            ext.recv!(ext.userdata, pointer.baseAddress, pointer.count)
+        }
+        return (count, count > 0 ? Data(buffer.prefix(Int(count))) : Data())
+    }
 
     // MARK: - Scenario: ext struct is populated with trampolines
 
@@ -66,33 +86,28 @@ final class TransportBridgeTests: XCTestCase, @unchecked Sendable {
     /// WHEN the C send callback enqueues bytes
     /// THEN it returns the byte count without blocking on the network
     /// AND the outbound pump subsequently delivers those bytes to the transport
-    ///
-    /// Only the OUTBOUND pump runs in this test so that the inbound pump does not
-    /// compete for the MockTransport's receive() and steal the outbound-delivered bytes.
     func testSendReturnsByteCountImmediately() async throws {
         let mock = MockTransport()
-        try await mock.connect(host: "localhost", port: 445)
-        let bridge = TransportBridge(transport: mock)
-        bridge.startOutboundPump()          // outbound only; inbound pump NOT started
+        let bridge = try await connectedBridge(to: mock)
+        bridge.startOutboundPump()
         let ext = bridge.makeExternalTransport()
         defer { _ = ext.close?(ext.userdata) }
 
         let payload: [UInt8] = [0xDE, 0xAD, 0xBE, 0xEF]
-        let sentLen: Int32 = payload.withUnsafeBufferPointer { ptr in
-            ext.send!(ext.userdata, ptr.baseAddress, ptr.count)
+        let sentLen: Int32 = payload.withUnsafeBufferPointer { pointer in
+            ext.send!(ext.userdata, pointer.baseAddress, pointer.count)
         }
         XCTAssertEqual(
             sentLen, Int32(payload.count),
             "send must return the full byte count immediately"
         )
 
-        // Outbound pump delivers bytes to transport.send(_:) asynchronously.
-        // With no inbound pump running, mock.receive() sees the bytes from the queue.
-        try await Task.sleep(nanoseconds: 50_000_000) // 50 ms
-
-        let delivered = try await mock.receive()
+        // The outbound pump delivers to transport.send(_:) asynchronously; the mock's sent log
+        // is the observation point (there is no loopback to read from).
+        await mock.waitForSent(count: 1)
+        let delivered = await mock.sentChunks()
         XCTAssertEqual(
-            delivered, Data(payload),
+            delivered, [Data(payload)],
             "outbound pump must deliver bytes to the transport"
         )
     }
@@ -102,71 +117,48 @@ final class TransportBridgeTests: XCTestCase, @unchecked Sendable {
     /// WHEN the C send callback is invoked and the caller overwrites the source buffer
     ///      immediately after send returns
     /// THEN the bytes delivered to the SMBTransport match the original contents
-    ///
-    /// Only the OUTBOUND pump runs in this test to avoid inbound-pump contention.
     func testSentBytesSurviveImmediateBufferReuse() async throws {
         let mock = MockTransport()
-        try await mock.connect(host: "localhost", port: 445)
-        let bridge = TransportBridge(transport: mock)
-        bridge.startOutboundPump()          // outbound only; inbound pump NOT started
+        let bridge = try await connectedBridge(to: mock)
+        bridge.startOutboundPump()
         let ext = bridge.makeExternalTransport()
         defer { _ = ext.close?(ext.userdata) }
 
-        // Original bytes to send.
-        var srcBuf: [UInt8] = [1, 2, 3, 4, 5, 6, 7, 8]
-        let sentLen: Int32 = srcBuf.withUnsafeBufferPointer { ptr in
-            ext.send!(ext.userdata, ptr.baseAddress, ptr.count)
+        var sourceBuffer: [UInt8] = [1, 2, 3, 4, 5, 6, 7, 8]
+        let sentLen: Int32 = sourceBuffer.withUnsafeBufferPointer { pointer in
+            ext.send!(ext.userdata, pointer.baseAddress, pointer.count)
         }
         XCTAssertEqual(sentLen, 8)
 
-        // Overwrite source buffer immediately after send returns, before any async work.
+        // Overwrite the source buffer immediately after send returns, before any async work.
         // If the bridge stored a reference instead of a copy, the transport would receive zeros.
-        for idx in srcBuf.indices { srcBuf[idx] = 0 }
+        for index in sourceBuffer.indices { sourceBuffer[index] = 0 }
 
-        // Give the outbound pump time to drain into the mock transport.
-        // No inbound pump running, so mock.receive() gets the bytes.
-        try await Task.sleep(nanoseconds: 50_000_000) // 50 ms
-
-        // Bytes delivered must be the originals [1..8], not the overwritten zeros.
-        let delivered = try await mock.receive()
+        await mock.waitForSent(count: 1)
+        let delivered = await mock.sentChunks()
         XCTAssertEqual(
-            delivered, Data([1, 2, 3, 4, 5, 6, 7, 8]),
+            delivered, [Data([1, 2, 3, 4, 5, 6, 7, 8])],
             "copy-at-boundary: bridge must copy bytes before send returns"
         )
     }
 
     // MARK: - Scenario: recv returns buffered bytes
 
-    /// WHEN the inbound pump has appended bytes and C recv is called
+    /// WHEN the transport has delivered bytes and C recv is called
     /// THEN up to maxLen bytes are copied into the C buffer and that count is returned
     func testRecvDrainsInboundBytes() async throws {
         let mock = MockTransport()
-        try await mock.connect(host: "localhost", port: 445)
-        let bridge = TransportBridge(transport: mock)
-        bridge.startInboundPump()           // inbound only; outbound pump NOT started
+        let bridge = try await connectedBridge(to: mock)
         let ext = bridge.makeExternalTransport()
         defer { _ = ext.close?(ext.userdata) }
 
-        // Push bytes from the "network" side into the mock. MockTransport.send(_:) delivers
-        // directly to a suspended receive() if one is waiting (the inbound pump's call), which
-        // then appends to the bridge's inbound buffer.
         let serverData = Data("hello from server".utf8)
-        try await mock.send(serverData)
+        await mock.deliver(serverData)
 
-        // Wait for the inbound pump to deliver bytes to the bridge inbound buffer.
-        try await Task.sleep(nanoseconds: 50_000_000) // 50 ms
-
-        // C recv drains synchronously.
-        var recvBuf = [UInt8](repeating: 0, count: 64)
-        let count: Int32 = recvBuf.withUnsafeMutableBufferPointer { ptr in
-            ext.recv!(ext.userdata, ptr.baseAddress, ptr.count)
-        }
-
+        // No sleep: the delivery ran the bridge's handler synchronously before `deliver` returned.
+        let (count, bytes) = drain(ext)
         XCTAssertEqual(count, Int32(serverData.count), "recv must return the byte count")
-        XCTAssertEqual(
-            Data(recvBuf.prefix(Int(count))), serverData,
-            "recv must deliver the exact bytes from the transport"
-        )
+        XCTAssertEqual(bytes, serverData, "recv must deliver the exact bytes from the transport")
     }
 
     // MARK: - Scenario: recv would-block when empty and open
@@ -175,18 +167,11 @@ final class TransportBridgeTests: XCTestCase, @unchecked Sendable {
     /// THEN it returns the would-block signal (does not block, does not return 0)
     func testRecvWouldBlockWhenEmptyAndOpen() async throws {
         let mock = MockTransport()
-        try await mock.connect(host: "localhost", port: 445)
-        let bridge = TransportBridge(transport: mock)
-        bridge.startPumps()
+        let bridge = try await connectedBridge(to: mock)
         let ext = bridge.makeExternalTransport()
         defer { _ = ext.close?(ext.userdata) }
 
-        // No data pushed; inbound buffer is empty; transport is open.
-        var recvBuf = [UInt8](repeating: 0, count: 64)
-        let count: Int32 = recvBuf.withUnsafeMutableBufferPointer { ptr in
-            ext.recv!(ext.userdata, ptr.baseAddress, ptr.count)
-        }
-
+        let (count, _) = drain(ext)
         XCTAssertLessThan(count, 0, "recv must return negative to signal would-block")
         // errno is set synchronously by cRecv before returning; no await between the call and
         // this check, so errno is from our cRecv call (thread-local, same thread).
@@ -195,52 +180,57 @@ final class TransportBridgeTests: XCTestCase, @unchecked Sendable {
 
     // MARK: - Scenario: recv returns 0 on graceful EOF
 
-    /// WHEN the transport reports graceful EOF (empty Data) and the inbound store is drained
+    /// WHEN the transport delivered graceful EOF (empty Data) and the inbound store is drained
     /// THEN C recv returns 0
     func testRecvReturnsZeroOnGracefulEOF() async throws {
         let mock = MockTransport()
-        try await mock.connect(host: "localhost", port: 445)
-        let bridge = TransportBridge(transport: mock)
-        bridge.startInboundPump()           // inbound only
+        let bridge = try await connectedBridge(to: mock)
         let ext = bridge.makeExternalTransport()
         defer { _ = ext.close?(ext.userdata) }
 
-        // Signal graceful EOF from the "server" side.
         await mock.signalGracefulEOF()
 
-        // Wait for the inbound pump to process the EOF.
-        try await Task.sleep(nanoseconds: 50_000_000) // 50 ms
-
-        var recvBuf = [UInt8](repeating: 0, count: 64)
-        let count: Int32 = recvBuf.withUnsafeMutableBufferPointer { ptr in
-            ext.recv!(ext.userdata, ptr.baseAddress, ptr.count)
-        }
-
+        let (count, _) = drain(ext)
         XCTAssertEqual(count, 0, "recv must return 0 to signal graceful EOF")
+    }
+
+    /// WHEN bytes were delivered before graceful EOF
+    /// THEN recv drains the bytes first and only then reports EOF (precedence: bytes → EOF)
+    func testRecvDrainsBufferedBytesBeforeReportingEOF() async throws {
+        let mock = MockTransport()
+        let bridge = try await connectedBridge(to: mock)
+        let ext = bridge.makeExternalTransport()
+        defer { _ = ext.close?(ext.userdata) }
+
+        let payload = Data("tail".utf8)
+        await mock.deliver(payload)
+        await mock.signalGracefulEOF()
+
+        let (first, bytes) = drain(ext)
+        XCTAssertEqual(first, Int32(payload.count))
+        XCTAssertEqual(bytes, payload)
+        let (second, _) = drain(ext)
+        XCTAssertEqual(second, 0, "EOF is reported only after the buffered bytes are drained")
     }
 
     // MARK: - Scenario: Cancellation tears down cleanly
 
     /// WHEN the close callback fires
-    /// THEN both pump tasks stop, the transport is closed, and recv returns an error
+    /// THEN the outbound pump task stops, the transport is closed, and recv returns an error
     func testCloseTearsDownCleanly() async throws {
         let mock = MockTransport()
-        try await mock.connect(host: "localhost", port: 445)
-        let bridge = TransportBridge(transport: mock)
-        bridge.startPumps()
+        let bridge = try await connectedBridge(to: mock)
+        bridge.startOutboundPump()
         let ext = bridge.makeExternalTransport()
 
         // Close via the C callback (balances the passRetained; bridge is still alive here
         // because this test holds its own strong reference via `bridge`).
         _ = ext.close?(ext.userdata)
 
-        // Brief pause for async teardown Tasks to schedule.
-        try await Task.sleep(nanoseconds: 20_000_000) // 20 ms
-
         // After close, cRecv must return a negative error, not EAGAIN or 0.
         var recvBuf = [UInt8](repeating: 0, count: 64)
-        let count: Int32 = recvBuf.withUnsafeMutableBufferPointer { ptr in
-            bridge.cRecv(buf: ptr.baseAddress, maxLen: ptr.count)
+        let count: Int32 = recvBuf.withUnsafeMutableBufferPointer { pointer in
+            bridge.cRecv(buf: pointer.baseAddress, maxLen: pointer.count)
         }
         XCTAssertLessThan(count, 0, "after close, recv must return negative")
         XCTAssertEqual(errno, ECONNRESET, "after close, recv must set errno = ECONNRESET")
@@ -278,120 +268,90 @@ final class TransportBridgeTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(after, 0, "trampoline must report success once the transport is connected")
     }
 
-    // MARK: - Scenario: Round-trip through C callbacks via MockTransport (loopback)
+    // MARK: - Scenario: Round-trip through C callbacks via MockTransport
 
-    /// WHEN bytes are pushed through C send
-    /// THEN they traverse: cSend → outbound pump → transport.send → (MockTransport loopback)
-    ///      → inbound pump → bridge inbound buffer → cRecv
-    /// AND the bytes arrive intact at C recv (no real socket, no server)
-    ///
-    /// MockTransport is a loopback: bytes written via transport.send(_:) become available
-    /// via transport.receive(). With BOTH pumps running, the outbound pump delivers bytes
-    /// to MockTransport, the inbound pump picks them up, and C recv drains them.
-    func testFullLoopbackThroughBothPumps() async throws {
+    /// WHEN bytes are pushed through C send AND inbound bytes are injected through the mock
+    /// THEN the outbound bytes reach `transport.send(_:)` and the inbound bytes are drainable
+    ///      through C recv — both directions, no real socket, no server
+    func testRoundTripThroughCCallbacksViaMockTransport() async throws {
         let mock = MockTransport()
-        try await mock.connect(host: "localhost", port: 445)
-        let bridge = TransportBridge(transport: mock)
-        bridge.startPumps()                 // both pumps: outbound + inbound
+        let bridge = try await connectedBridge(to: mock)
+        bridge.startOutboundPump()
         let ext = bridge.makeExternalTransport()
         defer { _ = ext.close?(ext.userdata) }
 
-        let payload: [UInt8] = [0xAA, 0xBB, 0xCC, 0xDD]
-        let sent: Int32 = payload.withUnsafeBufferPointer { ptr in
-            ext.send!(ext.userdata, ptr.baseAddress, ptr.count)
+        let outbound: [UInt8] = [0xAA, 0xBB, 0xCC, 0xDD]
+        let sent: Int32 = outbound.withUnsafeBufferPointer { pointer in
+            ext.send!(ext.userdata, pointer.baseAddress, pointer.count)
         }
-        XCTAssertEqual(sent, Int32(payload.count), "send must return full byte count")
+        XCTAssertEqual(sent, Int32(outbound.count), "send must return full byte count")
+        await mock.waitForSent(count: 1)
+        let delivered = await mock.sentChunks()
+        XCTAssertEqual(delivered, [Data(outbound)], "outbound bytes reach the transport")
 
-        // Allow the full chain to run:
-        //   outbound pump drains → transport.send(payload) → MockTransport.send delivers to
-        //   inbound pump's waiting receive() → inbound pump appends to bridge inbound buffer.
-        try await Task.sleep(nanoseconds: 100_000_000) // 100 ms
-
-        var recvBuf = [UInt8](repeating: 0, count: 64)
-        let count: Int32 = recvBuf.withUnsafeMutableBufferPointer { ptr in
-            ext.recv!(ext.userdata, ptr.baseAddress, ptr.count)
-        }
-
-        XCTAssertEqual(count, Int32(payload.count), "recv must return the byte count")
-        XCTAssertEqual(
-            Data(recvBuf.prefix(Int(count))), Data(payload),
-            "bytes must survive loopback: cSend → outbound → mock → inbound → cRecv"
-        )
+        let inbound = Data([0x11, 0x22, 0x33])
+        await mock.deliver(inbound)
+        let (count, bytes) = drain(ext)
+        XCTAssertEqual(count, Int32(inbound.count))
+        XCTAssertEqual(bytes, inbound, "inbound bytes are drainable through C recv")
     }
 
     // MARK: - Scenario: double-start guard prevents task leaks
 
-    /// WHEN startOutboundPump() (or startInboundPump()) is called a second time
+    /// WHEN startOutboundPump() is called a second time
     /// THEN the second call is a no-op — the guard returns early without creating a second task
     /// AND the bridge still tears down cleanly after close()
-    ///
-    /// This verifies the lock-guarded `guard outboundPumpTask == nil` / `guard inboundPumpTask == nil`
-    /// path added to prevent accidental task leaks on repeated start calls.
     func testDoubleStartIsNoOp() async throws {
         let mock = MockTransport()
-        try await mock.connect(host: "localhost", port: 445)
-        let bridge = TransportBridge(transport: mock)
+        let bridge = try await connectedBridge(to: mock)
 
-        // Call both start methods twice — second calls must be silent no-ops, not crash or leak.
+        // Second call must be a silent no-op, not a crash or a leaked task.
         bridge.startOutboundPump()
         bridge.startOutboundPump()
-        bridge.startInboundPump()
-        bridge.startInboundPump()
 
         let ext = bridge.makeExternalTransport()
         // Close via the C trampoline to balance passRetained.
         _ = ext.close?(ext.userdata)
 
-        // After close, cRecv must return ECONNRESET — confirming clean teardown despite double start.
-        try await Task.sleep(nanoseconds: 20_000_000) // 20 ms
         var recvBuf = [UInt8](repeating: 0, count: 64)
-        let result: Int32 = recvBuf.withUnsafeMutableBufferPointer { ptr in
-            bridge.cRecv(buf: ptr.baseAddress, maxLen: ptr.count)
+        let result: Int32 = recvBuf.withUnsafeMutableBufferPointer { pointer in
+            bridge.cRecv(buf: pointer.baseAddress, maxLen: pointer.count)
         }
         XCTAssertLessThan(result, 0, "after close, recv must return negative")
         XCTAssertEqual(errno, ECONNRESET, "after close, recv must set errno = ECONNRESET")
     }
 
-    // MARK: - Scenario: recv gathers bytes across multiple buffered inbound chunks
+    // MARK: - Scenario: recv gathers bytes across multiple delivered inbound chunks
     //
     // These three tests pin the inbound-buffering contract that the chunk-FIFO refactor
     // (replacing the contiguous `inboundBuffer: Data` + `removeSubrange(..<count)` front-drain
-    // with a `[Data]` FIFO + head cursor) must preserve byte-for-byte. They pass against the
-    // contiguous implementation and must stay green after the refactor; they fail against the
+    // with a `[Data]` FIFO + head cursor) must preserve byte-for-byte. They fail against the
     // naive-FIFO mistakes (returning only the head chunk, or indexing a non-zero-startIndex
     // chunk with absolute offsets).
 
-    /// WHEN several distinct chunks have been buffered (each arrives as its own `receive()`
-    ///      result, i.e. a separate FIFO entry)
+    /// WHEN several distinct chunks have been delivered (each its own FIFO entry)
     /// AND a single C recv is issued with `maxLen` larger than the total buffered
     /// THEN recv gathers ALL buffered bytes across chunk boundaries, in FIFO order, in one call.
     func testRecvGathersBytesAcrossMultipleBufferedChunks() async throws {
         let mock = MockTransport()
-        try await mock.connect(host: "localhost", port: 445)
-        let bridge = TransportBridge(transport: mock)
-        bridge.startInboundPump()           // inbound only
+        let bridge = try await connectedBridge(to: mock)
         let ext = bridge.makeExternalTransport()
         defer { _ = ext.close?(ext.userdata) }
 
-        // Three separate server writes → three distinct inbound-pump receive() results.
-        let c1 = Data("AAAA".utf8)          // 4
-        let c2 = Data("BBBBBB".utf8)        // 6
-        let c3 = Data("CC".utf8)            // 2
-        try await mock.send(c1)
-        try await mock.send(c2)
-        try await mock.send(c3)
-        try await Task.sleep(nanoseconds: 80_000_000) // 80 ms — let the pump append all three
+        let firstChunk = Data("AAAA".utf8)      // 4
+        let secondChunk = Data("BBBBBB".utf8)   // 6
+        let thirdChunk = Data("CC".utf8)        // 2
+        await mock.deliver(firstChunk)
+        await mock.deliver(secondChunk)
+        await mock.deliver(thirdChunk)
 
-        var recvBuf = [UInt8](repeating: 0, count: 64)
-        let count: Int32 = recvBuf.withUnsafeMutableBufferPointer { ptr in
-            ext.recv!(ext.userdata, ptr.baseAddress, ptr.count)
-        }
+        let (count, bytes) = drain(ext)
         XCTAssertEqual(
-            count, Int32(c1.count + c2.count + c3.count),
+            count, Int32(firstChunk.count + secondChunk.count + thirdChunk.count),
             "a single recv with ample maxLen must gather all buffered chunks"
         )
         XCTAssertEqual(
-            Data(recvBuf.prefix(Int(count))), c1 + c2 + c3,
+            bytes, firstChunk + secondChunk + thirdChunk,
             "recv must reassemble bytes across chunk boundaries in FIFO order"
         )
     }
@@ -402,64 +362,244 @@ final class TransportBridgeTests: XCTestCase, @unchecked Sendable {
     ///      where the previous one stopped — no bytes dropped, duplicated, or reordered.
     func testRecvPartialDrainAdvancesCursorAcrossChunkBoundary() async throws {
         let mock = MockTransport()
-        try await mock.connect(host: "localhost", port: 445)
-        let bridge = TransportBridge(transport: mock)
-        bridge.startInboundPump()
+        let bridge = try await connectedBridge(to: mock)
         let ext = bridge.makeExternalTransport()
         defer { _ = ext.close?(ext.userdata) }
 
-        let c1 = Data("AAAA".utf8)          // 4
-        let c2 = Data("BBBBBB".utf8)        // 6
-        let c3 = Data("CC".utf8)            // 2  → 12 total
-        try await mock.send(c1)
-        try await mock.send(c2)
-        try await mock.send(c3)
-        try await Task.sleep(nanoseconds: 80_000_000)
+        await mock.deliver(Data("AAAA".utf8))    // 4
+        await mock.deliver(Data("BBBBBB".utf8))  // 6
+        await mock.deliver(Data("CC".utf8))      // 2  → 12 total
 
-        // First recv: maxLen 5 → 4 bytes from c1 + 1 byte from c2.
-        var buf1 = [UInt8](repeating: 0, count: 5)
-        let n1: Int32 = buf1.withUnsafeMutableBufferPointer { ptr in
-            ext.recv!(ext.userdata, ptr.baseAddress, ptr.count)
-        }
-        XCTAssertEqual(n1, 5, "first recv returns maxLen bytes when more are buffered")
-        XCTAssertEqual(Data(buf1.prefix(Int(n1))), Data("AAAAB".utf8))
+        // First recv: maxLen 5 → 4 bytes from chunk one + 1 byte from chunk two.
+        let (firstCount, firstBytes) = drain(ext, maxLen: 5)
+        XCTAssertEqual(firstCount, 5, "first recv returns maxLen bytes when more are buffered")
+        XCTAssertEqual(firstBytes, Data("AAAAB".utf8))
 
-        // Second recv: drains the remainder — 5 bytes from c2 + 2 bytes from c3.
-        var buf2 = [UInt8](repeating: 0, count: 64)
-        let n2: Int32 = buf2.withUnsafeMutableBufferPointer { ptr in
-            ext.recv!(ext.userdata, ptr.baseAddress, ptr.count)
-        }
-        XCTAssertEqual(n2, 7, "second recv resumes exactly where the first stopped")
-        XCTAssertEqual(Data(buf2.prefix(Int(n2))), Data("BBBBBCC".utf8))
+        // Second recv: drains the remainder — 5 bytes from chunk two + 2 from chunk three.
+        let (secondCount, secondBytes) = drain(ext)
+        XCTAssertEqual(secondCount, 7, "second recv resumes exactly where the first stopped")
+        XCTAssertEqual(secondBytes, Data("BBBBBCC".utf8))
     }
 
-    /// WHEN a buffered chunk is a `Data` slice with a NON-ZERO `startIndex` (as produced by
+    /// WHEN a delivered chunk is a `Data` slice with a NON-ZERO `startIndex` (as produced by
     ///      slicing inbound bytes — `ByteBuffer.readableBytesView`-derived Data can be such)
     /// THEN recv copies the slice's logical bytes, honoring its index range — never indexing
     ///      with absolute offsets (which would SIGTRAP or corrupt under a by-reference FIFO).
     func testRecvHandlesNonZeroStartIndexChunk() async throws {
         let mock = MockTransport()
-        try await mock.connect(host: "localhost", port: 445)
-        let bridge = TransportBridge(transport: mock)
-        bridge.startInboundPump()
+        let bridge = try await connectedBridge(to: mock)
         let ext = bridge.makeExternalTransport()
         defer { _ = ext.close?(ext.userdata) }
 
         let backing = Data((0..<32).map { UInt8($0) })
-        let slice = backing[8...]           // startIndex == 8, 24 bytes: values 8...31
+        let slice = backing[8...] // startIndex == 8, 24 bytes: values 8...31
         XCTAssertNotEqual(slice.startIndex, 0, "precondition: slice must have a non-zero startIndex")
-        try await mock.send(slice)
-        try await Task.sleep(nanoseconds: 60_000_000)
+        await mock.deliver(slice)
 
-        var recvBuf = [UInt8](repeating: 0, count: 64)
-        let count: Int32 = recvBuf.withUnsafeMutableBufferPointer { ptr in
-            ext.recv!(ext.userdata, ptr.baseAddress, ptr.count)
-        }
+        let (count, bytes) = drain(ext)
         XCTAssertEqual(count, 24, "recv must return the slice's logical byte count")
         XCTAssertEqual(
-            Data(recvBuf.prefix(Int(count))), Data((8...31).map { UInt8($0) }),
+            bytes, Data((8...31).map { UInt8($0) }),
             "recv must copy a non-zero-startIndex chunk by honoring its index range"
         )
+    }
+
+    // MARK: - Scenario: the inbound-ready signal fires inside the delivery
+
+    /// WHEN the transport delivers a chunk
+    /// THEN the chunk is in the store and the signal has fired before the delivery returned —
+    ///      no task, no executor hop, nothing to wait for.
+    ///
+    /// WHY the synchronous assertion: an `XCTestExpectation` would also pass if the signal were
+    /// posted from a task later; asserting immediately after `await mock.deliver(...)` returns is
+    /// what pins "no executor hop between the transport and the store".
+    func testInboundReadySignalFiresInsideTheDelivery() async throws {
+        let mock = MockTransport()
+        let bridge = try await connectedBridge(to: mock)
+        let ext = bridge.makeExternalTransport()
+        defer { _ = ext.close?(ext.userdata) }
+
+        let signals = LockedBox<Int>(0)
+        bridge.setInboundReadyHandler { signals.mutate { $0 += 1 } }
+        XCTAssertEqual(signals.value, 0, "registering against an empty store must not signal")
+
+        let payload = Data("chunk".utf8)
+        await mock.deliver(payload)
+
+        XCTAssertEqual(signals.value, 1, "the delivery fires exactly one signal, synchronously")
+        let (count, bytes) = drain(ext)
+        XCTAssertEqual(count, Int32(payload.count))
+        XCTAssertEqual(bytes, payload)
+    }
+
+    /// WHEN the inbound-ready handler is registered while the store is empty and open
+    /// THEN no signal fires until the first delivery
+    func testRegistrationWithEmptyStoreDoesNotSignal() async throws {
+        let mock = MockTransport()
+        let bridge = try await connectedBridge(to: mock)
+        let ext = bridge.makeExternalTransport()
+        defer { _ = ext.close?(ext.userdata) }
+
+        let signals = LockedBox<Int>(0)
+        bridge.setInboundReadyHandler { signals.mutate { $0 += 1 } }
+        XCTAssertEqual(signals.value, 0, "an empty open store must not signal at registration")
+    }
+
+    // MARK: - Scenario: a delivery before registration is not a lost wakeup
+
+    /// WHEN a chunk is delivered after connect but BEFORE the inbound-ready handler is registered
+    /// THEN registering the handler fires exactly one signal, and C recv then returns the bytes.
+    ///
+    /// WHY this is the lost-wakeup test: `serviceContextForSeam` is the only path that services
+    /// with `POLLIN`, and it runs only from this signal. A chunk sitting in the store with no
+    /// signal is drained only by a *later* delivery — and if it is the last one, the connect hangs
+    /// to its timeout. Asserting the bytes alone would pass even with the wakeup lost, so the
+    /// signal count is the assertion that matters here.
+    func testDeliveryBeforeRegistrationSignalsExactlyOnceAtRegistration() async throws {
+        let mock = MockTransport()
+        let bridge = try await connectedBridge(to: mock)
+        let ext = bridge.makeExternalTransport()
+        defer { _ = ext.close?(ext.userdata) }
+
+        let payload = Data("early".utf8)
+        await mock.deliver(payload)
+
+        let signals = LockedBox<Int>(0)
+        bridge.setInboundReadyHandler { signals.mutate { $0 += 1 } }
+        XCTAssertEqual(signals.value, 1, "registration must fire exactly one signal for a non-empty store")
+
+        let (count, bytes) = drain(ext)
+        XCTAssertEqual(count, Int32(payload.count))
+        XCTAssertEqual(bytes, payload)
+    }
+
+    /// The EOF flavour of the same window: an EOF that lands before registration must still wake
+    /// the servicing loop when the handler is installed.
+    func testEOFBeforeRegistrationSignalsExactlyOnceAtRegistration() async throws {
+        let mock = MockTransport()
+        let bridge = try await connectedBridge(to: mock)
+        let ext = bridge.makeExternalTransport()
+        defer { _ = ext.close?(ext.userdata) }
+
+        await mock.signalGracefulEOF()
+
+        let signals = LockedBox<Int>(0)
+        bridge.setInboundReadyHandler { signals.mutate { $0 += 1 } }
+        XCTAssertEqual(signals.value, 1, "a pre-registration EOF must signal at registration")
+
+        let (count, _) = drain(ext)
+        XCTAssertEqual(count, 0, "recv reports EOF on the next drain")
+    }
+
+    /// The error flavour of the same window.
+    func testErrorBeforeRegistrationSignalsExactlyOnceAtRegistration() async throws {
+        let mock = MockTransport()
+        let bridge = try await connectedBridge(to: mock)
+        let ext = bridge.makeExternalTransport()
+        defer { _ = ext.close?(ext.userdata) }
+
+        await mock.signalError(POSIXError(.ECONNRESET))
+
+        let signals = LockedBox<Int>(0)
+        bridge.setInboundReadyHandler { signals.mutate { $0 += 1 } }
+        XCTAssertEqual(signals.value, 1, "a pre-registration error must signal at registration")
+
+        let (count, _) = drain(ext)
+        XCTAssertLessThan(count, 0, "recv reports the error on the next drain")
+        XCTAssertEqual(errno, ECONNRESET)
+    }
+
+    // MARK: - Scenario: an outbound send failure is reported by recv, after buffered bytes
+
+    /// WHEN the outbound pump's `transport.send(_:)` fails while inbound bytes are still buffered
+    /// THEN C recv drains the bytes first and only then reports the error — the return precedence
+    ///      (bytes → EOF → error → would-block) is unchanged by routing the send failure through
+    ///      the same inbound entry point.
+    func testOutboundSendFailureIsReportedByRecvAfterBufferedBytes() async throws {
+        let mock = MockTransport()
+        let bridge = try await connectedBridge(to: mock)
+        let ext = bridge.makeExternalTransport()
+        defer { _ = ext.close?(ext.userdata) }
+
+        let payload = Data("buffered".utf8)
+        await mock.deliver(payload)
+
+        // Closing the mock (not the bridge) makes the next transport.send(_:) throw.
+        await mock.close()
+        bridge.startOutboundPump()
+        let outbound: [UInt8] = [0x01, 0x02]
+        _ = outbound.withUnsafeBufferPointer { pointer in
+            ext.send!(ext.userdata, pointer.baseAddress, pointer.count)
+        }
+
+        // The buffered bytes still come out first.
+        let (first, bytes) = drain(ext)
+        XCTAssertEqual(first, Int32(payload.count))
+        XCTAssertEqual(bytes, payload)
+
+        // Then the send failure surfaces as ECONNRESET.
+        let errored = await waitUntil {
+            var recvBuf = [UInt8](repeating: 0, count: 64)
+            let count: Int32 = recvBuf.withUnsafeMutableBufferPointer { pointer in
+                bridge.cRecv(buf: pointer.baseAddress, maxLen: pointer.count)
+            }
+            return count < 0 && errno == ECONNRESET
+        }
+        XCTAssertTrue(errored, "a failed outbound send must surface at recv as ECONNRESET")
+    }
+
+    // MARK: - Scenario: a delivery after close is ignored
+
+    /// WHEN the bridge has been closed and the transport delivers a chunk, EOF, or an error
+    /// THEN nothing is appended, no inbound-ready signal fires, and recv keeps reporting closed
+    func testDeliveryAfterCloseIsIgnored() async throws {
+        let mock = MockTransport()
+        let bridge = try await connectedBridge(to: mock)
+
+        let signals = LockedBox<Int>(0)
+        bridge.setInboundReadyHandler { signals.mutate { $0 += 1 } }
+
+        bridge.close()
+
+        // The mock's own close guard would hide the bridge-side behaviour, so deliver straight
+        // into the bridge's transport entry point — exactly what an ill-behaved conformer does.
+        bridge.deliverInbound(.success(Data("late".utf8)))
+        bridge.deliverInbound(.success(Data()))
+        bridge.deliverInbound(.failure(POSIXError(.EIO)))
+
+        XCTAssertEqual(signals.value, 0, "no signal may fire once the bridge is closed")
+        var recvBuf = [UInt8](repeating: 0, count: 64)
+        let count: Int32 = recvBuf.withUnsafeMutableBufferPointer { pointer in
+            bridge.cRecv(buf: pointer.baseAddress, maxLen: pointer.count)
+        }
+        XCTAssertLessThan(count, 0, "recv keeps reporting the closed error")
+        XCTAssertEqual(errno, ECONNRESET)
+    }
+
+    // MARK: - Scenario: the inbound handler does not retain the bridge
+
+    /// WHEN a bridge has connected a transport (which now holds the bridge's inbound handler)
+    /// AND the bridge's last strong reference is released
+    /// THEN the bridge is deallocated while the transport still exists
+    ///
+    /// WHY: bridge → transport → closure → bridge would otherwise be a retain cycle, and the
+    /// bridge's lifetime must stay exactly the `userdata` retain that the close trampoline
+    /// balances — never dependent on a conformer releasing the closure.
+    func testInboundHandlerDoesNotRetainTheBridge() async throws {
+        let mock = MockTransport()
+        var bridge: TransportBridge? = TransportBridge(transport: mock)
+        // `weak var` + separate assignment: `weak let` needs Swift 6.2 (Linux CI is 6.1) and a
+        // never-mutated `weak var` warns on 6.2.
+        weak var weakBridge: TransportBridge?
+        weakBridge = bridge
+        try await bridge?.connect(host: "localhost", port: 445)
+        XCTAssertNotNil(weakBridge)
+
+        bridge = nil
+        XCTAssertNil(weakBridge, "the transport's handler must not keep the bridge alive")
+
+        // The mock still holds the (now weak-captured) closure; invoking it must be harmless.
+        await mock.deliver(Data("after dealloc".utf8))
     }
 }
 

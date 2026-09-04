@@ -1,13 +1,4 @@
-# inbound-profiling Specification
-
-## Purpose
-Make the SMB-over-NIO inbound path measurable with real signal: low-overhead signpost intervals
-and events at the five points that define the streaming-read hot path, a repeatable Release-build
-on-device capture procedure with a recorded baseline, and tooling that turns any capture into the
-same comparable numbers, so that the deferred transport work (push-conversion, receive-length
-tuning) is judged by a before/after delta rather than by an observer-noise trace.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Inbound path signposts
 
@@ -153,45 +144,3 @@ coalescing ratio is 1.00 by construction after the conversion).
   delta table against the Baseline for the per-thread shares, dispatch and pass percentiles,
   active throughput and stalls, computed by the same script; a single trailing `TransportRead`
   left unpaired by bridge teardown at the end of a run is not a pairing error
-
-### Requirement: Trace summary tooling
-
-The repository SHALL contain a script (`scripts/profile-summary.sh`) that prints the comparison
-numbers without the Instruments GUI. It SHALL accept either a `.trace` bundle (which it exports
-with `xctrace`) or a directory of already-exported time-profile and signpost XML (so the parsing
-is reproducible without a device or a bundle). From the time-profile samples it SHALL print the
-total sample count and a per-thread table (thread name, samples, share of total) that makes the
-cooperative-pool signature visible; from the signpost data, per signpost name filtered to the
-subsystem, the count, and for `TransportRead`, `InboundChunk` and `RecvDrain` the byte total and
-size distribution (min / median / p95 / max), for `ServiceDispatch` and `ServicePass` the
-duration distribution (min / median / p95 / max) with terminal passes counted and listed
-separately and excluded from the percentiles, the `TransportRead`-to-`InboundChunk` coalescing
-ratio, the pump-hop latency distribution derived by consuming `TransportRead` events in order
-until their bytes sum to each `InboundChunk` and measuring from the first consumed read, the
-bytes still buffered at the end (total `InboundChunk` minus total `RecvDrain`), and the derived
-throughput (bytes drained per second of wall-clock, both over the whole span and over the active
-time with idle gaps longer than one second excluded). When the input contains no `TransportRead`
-events (a QUIC capture, or a bundle from a build before this change) the coalescing ratio and
-pump-hop latency SHALL be reported as not available rather than as pairing errors. It SHALL work
-with the `xctrace` shipped in Xcode 26 and SHALL fail with a clear message, not a stack trace,
-when the input has no time-profile table or is not readable.
-
-#### Scenario: Summary from the committed fixture
-
-- **WHEN** the script is run on the synthetic exported-XML fixture committed under
-  `test-fixtures/`
-- **THEN** it prints the per-thread table and the five per-signpost summaries with the values
-  the fixture was written to produce, and running it twice yields identical output
-
-#### Scenario: Summary from a bundle without signposts
-
-- **WHEN** the script is run on a bundle or export that has a time-profile table but no
-  `ro.SimpleKube.AMSMB2` signposts
-- **THEN** it prints the per-thread CPU table, reports that no matching signposts were found, and
-  exits successfully
-
-#### Scenario: Unreadable input
-
-- **WHEN** the script is run on a path that is neither a readable `.trace` bundle nor an export
-  directory containing a time-profile table
-- **THEN** it exits non-zero with a one-line explanation
