@@ -28,8 +28,8 @@
 - [x] 5.1 Tag `6.0.0-rc4` after 1–4 merge, with release notes stating the library now emits signposts under `ro.SimpleKube.AMSMB2` / `Inbound` and linking `docs/PROFILING.md`; re-pin RandomPlayer to it and build with Product ▸ Profile on the Apple TV; verify the process list export shows no debugger-injected library and the instrument set is Time Profiler + `os_signpost`
 - [x] 5.2 Run the workload three times per the doc and run `scripts/profile-summary.sh` on each bundle; verify all five signpost names appear with non-zero counts, `InboundChunk` bytes equal `TransportRead` bytes, `RecvDrain` bytes do not exceed `InboundChunk` bytes, the coalescing ratio and pump-hop latency columns are populated with no pairing errors, and the per-thread table shows the cooperative-pool threads
 - [x] 5.3 Fill the Baseline section with the median run (date, device, tvOS, AMSMB2 version, `xctrace version`, script output, stalls observed) and commit; verify the numbers in the doc match the script output of the archived run
-- [ ] 5.4 Comment on issue #44 with the summary and the doc link; add a "gated on #44 baseline" comment to #45 and #46 referencing `docs/PROFILING.md`; verify all three issues show the cross-references
+- [x] 5.4 Comment on issue #44 with the summary and the doc link; add a "gated on #44 baseline" comment to #45 and #46 referencing `docs/PROFILING.md`; verify all three issues show the cross-references
 
 ## 6. Verification gate
 
-- [ ] 6.1 Run `/opsx:verify` and confirm every spec scenario maps to a test, a script run on the fixture, or the operator gate (5.x) and that the artifacts describe what shipped; then `/opsx:archive`
+- [x] 6.1 Run `/opsx:verify` and confirm every spec scenario maps to a test, a script run on the fixture, or the operator gate (5.x) and that the artifacts describe what shipped; then `/opsx:archive`
