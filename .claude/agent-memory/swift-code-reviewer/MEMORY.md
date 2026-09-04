@@ -69,3 +69,25 @@
 - `ScriptedQUICDriver` (AMSMB2Tests/QUICTransportAppleTests.swift) has an optional `onCancel` hook
   read under the lock and invoked OUTSIDE it. Default-nil, so other suites are unaffected.
 - Pre-existing >132-col line: `AMSMB2/Context.swift:727` (commit 75e4db5c) — not a new-change finding.
+
+## `xctrace` export format — verified empirically (2026-09-04, xctrace 16.0 (17F113))
+Reproduced locally with a throwaway Swift emitter + `xcrun xctrace record --template 'Time Profiler'
+--instrument os_signpost --launch`, then `xctrace export --xpath`:
+- **A single `--xpath 'table[@schema="X"]'` export returns SEVERAL `<node>` elements. Only the FIRST
+  carries `<schema>`; the row-bearing node(s) have NO `<schema>` child.** Any parser that does
+  `if node.find("schema") is None: continue` silently drops every row. Seen every time for
+  `os-signpost` (3 nodes: schema-only, empty, 79 rows); `time-profile` happened to be one node.
+- **Values *inside* `<os-log-metadata>` are interned too**: a repeated argument arrives as
+  `<uint64 ref="16"/>` with no text. A parser that resolves `ref` only on the row's top-level
+  cells dies on it. Resolve nested children as well.
+- `os_signpost` `%d` with a Swift `Int` **truncates to 32 bits** (`0x1_0000_0002` → `2`); `%ld` is
+  exact. Either way xctrace renders the arg as `<uint64>`, and `-1` arrives as
+  `18446744073709551615` (sign-extended), so a uint64→signed fold is the right decode.
+- Format `"%d"` → `<format-string>%d</format-string>` and `<os-log-metadata><uint64/></os-log-metadata>`
+  with **no** `<narrative-text>`. A prefixed format (`"terminal=%d"`) adds
+  `<narrative-text>terminal=</narrative-text>` before the `<uint64>`. `emit-location` is a real
+  `<return-location>` tree, not `<sentinel/>`.
+- `event-type` texts are exactly `Event` / `Begin` / `End`; `.exclusive` IDs export as
+  `17216892719917625070` (`fmt="OS_SIGNPOST_ID_EXCLUSIVE"`).
+- `xctrace export --toc | grep` works fine (no `--output` needed) despite the "always pass --output"
+  advice, which applies to `--xpath` exports into a closing pipe.

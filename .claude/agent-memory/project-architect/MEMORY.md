@@ -14,6 +14,7 @@
 - [tcp-one-shot-connect-review.md](tcp-one-shot-connect-review.md) — fix-tcp-one-shot-connect verdict history; Network.framework test-timing gotcha.
 - [seam-connect-ordering.md](seam-connect-ordering.md) — fix-seam-connect-ordering root cause and decision.
 - [stream-premature-eof.md](stream-premature-eof.md) — AsyncInputStream premature-EOF fix guardrails.
+- [inbound-profiling-review.md](inbound-profiling-review.md) — issue #44 profiling gate verdict; inbound hop chain, os_signpost vararg cost, availability facts.
 - [regate-fix-swift6-concurrency.md](regate-fix-swift6-concurrency.md) — re-gate precedent for scope expansions.
 
 ## Invariants
