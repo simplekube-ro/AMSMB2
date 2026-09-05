@@ -247,7 +247,9 @@ public final class TCPTransportApple: SMBTransport, @unchecked Sendable {
             // coarser receive cuts per-byte op-count on the streaming read path. Throughput (per-
             // byte copy volume) is unchanged; this is an op-count optimisation. `minimumIncomplete-
             // ReceiveLength` stays at its default (1) so small control PDUs still flush immediately
-            // with no added latency.
+            // with no added latency. Measured against the rc5 capture set and kept at 256 KB —
+            // see "Receive length (#46)" in docs/PROFILING.md for the ceiling numbers, the
+            // reading and the rule for re-opening the question.
             .channelOption(NIOTSChannelOptions.maximumReceiveLength, value: 1 << 18) // 256 KB
             .channelInitializer { [inboundHandler, weak self] channel in
                 // Capture the channel the moment it is created — before the connect completes —

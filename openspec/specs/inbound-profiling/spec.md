@@ -176,6 +176,19 @@ ratio, the pump-hop latency distribution, the bytes still buffered at the end (t
 wall-clock, both over the whole span and over the active time with idle gaps longer than one
 second excluded).
 
+After the `InboundChunk` size line the script SHALL print a ceiling line: the number of
+`InboundChunk` events whose size equals the maximum observed chunk size, with their share of the
+chunk count (three decimals) and of the byte total (two decimals), followed by the share of chunks
+and of bytes at or above each of 64 KB, 128 KB, 256 KB, 512 KB and 1 MB, in that order, on one
+line, so that a reader can tell whether the transport's receive length bound the capture. These
+shares are printed to finer precision than the per-thread table's one decimal because an at-cap
+chunk share is a fraction of a percent while its byte share is whole percents. When there are no
+`InboundChunk` events the line SHALL print `ceiling: n/a`. The line measures the transport's
+receive length only where the coalescing ratio is 1.00 (a TCP capture of 6.0.0-rc5 or later): in a
+capture whose reads were coalesced, or whose chunks came from a transport that emits no
+`TransportRead`, the maximum is a coalesced maximum, and the coalescing-ratio line the script
+already prints is what qualifies the ceiling line.
+
 The pump-hop latency SHALL be derived in one of two pairing modes, selected by the operator and
 named in the output so that a summary can be read on its own:
 
@@ -261,3 +274,44 @@ subsystem carries no thread.
 - **WHEN** the script is run on a path that is neither a readable `.trace` bundle nor an export
   directory containing a time-profile table, or the pairing option names an unknown mode
 - **THEN** it exits non-zero with a one-line explanation
+
+#### Scenario: Ceiling line from the committed fixtures
+
+- **WHEN** the script is run on each of the committed fixtures, including the fixture whose chunk
+  sizes straddle the 64 KB, 128 KB, 256 KB, 512 KB and 1 MB thresholds
+- **THEN** each output contains exactly one ceiling line whose at-max count and whose ten
+  threshold shares equal the values computed by hand from that fixture's chunk sizes in its
+  `expected.txt` — non-zero for at least three of the five thresholds on the straddling fixture —
+  and every other line is unchanged
+
+#### Scenario: Ceiling line on a real capture
+
+- **WHEN** the script is run on a TCP bundle whose coalescing ratio is 1.00 and in which some
+  chunks reached a receive length that is one of the five printed thresholds
+- **THEN** the ceiling line's maximum size equals the receive length in force for that build and
+  the at-or-above share for that threshold equals the at-max share
+
+### Requirement: Receive-length decision record
+
+The profiling document SHALL hold a dated subsection recording the decision for the TCP
+transport's maximum receive length: the capture set it was computed from (bundles, AMSMB2
+version, device, server), the per-run ceiling table produced by the summary script, the reading of
+what raising and lowering the value could change in chunk count and per-chunk chain time — stating
+which of those figures are measured and which are derived by splitting each over-cap chunk at a
+hypothetical lower cap — the decision, and the rule under which the question is re-opened together
+with the arithmetic that sets the rule's threshold. Because the record decides *not* to change the
+transport, it SHALL say so explicitly, so that it is not read as a change that skipped the
+before/after delta the document requires of inbound-path changes. The transport source SHALL
+reference the subsection in the comment on the option.
+
+#### Scenario: Decision is traceable
+
+- **WHEN** a contributor reads the transport's receive-length comment
+- **THEN** they are pointed at the subsection, and every number in the subsection's decision is
+  either a value the summary script prints for one of the named bundles or is labelled as derived
+  from those values, with the derivation stated
+
+#### Scenario: Revisit condition is checkable from one line
+
+- **WHEN** a later capture is summarised with the script
+- **THEN** its ceiling line alone is enough to test the subsection's revisit rule

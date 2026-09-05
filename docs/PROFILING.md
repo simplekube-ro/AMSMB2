@@ -144,15 +144,17 @@ push-conversion (#45) need, the rc4 Baseline bundles included. The mode is not d
 bundle — a pre-#45 capture has reads on its chunk threads too, so no thread-based detector can
 tell the two apart — and the output names the mode it used on its `pairing:` line.
 
-It also accepts a directory that already holds `time-profile.xml` and `os-signpost.xml`. Three
+It also accepts a directory that already holds `time-profile.xml` and `os-signpost.xml`. Four
 hand-written exports under `test-fixtures/profiling/` pin the exact output in an `expected.txt`
 each, which is how the parsing and arithmetic are verified without a device: `per-thread-export`
 is shaped like an rc5 capture (two delivery threads whose reads and chunks interleave, one attach
 carry-over, one superseded read, one trailing read, one byte mismatch; its header comment also
 states what the global FIFO reports for the same rows), `sample-export` is shaped like a pre-#45
 capture (reads on the NIO thread, chunks on the pump thread, one coalesced group) and is run in
-global mode, and `no-transport-read-export` is the first fixture without its `TransportRead`
-rows, the shape of a QUIC capture:
+global mode, `no-transport-read-export` is the first fixture without its `TransportRead`
+rows, the shape of a QUIC capture, and `ceiling-export` is seven read/chunk pairs whose sizes
+straddle the ceiling line's five thresholds (the other three top out at 1500-byte chunks, which
+would leave the threshold shares covered only at zero):
 
 ```
 diff <(scripts/profile-summary.sh test-fixtures/profiling/per-thread-export) \
@@ -161,6 +163,8 @@ diff <(scripts/profile-summary.sh --pairing global test-fixtures/profiling/sampl
      test-fixtures/profiling/sample-export/expected.txt
 diff <(scripts/profile-summary.sh test-fixtures/profiling/no-transport-read-export) \
      test-fixtures/profiling/no-transport-read-export/expected.txt
+diff <(scripts/profile-summary.sh test-fixtures/profiling/ceiling-export) \
+     test-fixtures/profiling/ceiling-export/expected.txt
 ```
 
 The fixtures pin the parser's arithmetic, not the export format. After changing the parser, also
@@ -192,6 +196,7 @@ below was captured with it. The signposts measure both:
 | Per-thread CPU | `time-profile` | Samples per thread and share of total. The unnamed `RandomPlayer (0x…)` threads are the Swift cooperative pool; `NIO-SGLTN-*` is the NIOTS event loop; the cooperative-pool share is the signature #45 should shrink. |
 | `TransportRead` | event, bytes | One per chunk the TCP transport receives on the network stack's queue. **TCP transport only** — a QUIC capture has none, and the script prints `n/a` for the two derived metrics instead of pairing errors. |
 | `InboundChunk` | event, bytes | One per non-empty chunk the bridge appends to its FIFO. Total `InboundChunk` bytes equal total `TransportRead` bytes: coalescing changes counts, never bytes. |
+| `InboundChunk` ceiling | derived | A refinement of the chunk-size distribution above, printed on its own line right after it: how many chunks are at the largest observed size, with their share of the chunk count (three decimals) and of the byte total (two), then the share of chunks and of bytes at or above 64 KB, 128 KB, 256 KB, 512 KB and 1 MB. The thresholds are fixed so the line reads the same across captures, and the shares are finer than the per-thread table's one decimal because an at-cap chunk share is a fraction of a percent while its byte share is whole percents. This is the saturation of the receive path: it separates "the transport's `maximumReceiveLength` never bound this capture" from "the cap made no difference", which is the question Receive length (#46) answers. **It reads the receive length only where the coalescing ratio is 1.00** — a TCP capture of 6.0.0-rc5 or later, where each read is forwarded as exactly one chunk. On a pre-#45 bundle read with `--pairing global`, or on a QUIC capture whose chunks have no `TransportRead` at all, the maximum is a coalesced maximum and reaches the cap only by accident. With no `InboundChunk` events the line prints `ceiling: n/a`. |
 | Coalescing ratio | derived | `TransportRead` count ÷ `InboundChunk` count; in global mode also the reads-per-chunk distribution (in per-thread mode every pair is one read to one chunk by construction, so it is not printed). After #45 it is **1.00 by construction for the connection's lifetime**: the transport hands each read to the bridge inside the same callback, and a zero-length read is skipped before `TransportRead` is emitted, so every read has exactly one non-empty chunk to pair with. The one exception is a read that races bridge teardown — the bridge is closed but `transport.close()` has not run yet, so the channel can still read for a moment and the bridge drops the delivery — which leaves that read unpaired (the script's *read without a chunk*); expect at most a couple per connection, at the end. A ratio above 1 is otherwise only possible in a pre-#45 capture, where it was direct evidence of pump backlog. |
 | Pump-hop latency | derived | In per-thread mode (the default) the script keys `TransportRead` and `InboundChunk` by the thread that emitted them, keeps at most one read pending per thread, and pairs each chunk with its thread's pending read of equal byte count: chunk time − read time. A chunk with no read pending on its thread is a *chunk without a read*, counted, not an error; expect at most one per attach (the carry-over: its read preceded the recording), plus one per `TransportRead` signpost the recorder dropped (xctrace warns `log/signpost messages lost due to high rates`; a handful on a lossy run), plus every chunk of a QUIC connection in a mixed TCP + QUIC capture (the QUIC transport emits no `TransportRead`; on a QUIC-only capture there is nothing to pair and the metric is `n/a`, see the `TransportRead` row). A read followed on its thread by another read, or by the end of the capture, with no chunk in between is a *read without a chunk*: the teardown race above (at most a couple per connection, at the end) plus one per `InboundChunk` signpost the recorder dropped. A chunk whose pending read has a different byte count is a pairing error, printed with both counts and the thread. The `pairing:` line also gives the number of *delivery threads* (distinct threads that emitted either event; NIOTS may serve two connections from one loop thread, so it can undercount connections). In global mode (`--pairing global`, for captures before #45, where the chunk was appended from a pump task on another thread) the script instead pops `TransportRead`s from one FIFO across all threads until their bytes sum to the chunk size and reports chunk time − first popped read time; overshoot and underflow are pairing errors, and interleaved connections mispair. After #45 this is the residual **in-callback hand-off** — the bridge lock and the FIFO append, with the `Data` copy already done before `TransportRead` — not an executor hop. In the pre-#45 Baseline it is the network-queue → cooperative-pool hop that the conversion removed, which is what the before/after delta reads. |
 | `ServiceDispatch` | interval | From the inbound-ready signal arming a pass (debounce accepts) to the armed signal being cleared: the pass beginning on `eventLoopQueue`, or teardown clearing it first. This is the debounce + queue hop that stays after #45. |
@@ -535,6 +540,102 @@ Procedure notes from this capture:
 Bundles are kept locally in `../RandomPlayer/profiling/` as `rc5-run{1,2,3}.trace` (gitignored);
 the summaries above are the record.
 
+## Receive length (#46)
+
+Recorded 2026-09-05. The decision on `NIOTSChannelOptions.maximumReceiveLength`, the 256 KB
+(`1 << 18`) receive cap PR #43 set on the NIOTS bootstrap in `AMSMB2/TCPTransportApple.swift`
+with a note that the value should be measured.
+
+**Capture set.** The three bundles of the After section above — `rc5-run{1,2,3}.trace` in
+`../RandomPlayer/profiling/` (gitignored), AMSMB2 6.0.0-rc5 (ff39d15), RandomPlayer 2949293e,
+Apple TV 4K (3rd generation) "Birou" on tvOS 26.6, same server and link, `xctrace` 16.0 —
+re-summarised with `scripts/profile-summary.sh` in its default per-thread mode. No capture was
+taken at any other cap; why one cannot change the bound is below. Every run's coalescing ratio is
+1.00, which is what makes the chunk ceiling a reading of the receive length at all (see the
+`InboundChunk` ceiling row in Metrics).
+
+**Per-run ceiling.** The `InboundChunk` ceiling line of each run, verbatim:
+
+```
+run 1:   InboundChunk     ceiling: 65 chunks at the max size 262144 (0.429% of chunks, 4.27% of bytes); at or above 65536: 7.549% / 38.34%, 131072: 3.071% / 22.66%, 262144: 0.429% / 4.27%, 524288: 0.000% / 0.00%, 1048576: 0.000% / 0.00%
+run 2:   InboundChunk     ceiling: 65 chunks at the max size 262144 (0.330% of chunks, 4.69% of bytes); at or above 65536: 0.873% / 8.19%, 131072: 0.497% / 6.28%, 262144: 0.330% / 4.69%, 524288: 0.000% / 0.00%, 1048576: 0.000% / 0.00%
+run 3:   InboundChunk     ceiling: 65 chunks at the max size 262144 (0.245% of chunks, 3.47% of bytes); at or above 65536: 1.000% / 8.44%, 131072: 0.502% / 5.94%, 262144: 0.245% / 3.47%, 524288: 0.000% / 0.00%, 1048576: 0.000% / 0.00%
+```
+
+| Metric | Run 1 (outlier) | Run 2 | Run 3 (median) |
+|---|---|---|---|
+| Chunks / chunk bytes | 15142 / 399 MB | 19709 / 364 MB | 26494 / 491 MB |
+| Active span | 11.289 s | 5.776 s | 8.477 s |
+| Chunk size median / p95 (bytes) | 15928 / 92672 | 14480 / 27512 | 14480 / 28960 |
+| At the cap (max size 262144) | 65 = 0.429% of chunks, 4.27% of bytes | 65 = 0.330%, 4.69% | 65 = 0.245%, 3.47% |
+| At or above 131072 | 3.071% / 22.66% | 0.497% / 6.28% | 0.502% / 5.94% |
+| At or above 65536 | 7.549% / 38.34% | 0.873% / 8.19% | 1.000% / 8.44% |
+| At or above 524288, 1048576 | 0.000% / 0.00% | 0.000% / 0.00% | 0.000% / 0.00% |
+| *Derived:* extra chunks if the cap were 131072 | +465 (+3.1%) | +98 (+0.5%) | +133 (+0.5%) |
+| *Derived:* extra chunks if the cap were 65536 | +1819 (+12.0%) | +345 (+1.8%) | +482 (+1.8%) |
+| *Measured (from the bundles' raw chunk sizes, not from the summary output):* chunks that are whole multiples of 1448 bytes | 86% | 98% | 98% |
+
+Reading:
+
+- **Measured — the cap is not what shapes the distribution.** It is reached by 0.25–0.43% of
+  chunks (65 per run, 3.5–4.7% of bytes) while the median chunk is 14–16 KB and 86–98% of chunks
+  are whole multiples of 1448 bytes, one TCP segment payload. The shape comes from segment cadence
+  and from `minimumIncompleteReceiveLength` staying at its default of 1 — `NWConnection` completes
+  a receive as soon as the socket has data, so a chunk reaches the cap only when the kernel queued
+  more than 256 KB between two completions. Since the inbound push-conversion (#45) the transport
+  forwards each read as exactly one `InboundChunk` (coalescing ratio 1.00 in all three runs), so
+  the chunk ceiling *is* the receive length, and these three bundles bound the effect of any cap
+  in [64 KB, 1 MB] in both directions: raising it can only merge chunks that are at the cap,
+  lowering it can only split chunks above the new one.
+- **Raising it — an upper bound of 65 chunks per run.** At most the 65 at-cap chunks can merge:
+  under 0.43% of the chunk count, about 65 × 25 µs ≈ 1.6 ms of the 25 µs per-chunk chain (After,
+  delta table) over a 5.8–11.3 s fill. *Caveat on the 65:* the same count in three runs that
+  differ in length (15142 / 19709 / 26494 chunks), byte total and p95 is unexplained, and an exact
+  invariant across runs that differ in every other respect is the signature of a systematic
+  artefact rather than of a coincidence. It does not move the decision either way. If the 65 are
+  real saturation, raising the cap removes at most those 65; if some of them returned exactly
+  262144 without the socket being full, the at-cap count *overstates* what raising could remove
+  and the bound is only more conservative.
+- **Lowering it — a cost with no identified benefit.** The two "extra chunks" rows are **derived,
+  not measured**: each chunk larger than the hypothetical cap is split into ⌈size ÷ cap⌉ pieces
+  and the extra pieces are summed, over the same bundles' chunk sizes. (They are larger than the
+  ceiling line's counts above each threshold — 1143 / 172 / 265 chunks at or above 64 KB, the
+  ceiling line's 64 KB chunk share times the chunk count — because a chunk can be more than twice
+  a lower cap.) A real capture at a lower cap would also re-clock the receive loop, so the split
+  is a first-order estimate of the cost, not a prediction. Read per run and never averaged, since
+  run 1 is the documented outlier: +0.5% / +1.8% chunks at 128 KB / 64 KB on the two clean runs,
+  +3.1% / +12.0% on run 1. There is nothing on the other side of that cost:
+  `maximumReceiveLength` caps what a completion returns and pre-allocates nothing, so a smaller
+  value buys no memory.
+- **This is a decision not to change the transport.** There is no before/after delta under "Using
+  the baseline", step 3, because nothing was changed to capture a delta against; the evidence is
+  the ceiling of the existing bundles, and the argument is that no capture at another cap on this
+  workload could resolve an effect this small. The room above the cap is ~1.6 ms over a fill, and
+  the run-to-run spread the After section records is already wider than that (dispatch median
+  0.013–0.014 ms, pass p95 0.032–0.040 ms across five runs, throughput link-bound).
+
+**Decision: keep `1 << 18` (256 KB).**
+
+**Revisit rule.** Re-open #46 if either holds:
+
+1. A capture taken by the standard procedure shows an **at-cap share above 5% of chunks** on its
+   ceiling line, or
+2. `minimumIncompleteReceiveLength` is ever raised above 1, which changes the premise this whole
+   reading rests on (a receive completing as soon as the socket has data).
+
+The 5% is a **shape-change tripwire — an order of magnitude above every rc5 run (0.25–0.43%) — not
+a break-even point**, and the arithmetic is stated so the next reader can move it rather than
+inherit it: at a 5% at-cap share, run 3's 26494 chunks would put ~1325 at the cap, and merging
+every one of them saves at most 1325 × 25 µs ≈ 33 ms over that run's 8.5 s fill — still under a
+tenth of what #45 removed (the 15 µs the chain fell by — 40 → 25 in the After delta table — ×
+26494 ≈ 0.4 s). A share that made raising the cap worth #45-sized effort would be tens of percent.
+5% is chosen because above it the capture no longer looks like the one this decision was taken
+on, which is the honest trigger for re-measuring.
+
+Caveat on the capture set: one device, one server, three runs of one workload. The revisit rule is
+what carries the decision forward — the ceiling line makes testing it a one-line read of any later
+summary.
+
 ## Using the baseline
 
 For #45, #46, or any other change to the inbound path:
@@ -542,7 +643,9 @@ For #45, #46, or any other change to the inbound path:
 1. Same device, same server and link, uncached videos of comparable size, three runs, report the median.
 2. Run `scripts/profile-summary.sh` on each bundle (default per-thread pairing for anything
    captured with 6.0.0-rc5 or later; the rc4 Baseline bundles need `--pairing global`); never
-   read numbers off the Instruments GUI.
+   read numbers off the Instruments GUI. That output's `InboundChunk` ceiling line is also what
+   tests the revisit rule of Receive length (#46) — read it only when the same output's coalescing
+   ratio is 1.00.
 3. Compare against the Baseline (pre-#45) and After (post-#45) sections above. The evidence a PR
    must carry is the delta on the **per-thread shares** (the cooperative-pool threads called out
    — the signature #45 targets), the **`ServiceDispatch` and `ServicePass` percentiles**, the
