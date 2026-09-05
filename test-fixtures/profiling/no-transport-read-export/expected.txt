@@ -1,0 +1,19 @@
+Time profile: 10 samples
+  samples   share  thread
+        4   40.0%  Main Thread (0x100)
+        3   30.0%  NIO-SGLTN-1-#1 (0x101)
+        3   30.0%  RandomPlayer (0x102)
+
+Signposts (subsystem ro.SimpleKube.AMSMB2): 29 rows, 0 rows from other subsystems ignored
+  TransportRead    count 0, bytes 0, size n/a
+  InboundChunk     count 5, bytes 4600, size min 500 / median 900 / p95 1500 / max 1500
+  RecvDrain        count 8, bytes 4600, copied 4, EOF 1, would-block 3, size min 700 / median 900 / p95 2000 / max 2000
+  ServiceDispatch  count 4, duration ms min 0.100 / median 0.200 / p95 0.400 / max 0.400, unpaired 0
+  ServicePass      count 4, non-terminal 3, terminal 1, duration ms min 1.000 / median 1.500 / p95 2.000 / max 2.000, unpaired 0
+    terminal pass durations ms: 4.340
+  coalescing ratio: n/a (no TransportRead events)
+  pairing: per-thread (2 delivery threads)
+  pump-hop latency: n/a (no TransportRead events)
+  buffered at end: 0 bytes (InboundChunk 4600 - RecvDrain 4600)
+  throughput: 0.130 MB/s (RecvDrain 4600 bytes over 0.035 s)
+  active throughput: 0.130 MB/s (RecvDrain 4600 bytes over 0.035 s active; idle gaps > 1 s excluded)

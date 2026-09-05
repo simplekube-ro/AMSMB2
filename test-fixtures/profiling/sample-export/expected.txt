@@ -12,6 +12,7 @@ Signposts (subsystem ro.SimpleKube.AMSMB2): 44 rows, 1 row from other subsystems
   ServicePass      count 5, non-terminal 4, terminal 1, duration ms min 1.000 / median 1.000 / p95 2.000 / max 2.000, unpaired 0
     terminal pass durations ms: 4.340
   coalescing ratio: 1.60 (8 TransportRead / 5 InboundChunk)
+  pairing: global FIFO (byte-sum across threads; for captures before the inbound push-conversion, #45)
   reads per chunk: 1 read x4, 3 reads x1
   zero-byte TransportRead skipped: 1
   pump-hop latency ms: min 0.100 / median 0.200 / p95 0.900 / max 0.900 (5 pairs, 0 pairing errors)

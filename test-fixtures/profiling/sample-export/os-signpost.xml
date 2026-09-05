@@ -12,6 +12,11 @@
   elided as <sentinel/> (a real export carries a <return-location> tree there). The table is
   split over two <node> elements the way a real export is: only the first carries <schema>, the
   second holds rows only.
+  This is a pre-#45-shaped capture: the reads are on the NIO thread (0x101), the chunks on the
+  pump thread (0x102), and group B coalesces three reads into one chunk, which cannot happen since
+  the inbound push-conversion (#45). It therefore pins the global byte-sum pairing and is run with
+  the script's pairing option set to global (see docs/PROFILING.md); per-thread-export is the
+  post-#45-shaped fixture.
 
   Timeline (ns), subsystem ro.SimpleKube.AMSMB2 / category Inbound unless noted:
     group A (1:1):        TransportRead 1000 @1.000000000 -> InboundChunk 1000 @1.000100000  (hop 0.100 ms)

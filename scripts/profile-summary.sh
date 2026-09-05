@@ -1,8 +1,14 @@
 #!/bin/bash
 # Summarise an Instruments capture of the AMSMB2 inbound path without the Instruments GUI.
 #
-# Usage: scripts/profile-summary.sh <bundle.trace | export-dir>
+# Usage: scripts/profile-summary.sh [--pairing per-thread|global] <bundle.trace | export-dir>
 #
+#   --pairing     how TransportRead events are paired to InboundChunk events for the pump-hop
+#                 latency: per-thread (default; captures of 6.0.0-rc5 or later, where a read and
+#                 its chunk are emitted back to back on the delivery thread) or global (the
+#                 byte-sum FIFO across threads, for captures taken before the inbound
+#                 push-conversion, #45, such as the rc4 Baseline bundles). The mode used is
+#                 printed in the output.
 #   bundle.trace  exported with `xcrun xctrace export --xpath` (time-profile and os-signpost
 #                 tables) into a temp dir, then summarised
 #   export-dir    a directory holding time-profile.xml (required) and os-signpost.xml
@@ -11,8 +17,9 @@
 # Output (plain text, deterministic): total samples and a per-thread table, then per signpost
 # name under subsystem ro.SimpleKube.AMSMB2 the count, byte totals and size percentiles
 # (TransportRead, InboundChunk, RecvDrain), duration percentiles (ServiceDispatch, ServicePass;
-# terminal passes listed separately and excluded), the coalescing ratio, pump-hop latency,
-# bytes still buffered, and derived throughput. See docs/PROFILING.md for the metric definitions.
+# terminal passes listed separately and excluded), the coalescing ratio, the pairing mode,
+# pump-hop latency, bytes still buffered, and derived throughput. See docs/PROFILING.md for the
+# metric definitions.
 #
 # Conventions:
 #   - Percentiles use nearest-rank: over the N sorted values, pN is the value at 1-based index
@@ -22,10 +29,22 @@
 #   - RecvDrain: size stats cover drains that copied bytes; 0 (EOF) and -1 (would-block) are
 #     counted separately. -1 arrives from xctrace as uint64 18446744073709551615 and is folded
 #     back to a signed value.
-#   - Pump-hop pairing: TransportRead and InboundChunk events are walked in timestamp order;
-#     for each InboundChunk of S bytes, TransportReads are popped FIFO until they sum to S
-#     (zero-byte reads are skipped and counted); latency = chunk.ts - first popped read.ts.
-#     Overshoot or FIFO underflow is printed as a pairing error and counted, not fatal.
+#   - Pump-hop pairing, per-thread mode: TransportRead and InboundChunk events are walked in
+#     timestamp order keyed by the emitting thread (the row's <thread><tid>), with at most one
+#     read pending per thread. A chunk pairs with the pending read of equal bytes (latency =
+#     chunk.ts - read.ts). A chunk with no read pending on its thread is a "chunk without a
+#     read" (attach carry-over, a read signpost the recorder dropped, or a QUIC chunk); a read
+#     superseded by another read on its thread, or still pending at the end, is a "read without
+#     a chunk" (the teardown race). Both are counted, not errors. A chunk whose pending read has
+#     different bytes is a pairing error that consumes both events. So every chunk is exactly one
+#     of paired / without a read / error, and every non-zero read one of paired / without a
+#     chunk / error. The pairing line also gives the number of distinct threads that emitted
+#     either event ("delivery threads").
+#   - Pump-hop pairing, global mode: for each InboundChunk of S bytes, TransportReads are popped
+#     from one FIFO across all threads until they sum to S; latency = chunk.ts - first popped
+#     read.ts. Overshoot or FIFO underflow is printed as a pairing error and counted, not fatal;
+#     the reads-per-chunk distribution is printed. Zero-byte reads are skipped and counted in
+#     both modes.
 #   - Throughput = RecvDrain bytes / (last - first subsystem signpost timestamp), MB = 10^6 bytes.
 #     Active throughput divides by the active time instead: the sum of the gaps between
 #     consecutive subsystem signposts (all names, timestamp order) that are <= 1 s, so a burst
@@ -34,7 +53,8 @@
 #     paired by (name, signpost id) in that order.
 #
 # Exit status: 0 on success (including "no signposts"); 1 with a one-line message on stderr when
-# the input is not readable, has no time-profile table, or the xctrace export fails.
+# the input is not readable, has no time-profile table, a signpost row of the subsystem carries
+# no thread, the pairing mode is unknown, or the xctrace export fails.
 set -euo pipefail
 
 SUBSYSTEM="ro.SimpleKube.AMSMB2"
@@ -43,7 +63,24 @@ SP_XPATH='/trace-toc/run[1]/data/table[@schema="os-signpost"]'
 
 die() { echo "error: $*" >&2; exit 1; }
 
-[[ $# -eq 1 ]] || die "usage: $0 <bundle.trace | export-dir>"
+usage="usage: $0 [--pairing per-thread|global] <bundle.trace | export-dir>"
+pairing="per-thread"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --pairing)
+            [[ $# -ge 2 ]] || die "--pairing needs a value; $usage"
+            pairing="$2"
+            shift 2
+            ;;
+        -*) die "unknown option $1; $usage" ;;
+        *) break ;;
+    esac
+done
+case "$pairing" in
+    per-thread | global) ;;
+    *) die "unknown pairing mode '$pairing'; $usage" ;;
+esac
+[[ $# -eq 1 ]] || die "$usage"
 input="$1"
 
 tmpdir=""
@@ -84,7 +121,7 @@ else
     die "$input is neither a .trace bundle nor an export directory"
 fi
 
-python3 - "$export_dir" "$SUBSYSTEM" <<'PY'
+python3 - "$export_dir" "$SUBSYSTEM" "$pairing" <<'PY'
 import math
 import os
 import re
@@ -92,7 +129,7 @@ import sys
 from collections import Counter, deque
 import xml.etree.ElementTree as ET
 
-export_dir, subsystem = sys.argv[1], sys.argv[2]
+export_dir, subsystem, pairing = sys.argv[1], sys.argv[2], sys.argv[3]
 
 NS = 1_000_000_000
 IDLE_GAP_NS = NS  # gaps longer than this between signposts do not count as active time
@@ -201,6 +238,71 @@ def ms(ns):
     return f"{ns / 1_000_000:.3f}"
 
 
+# --- pump-hop pairing ------------------------------------------------------------------------
+# Both take the TransportRead and InboundChunk events in (ts, order) order and return the
+# latencies (ns) plus the counts described in the header's Conventions.
+
+def pair_per_thread(events):
+    """One pending read per thread; a chunk pairs with its thread's pending read of equal bytes.
+
+    Returns (latencies, chunks without a read, reads without a chunk, errors, zero-byte reads).
+    """
+    pending = {}  # tid -> (ts, bytes) of the read waiting for its chunk
+    latencies, errors = [], []
+    without_read = without_chunk = skipped_zero = 0
+    for ts, _, name, _, _, value, tid, label in events:
+        if name == "TransportRead":
+            if value == 0:
+                skipped_zero += 1
+            else:
+                if tid in pending:
+                    without_chunk += 1
+                pending[tid] = (ts, value)
+            continue
+        read = pending.pop(tid, None)
+        if read is None:
+            without_read += 1
+        elif read[1] == value:
+            latencies.append(ts - read[0])
+        else:
+            errors.append(f"mismatch: InboundChunk {value} bytes at {ts} ns on {label}, "
+                          f"pending TransportRead {read[1]} bytes")
+    without_chunk += len(pending)
+    return latencies, without_read, without_chunk, errors, skipped_zero
+
+
+def pair_global(events):
+    """Pop reads from one FIFO across threads until their bytes sum to each chunk.
+
+    Returns (latencies, reads-per-chunk Counter, errors, zero-byte reads).
+    """
+    fifo = deque()
+    latencies, errors = [], []
+    reads_per_chunk = Counter()
+    skipped_zero = 0
+    for ts, _, name, _, _, value, _, _ in events:
+        if name == "TransportRead":
+            if value == 0:
+                skipped_zero += 1
+            else:
+                fifo.append((ts, value))
+            continue
+        acc, n, first_ts = 0, 0, None
+        while acc < value and fifo:
+            rts, rbytes = fifo.popleft()
+            first_ts = rts if first_ts is None else first_ts
+            acc += rbytes
+            n += 1
+        if acc == value and n:
+            latencies.append(ts - first_ts)
+            reads_per_chunk[n] += 1
+        elif acc > value:
+            errors.append(f"overshoot: InboundChunk {value} bytes at {ts} ns, {n} reads sum to {acc}")
+        else:
+            errors.append(f"underflow: InboundChunk {value} bytes at {ts} ns, only {acc} TransportRead bytes queued")
+    return latencies, reads_per_chunk, errors, skipped_zero
+
+
 def main():
     # --- time profile ----------------------------------------------------------------------------
 
@@ -225,19 +327,22 @@ def main():
     # --- signposts -------------------------------------------------------------------------------
 
     sp_path = os.path.join(export_dir, "os-signpost.xml")
-    events = []  # (ts, order, name, kind, ident, value)
+    events = []  # (ts, order, name, kind, ident, value, tid, thread label)
     ignored = 0
     if os.path.isfile(sp_path):
         sp_rows, resolve = load_table(sp_path, "os-signpost",
-                             required=("time", "event-type", "identifier", "name", "subsystem", "message"))
+                             required=("time", "thread", "event-type", "identifier", "name", "subsystem", "message"))
         for order, row in enumerate(sp_rows):
             sub = row["subsystem"]
             if sub is None or (sub.text or "").strip() != subsystem:
                 ignored += 1
                 continue
-            for col in ("time", "event-type", "identifier", "name"):
+            for col in ("time", "thread", "event-type", "identifier", "name"):
                 if row[col] is None:
                     raise Fail(f"{sp_path}: signpost row {order + 1} has an empty {col} cell")
+            tid = row["thread"].find("tid")
+            if tid is None:
+                raise Fail(f"{sp_path}: signpost row {order + 1} has a thread without a tid")
             events.append((
                 text_int(row["time"], "timestamp"),
                 order,
@@ -245,6 +350,8 @@ def main():
                 (row["event-type"].text or "").strip(),
                 (row["identifier"].text or "").strip(),
                 message_value(row["message"], resolve),
+                (resolve(tid).text or "").strip(),
+                thread_label(row["thread"]),
             ))
 
     print()
@@ -291,7 +398,7 @@ def main():
         paired = []  # (duration ns, end value)
         unpaired = 0
         for ev in by_name.get(name, []):
-            ts, _, _, kind, ident, value = ev
+            ts, _, _, kind, ident, value, _, _ = ev
             if kind == "Begin":
                 if ident in open_begins:
                     unpaired += 1
@@ -318,50 +425,39 @@ def main():
     if terminal:
         print("    terminal pass durations ms: " + ", ".join(ms(d) for d in terminal))
 
-    # Coalescing ratio and pump-hop latency (FIFO byte-sum pairing).
+    # Coalescing ratio and pump-hop latency. The pairing mode is an input, so its line is printed
+    # even when there is nothing to pair.
     reads = by_name.get("TransportRead", [])
     chunks = by_name.get("InboundChunk", [])
+    if pairing == "per-thread":
+        threads = {ev[6] for ev in reads + chunks}
+        pairing_line = f"per-thread ({len(threads)} delivery threads)"
+    else:
+        pairing_line = "global FIFO (byte-sum across threads; for captures before the inbound push-conversion, #45)"
     if not reads:
         print("  coalescing ratio: n/a (no TransportRead events)")
+        print(f"  pairing: {pairing_line}")
         print("  pump-hop latency: n/a (no TransportRead events)")
     else:
         ratio = f"{len(reads) / len(chunks):.2f}" if chunks else "n/a"
         print(f"  coalescing ratio: {ratio} ({len(reads)} TransportRead / {len(chunks)} InboundChunk)")
+        print(f"  pairing: {pairing_line}")
 
-        fifo = deque()
-        skipped_zero = 0
-        latencies = []
-        reads_per_chunk = Counter()
-        errors = []
-        for ev in sorted(reads + chunks, key=lambda e: (e[0], e[1])):
-            ts, _, name, _, _, value = ev
-            if name == "TransportRead":
-                if value == 0:
-                    skipped_zero += 1
-                else:
-                    fifo.append((ts, value))
-                continue
-            acc, n, first_ts = 0, 0, None
-            while acc < value and fifo:
-                rts, rbytes = fifo.popleft()
-                first_ts = rts if first_ts is None else first_ts
-                acc += rbytes
-                n += 1
-            if acc == value and n:
-                latencies.append(ts - first_ts)
-                reads_per_chunk[n] += 1
-            elif acc > value:
-                errors.append(f"overshoot: InboundChunk {value} bytes at {ts} ns, {n} reads sum to {acc}")
-            else:
-                errors.append(f"underflow: InboundChunk {value} bytes at {ts} ns, only {acc} TransportRead bytes queued")
-
-        if reads_per_chunk:
-            dist = ", ".join(f"{n} read{'s' if n != 1 else ''} x{c}" for n, c in sorted(reads_per_chunk.items()))
+        ordered = sorted(reads + chunks, key=lambda e: (e[0], e[1]))
+        if pairing == "per-thread":
+            latencies, without_read, without_chunk, errors, skipped_zero = pair_per_thread(ordered)
+            counts = (f"{len(latencies)} pairs, {without_read} chunks without a read, "
+                      f"{without_chunk} reads without a chunk, {len(errors)} pairing errors")
         else:
-            dist = "none"
-        print(f"  reads per chunk: {dist}")
+            latencies, reads_per_chunk, errors, skipped_zero = pair_global(ordered)
+            if reads_per_chunk:
+                dist = ", ".join(f"{n} read{'s' if n != 1 else ''} x{c}" for n, c in sorted(reads_per_chunk.items()))
+            else:
+                dist = "none"
+            print(f"  reads per chunk: {dist}")
+            counts = f"{len(latencies)} pairs, {len(errors)} pairing errors"
         print(f"  zero-byte TransportRead skipped: {skipped_zero}")
-        print(f"  pump-hop latency ms: {stats(latencies, ms)} ({len(latencies)} pairs, {len(errors)} pairing errors)")
+        print(f"  pump-hop latency ms: {stats(latencies, ms)} ({counts})")
         for err in errors:
             print(f"    pairing error: {err}")
 

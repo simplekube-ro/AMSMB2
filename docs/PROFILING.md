@@ -132,21 +132,38 @@ pass durations, per-thread shares) across runs rather than the MB/s figure.
 ## Export and summarise
 
 ```
-scripts/profile-summary.sh <bundle.trace>
+scripts/profile-summary.sh [--pairing per-thread|global] <bundle.trace>
 ```
 
 The script exports the `time-profile` and `os-signpost` tables with `xcrun xctrace export
 --xpath`, resolves the export's `ref`/`id` back-references, and prints the metrics below as plain
-text. It also accepts a directory that already holds `time-profile.xml` and `os-signpost.xml`;
-`test-fixtures/profiling/sample-export/` is a hand-written export whose exact output is pinned in
-`expected.txt`, which is how the parsing and arithmetic are verified without a device:
+text. `--pairing` selects how `TransportRead` events are paired to `InboundChunk` events for the
+pump-hop latency (see Metrics): `per-thread`, the default, is right for every capture of
+6.0.0-rc5 or later; `global` is the byte-sum FIFO that captures taken before the inbound
+push-conversion (#45) need, the rc4 Baseline bundles included. The mode is not detected from the
+bundle — a pre-#45 capture has reads on its chunk threads too, so no thread-based detector can
+tell the two apart — and the output names the mode it used on its `pairing:` line.
+
+It also accepts a directory that already holds `time-profile.xml` and `os-signpost.xml`. Three
+hand-written exports under `test-fixtures/profiling/` pin the exact output in an `expected.txt`
+each, which is how the parsing and arithmetic are verified without a device: `per-thread-export`
+is shaped like an rc5 capture (two delivery threads whose reads and chunks interleave, one attach
+carry-over, one superseded read, one trailing read, one byte mismatch; its header comment also
+states what the global FIFO reports for the same rows), `sample-export` is shaped like a pre-#45
+capture (reads on the NIO thread, chunks on the pump thread, one coalesced group) and is run in
+global mode, and `no-transport-read-export` is the first fixture without its `TransportRead`
+rows, the shape of a QUIC capture:
 
 ```
-diff <(scripts/profile-summary.sh test-fixtures/profiling/sample-export) \
+diff <(scripts/profile-summary.sh test-fixtures/profiling/per-thread-export) \
+     test-fixtures/profiling/per-thread-export/expected.txt
+diff <(scripts/profile-summary.sh --pairing global test-fixtures/profiling/sample-export) \
      test-fixtures/profiling/sample-export/expected.txt
+diff <(scripts/profile-summary.sh test-fixtures/profiling/no-transport-read-export) \
+     test-fixtures/profiling/no-transport-read-export/expected.txt
 ```
 
-The fixture pins the parser's arithmetic, not the export format. After changing the parser, also
+The fixtures pin the parser's arithmetic, not the export format. After changing the parser, also
 record a throwaway macOS program that emits the five names through `os_signpost` (same
 subsystem, category, `bytes=%ld` / `terminal=%ld` formats) with
 `xcrun xctrace record --template 'Time Profiler' --instrument os_signpost --launch -- <binary>`
@@ -159,7 +176,8 @@ then reports the failed table and exits 1 without parsing a truncated file. Re-r
 
 Percentiles are nearest-rank (median = p50). A bundle without the subsystem's signposts prints
 the per-thread table followed by `no ro.SimpleKube.AMSMB2 signposts` and exits 0; an unreadable
-path or a bundle with no time-profile table exits 1 with a one-line message.
+path, a bundle with no time-profile table, a signpost row without a thread, or an unknown
+`--pairing` value exits 1 with a one-line message.
 
 ## Metrics
 
@@ -174,8 +192,8 @@ below was captured with it. The signposts measure both:
 | Per-thread CPU | `time-profile` | Samples per thread and share of total. The unnamed `RandomPlayer (0x…)` threads are the Swift cooperative pool; `NIO-SGLTN-*` is the NIOTS event loop; the cooperative-pool share is the signature #45 should shrink. |
 | `TransportRead` | event, bytes | One per chunk the TCP transport receives on the network stack's queue. **TCP transport only** — a QUIC capture has none, and the script prints `n/a` for the two derived metrics instead of pairing errors. |
 | `InboundChunk` | event, bytes | One per non-empty chunk the bridge appends to its FIFO. Total `InboundChunk` bytes equal total `TransportRead` bytes: coalescing changes counts, never bytes. |
-| Coalescing ratio | derived | `TransportRead` count ÷ `InboundChunk` count, plus the reads-per-chunk distribution. After #45 it is **1.00 by construction for the connection's lifetime**: the transport hands each read to the bridge inside the same callback, and a zero-length read is skipped before `TransportRead` is emitted, so every read has exactly one non-empty chunk to pair with. The one exception is a read that races bridge teardown — the bridge is closed but `transport.close()` has not run yet, so the channel can still read for a moment and the bridge drops the delivery — which leaves that read unpaired; expect at most a couple per connection, at the end. A ratio above 1 is otherwise only possible in a pre-#45 capture, where it was direct evidence of pump backlog. |
-| Pump-hop latency | derived | For each `InboundChunk` the script pops `TransportRead`s in FIFO order until their bytes sum to the chunk size and reports chunk time − first popped read time. After #45 this is the residual **in-callback hand-off** — the bridge lock and the FIFO append, with the `Data` copy already done before `TransportRead` — not an executor hop. In the pre-#45 Baseline it is the network-queue → cooperative-pool hop that the conversion removed, which is what the before/after delta reads. |
+| Coalescing ratio | derived | `TransportRead` count ÷ `InboundChunk` count; in global mode also the reads-per-chunk distribution (in per-thread mode every pair is one read to one chunk by construction, so it is not printed). After #45 it is **1.00 by construction for the connection's lifetime**: the transport hands each read to the bridge inside the same callback, and a zero-length read is skipped before `TransportRead` is emitted, so every read has exactly one non-empty chunk to pair with. The one exception is a read that races bridge teardown — the bridge is closed but `transport.close()` has not run yet, so the channel can still read for a moment and the bridge drops the delivery — which leaves that read unpaired (the script's *read without a chunk*); expect at most a couple per connection, at the end. A ratio above 1 is otherwise only possible in a pre-#45 capture, where it was direct evidence of pump backlog. |
+| Pump-hop latency | derived | In per-thread mode (the default) the script keys `TransportRead` and `InboundChunk` by the thread that emitted them, keeps at most one read pending per thread, and pairs each chunk with its thread's pending read of equal byte count: chunk time − read time. A chunk with no read pending on its thread is a *chunk without a read*, counted, not an error; expect at most one per attach (the carry-over: its read preceded the recording), plus one per `TransportRead` signpost the recorder dropped (xctrace warns `log/signpost messages lost due to high rates`; a handful on a lossy run), plus every chunk of a QUIC connection in a mixed TCP + QUIC capture (the QUIC transport emits no `TransportRead`; on a QUIC-only capture there is nothing to pair and the metric is `n/a`, see the `TransportRead` row). A read followed on its thread by another read, or by the end of the capture, with no chunk in between is a *read without a chunk*: the teardown race above (at most a couple per connection, at the end) plus one per `InboundChunk` signpost the recorder dropped. A chunk whose pending read has a different byte count is a pairing error, printed with both counts and the thread. The `pairing:` line also gives the number of *delivery threads* (distinct threads that emitted either event; NIOTS may serve two connections from one loop thread, so it can undercount connections). In global mode (`--pairing global`, for captures before #45, where the chunk was appended from a pump task on another thread) the script instead pops `TransportRead`s from one FIFO across all threads until their bytes sum to the chunk size and reports chunk time − first popped read time; overshoot and underflow are pairing errors, and interleaved connections mispair. After #45 this is the residual **in-callback hand-off** — the bridge lock and the FIFO append, with the `Data` copy already done before `TransportRead` — not an executor hop. In the pre-#45 Baseline it is the network-queue → cooperative-pool hop that the conversion removed, which is what the before/after delta reads. |
 | `ServiceDispatch` | interval | From the inbound-ready signal arming a pass (debounce accepts) to the armed signal being cleared: the pass beginning on `eventLoopQueue`, or teardown clearing it first. This is the debounce + queue hop that stays after #45. |
 | `ServicePass` | interval, `terminal=0/1` | One signal-driven service pass (`smb2_service`, outbound flush, timer reschedule). `terminal=1` means the seam was gone when the pass ended: the pass tore it down (service failure or flush failure) or teardown ran while the pass was already dispatched. Terminal passes are listed separately and excluded from the duration percentiles because they include teardown and context destruction. |
 | `RecvDrain` | event, bytes | One per libsmb2 drain of the FIFO: bytes copied, `0` for EOF, `-1` for would-block. Total `RecvDrain` bytes never exceed total `InboundChunk` bytes; the difference is what was still buffered when recording stopped (`buffered at end`). |
@@ -213,7 +231,8 @@ median duration: run 3 0.010 ms, **run 2 0.011 ms**, run 1 0.012 ms).
 | Instruments | Time Profiler + os_signpost, attached to the running app, no debugger library in the process list |
 | Runs | 3 (median reported) |
 
-Script output of the median run (run 2):
+Script output of the median run (run 2), regenerated with the #69 script in `--pairing global`
+mode (the pairing block changed shape; every other line is as originally recorded):
 
 ```
 Time profile: 98194 samples
@@ -287,6 +306,7 @@ Signposts (subsystem ro.SimpleKube.AMSMB2): 49923 rows, 7462 rows from other sub
   ServiceDispatch  count 6207, duration ms min 0.007 / median 0.013 / p95 0.026 / max 1.552, unpaired 0
   ServicePass      count 6207, non-terminal 6207, terminal 0, duration ms min 0.005 / median 0.011 / p95 0.032 / max 0.481, unpaired 0
   coalescing ratio: 1.00 (6207 TransportRead / 6207 InboundChunk)
+  pairing: global FIFO (byte-sum across threads; for captures before the inbound push-conversion, #45)
   reads per chunk: 1 read x6207
   zero-byte TransportRead skipped: 0
   pump-hop latency ms: min 0.008 / median 0.016 / p95 0.031 / max 0.372 (6207 pairs, 0 pairing errors)
@@ -339,7 +359,8 @@ same Apple TV, three runs, median run reported (median by `ServicePass` median d
 | Instruments | Time Profiler + os_signpost, attached to the running app, no debugger library in the process list |
 | Runs | 3 (median reported) |
 
-Script output of the median run (run 3):
+Script output of the median run (run 3), regenerated with the #69 script in its default
+per-thread mode (the pairing block changed shape; every other line is as originally recorded):
 
 ```
 Time profile: 87282 samples
@@ -415,9 +436,9 @@ Signposts (subsystem ro.SimpleKube.AMSMB2): 213141 rows, 2826 rows from other su
   ServiceDispatch  count 26487, duration ms min 0.003 / median 0.014 / p95 0.038 / max 1.460, unpaired 0
   ServicePass      count 26488, non-terminal 26488, terminal 0, duration ms min 0.002 / median 0.009 / p95 0.035 / max 7.491, unpaired 0
   coalescing ratio: 1.00 (26494 TransportRead / 26494 InboundChunk)
-  reads per chunk: 1 read x26494
+  pairing: per-thread (10 delivery threads)
   zero-byte TransportRead skipped: 0
-  pump-hop latency ms: min 0.001 / median 0.002 / p95 0.007 / max 2.078 (26494 pairs, 0 pairing errors)
+  pump-hop latency ms: min 0.001 / median 0.002 / p95 0.007 / max 2.078 (26494 pairs, 0 chunks without a read, 0 reads without a chunk, 0 pairing errors)
   buffered at end: -21720 bytes (InboundChunk 491356162 - RecvDrain 491377882)
   throughput: 57.963 MB/s (RecvDrain 491377882 bytes over 8.477 s)
   active throughput: 57.963 MB/s (RecvDrain 491377882 bytes over 8.477 s active; idle gaps > 1 s excluded)
@@ -435,7 +456,7 @@ operator did not note run 2's file name.
 |---|---|---|---|
 | Bytes drained | 399 MB | 364 MB | 491 MB |
 | Active throughput | 35.3 MB/s | 63.0 MB/s | 58.0 MB/s |
-| Connections (threads emitting `TransportRead`) | 13 | 9 | 10 |
+| Delivery threads (threads emitting `TransportRead` or `InboundChunk`) | 13 | 9 | 10 |
 | Coalescing ratio | 1.00 | 1.00 | 1.00 |
 | Pump-hop latency median / p95 / max (ms), per-thread pairing | 0.002 / 0.012 / 5.551 | 0.002 / 0.008 / 0.578 | 0.002 / 0.007 / 2.078 |
 | Dispatch latency median / p95 (ms) | 0.026 / 0.104 | 0.014 / 0.040 | 0.014 / 0.038 |
@@ -443,7 +464,14 @@ operator did not note run 2's file name.
 | Chunk size median / p95 (bytes) | 15928 / 92672 | 14480 / 27512 | 14480 / 28960 |
 | Main thread share of samples | 19.5% | 42.0% | 20.3% |
 | Largest unnamed-thread share | 4.8% | 9.5% | 11.8% |
-| Global-FIFO pairing errors reported by the script | 155 | 1 | 0 |
+| Global-FIFO pairing errors reported by the pre-#69 script | 155 | 1 | 0 |
+
+The delivery-thread and per-thread pairing rows were computed by hand from the signpost export
+for PR #68; since #69 the script prints both in its default mode (the `pairing:` line and the
+pump-hop line), and re-running it on the three bundles reproduces them unchanged: 15141 / 19708 /
+26494 pairs, 1 / 1 / 0 chunks without a read (the attach carry-over), 0 reads without a chunk,
+0 pairing errors. The last row is what the global FIFO reported, reproducible with
+`--pairing global`.
 
 Delta against the Baseline (same script, same procedure, median run against median run). The
 merge condition was no regression in the dispatch/pass percentiles or active throughput, and no
@@ -491,14 +519,15 @@ Procedure notes from this capture:
 - `xcrun xctrace record --attach <pid>` failed once with `Cannot find process for provided pid`
   for a pid that `devicectl device info processes` had just listed; the identical command a
   minute later attached. Retry before falling back to `--attach RandomPlayer`.
-- The script pairs `TransportRead` to `InboundChunk` in one global FIFO across all connections.
-  RandomPlayer fills over 9–13 connections at once, so when two connections' reads interleave
-  the global pairing reports overshoot/underflow pairs that are not real (run 1: 155; run 2: 1;
-  run 3: 0). After the conversion every read and its chunk are on one thread, so pairing keyed
-  by thread is exact: recomputed that way the three runs give 15141 / 19708 / 26494 pairs with
-  at most one attach carry-over each and the same latency percentiles the script prints for
-  run 3. Keying the script's pairing by thread is a follow-up; until then read the hop row from
-  a run with zero reported errors, or recompute per thread.
+- The script's original pairing walked `TransportRead` and `InboundChunk` in one global FIFO
+  across all connections. RandomPlayer fills over 9–13 connections at once, so when two
+  connections' reads interleaved the global pairing reported overshoot/underflow pairs that are
+  not real (run 1: 155; run 2: 1; run 3: 0). After the conversion every read and its chunk are
+  on one thread, so the script now pairs per thread by default (#69): the three runs give
+  15141 / 19708 / 26494 pairs, 0 pairing errors, and the percentiles in the table, and the attach
+  carry-over of runs 1 and 2 reads as `1 chunks without a read` on the pump-hop line rather
+  than as an error. The global FIFO stays available as `--pairing global` for the rc4 Baseline
+  bundles.
 - Attach carry-over as documented above: run 3's `buffered at end` is −21720 bytes (one chunk
   appended before the attach, drained inside it); runs 1 and 2 each have one `InboundChunk`
   whose `TransportRead` preceded the attach.
@@ -511,7 +540,9 @@ the summaries above are the record.
 For #45, #46, or any other change to the inbound path:
 
 1. Same device, same server and link, uncached videos of comparable size, three runs, report the median.
-2. Run `scripts/profile-summary.sh` on each bundle; never read numbers off the Instruments GUI.
+2. Run `scripts/profile-summary.sh` on each bundle (default per-thread pairing for anything
+   captured with 6.0.0-rc5 or later; the rc4 Baseline bundles need `--pairing global`); never
+   read numbers off the Instruments GUI.
 3. Compare against the Baseline (pre-#45) and After (post-#45) sections above. The evidence a PR
    must carry is the delta on the **per-thread shares** (the cooperative-pool threads called out
    — the signature #45 targets), the **`ServiceDispatch` and `ServicePass` percentiles**, the
