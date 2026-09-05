@@ -24,3 +24,11 @@ Swift suite.
   time-profile block is then meaningless but the whole signpost block is real.
 - **`--` is illegal inside an XML comment**, so fixture header comments must paraphrase
   (`the pairing option set to global`) instead of writing `--pairing global`. Do not "fix" that.
+- Fixture header comments carry a hand-computed "Expected numbers" block that is the audit trail
+  for `expected.txt`. Recompute it, not just the `diff`: the two can disagree (seen 2026-09-05 on
+  `ceiling-export`, where the comment truncated 96.478/89.587 to 96.47/89.58 while `expected.txt`
+  correctly rounds to 96.48/89.59). A clean `diff` proves the script self-consistent, not right.
+- When a doc records numbers "from the script", check they are actually *printed* by it. Figures
+  needing the raw size list (e.g. "% of chunks that are whole multiples of 1448 bytes", per-run
+  at-or-above chunk *counts*) come from an uncommitted ad-hoc reader and must be labelled
+  measured-from-raw-sizes, not "derived".

@@ -16,6 +16,7 @@
 - [stream-premature-eof.md](stream-premature-eof.md) — AsyncInputStream premature-EOF fix guardrails.
 - [inbound-profiling-review.md](inbound-profiling-review.md) — issue #44 profiling gate verdict; inbound hop chain, os_signpost vararg cost, availability facts.
 - [regate-fix-swift6-concurrency.md](regate-fix-swift6-concurrency.md) — re-gate precedent for scope expansions.
+- [receive-length-sweep-review.md](receive-length-sweep-review.md) — #46 gate history (sweep, then decision record); RandomPlayer fill facts + method traps.
 
 ## Invariants
 - [cbdata-ownership-contract.md](cbdata-ownership-contract.md) — exactly-once CBData retain/release balance with libsmb2.
