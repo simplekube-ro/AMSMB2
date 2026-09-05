@@ -7,6 +7,7 @@ Time profile: 10 samples
 Signposts (subsystem ro.SimpleKube.AMSMB2): 44 rows, 1 row from other subsystems ignored
   TransportRead    count 8, bytes 7572, size min 0 / median 700 / p95 3000 / max 3000
   InboundChunk     count 5, bytes 7572, size min 72 / median 1500 / p95 3000 / max 3000
+  InboundChunk     ceiling: 1 chunks at the max size 3000 (20.000% of chunks, 39.62% of bytes); at or above 65536: 0.000% / 0.00%, 131072: 0.000% / 0.00%, 262144: 0.000% / 0.00%, 524288: 0.000% / 0.00%, 1048576: 0.000% / 0.00%
   RecvDrain        count 11, bytes 7072, copied 6, EOF 1, would-block 4, size min 72 / median 1000 / p95 3000 / max 3000
   ServiceDispatch  count 5, duration ms min 0.100 / median 0.200 / p95 0.400 / max 0.400, unpaired 0
   ServicePass      count 5, non-terminal 4, terminal 1, duration ms min 1.000 / median 1.000 / p95 2.000 / max 2.000, unpaired 0

@@ -1,0 +1,61 @@
+<?xml version="1.0"?>
+<!--
+  Hand-written sample of `xcrun xctrace export` with xpath '/trace-toc/run[1]/data/table[@schema="os-signpost"]'
+  (xctrace 16.0, Xcode 26.6), in the same style as per-thread-export: row children are positional
+  in <schema> column order, an empty cell is <sentinel/>, repeated values are interned (first
+  occurrence id="N", later ones <tag ref="N"/>, inside metadata cells too), the emit-location
+  column is elided, and the table is split over two <node> elements with only the first carrying
+  <schema>.
+
+  Shape: the fixture for the InboundChunk ceiling line. The other fixtures top out at 1500-byte
+  chunks, so on them all five threshold shares are 0.000% / 0.00% and the threshold accumulation
+  has no coverage. Here the seven chunk sizes straddle the five printed thresholds: one below
+  64 KB (1448), one at each of 65536, 131072 and 262144, one between 262144 and 524288 (393216),
+  and two at 524288 so the at-max count is not the degenerate 1. Only TransportRead and
+  InboundChunk rows are present — one read and its chunk back to back on the single delivery
+  thread NIO-SGLTN-1-#1 (0x101), as since the push-conversion (#45, 6.0.0-rc5), so the coalescing
+  ratio is 1.00 and the ceiling line reads the receive length. There are deliberately no
+  RecvDrain, ServiceDispatch or ServicePass rows: those lines print their empty forms and the
+  fixture stays minimal. Run with scripts/profile-summary.sh in its default (per-thread) mode.
+
+  Timeline (ns), subsystem ro.SimpleKube.AMSMB2 / category Inbound: seven pairs 1 ms apart, each
+  chunk 0.100 ms after its read, from TransportRead 1448 @1.000000000 to InboundChunk 524288
+  @1.006100000.
+
+  Expected numbers (nearest-rank percentiles, 1-based index ceil(N*p/100)):
+    TransportRead  n=7  bytes 1901992  sorted [1448,65536,131072,262144,393216,524288,524288]
+                   -> min 1448, median idx4=262144, p95 idx7=524288, max 524288
+    InboundChunk   n=7  bytes 1901992  same sizes -> same stats
+    ceiling: max 524288, 2 chunks at it = 2/7 = 28.571% of chunks, 2*524288/1901992 = 55.13% of bytes
+             >= 65536:   6/7 = 85.714% of chunks, 1900544/1901992 = 99.92% of bytes
+             >= 131072:  5/7 = 71.429%,           1835008/1901992 = 96.48%
+             >= 262144:  4/7 = 57.143%,           1703936/1901992 = 89.59%
+             >= 524288:  2/7 = 28.571%,           1048576/1901992 = 55.13%
+             >= 1048576: 0/7 =  0.000%,                          0 =  0.00%
+    RecvDrain      n=0; ServiceDispatch n=0; ServicePass n=0
+    ratio 7/7 = 1.00; 1 delivery thread (0x101); zero-byte skipped 0
+    pump-hop: 7 pairs, every latency 0.100 ms, 0 chunks without a read, 0 reads without a chunk,
+              0 pairing errors
+    buffered 1901992 - 0 = 1901992
+    span = active = 1.006100000-1.000000000 = 0.006100 s -> 0 drained bytes -> 0.000 MB/s
+-->
+<trace-query-result>
+<node xpath='//trace-toc[1]/run[1]/data[1]/table[8]'><schema name="os-signpost" documentation="Holds a signpost event from the OS's Unified Logging and Tracing component."><col><mnemonic>time</mnemonic><name>Timestamp</name><engineering-type>event-time</engineering-type></col><col><mnemonic>thread</mnemonic><name>Thread</name><engineering-type>thread</engineering-type></col><col><mnemonic>process</mnemonic><name>Process</name><engineering-type>process</engineering-type></col><col><mnemonic>event-type</mnemonic><name>Type</name><engineering-type>event-type</engineering-type></col><col><mnemonic>scope</mnemonic><name>Scope</name><engineering-type>string</engineering-type></col><col><mnemonic>identifier</mnemonic><name>Signpost ID</name><engineering-type>os-signpost-identifier</engineering-type></col><col><mnemonic>name</mnemonic><name>Name</name><engineering-type>signpost-name</engineering-type></col><col><mnemonic>format-string</mnemonic><name>Format String</name><engineering-type>format-string</engineering-type></col><col><mnemonic>backtrace</mnemonic><name>Backtrace</name><engineering-type>backtrace</engineering-type></col><col><mnemonic>subsystem</mnemonic><name>Subsystem</name><engineering-type>subsystem</engineering-type></col><col><mnemonic>category</mnemonic><name>Category</name><engineering-type>category</engineering-type></col><col><mnemonic>message</mnemonic><name>Message</name><engineering-type>os-log-metadata</engineering-type></col><col><mnemonic>emit-location</mnemonic><name>Emit Location</name><engineering-type>return-location</engineering-type></col></schema>
+<row><event-time id="1" fmt="00:01.000.000">1000000000</event-time><thread id="2" fmt="NIO-SGLTN-1-#1 (0x101) (RandomPlayer, pid: 1818)"><tid id="3" fmt="0x101">257</tid><process id="4" fmt="RandomPlayer (1818)"><pid id="5" fmt="1818">1818</pid><device-session id="6" fmt="TODO">TODO</device-session></process></thread><process ref="4"/><event-type id="7" fmt="Event">Event</event-type><string id="8" fmt="Process">Process</string><os-signpost-identifier id="9" fmt="OS_SIGNPOST_ID_EXCLUSIVE">17216892719917625070</os-signpost-identifier><signpost-name id="10" fmt="TransportRead">TransportRead</signpost-name><format-string id="11" fmt="bytes=%ld">bytes=%ld</format-string><sentinel/><subsystem id="12" fmt="ro.SimpleKube.AMSMB2">ro.SimpleKube.AMSMB2</subsystem><category id="13" fmt="Inbound">Inbound</category><os-log-metadata id="14" fmt="bytes= 1.448"><narrative-text id="15" fmt="bytes=">bytes=</narrative-text><uint64 id="16" fmt="1.448">1448</uint64></os-log-metadata><sentinel/></row>
+<row><event-time id="17" fmt="00:01.000.100">1000100000</event-time><thread ref="2"/><process ref="4"/><event-type ref="7"/><string ref="8"/><os-signpost-identifier ref="9"/><signpost-name id="18" fmt="InboundChunk">InboundChunk</signpost-name><format-string ref="11"/><sentinel/><subsystem ref="12"/><category ref="13"/><os-log-metadata ref="14"/><sentinel/></row>
+<row><event-time id="19" fmt="00:01.001.000">1001000000</event-time><thread ref="2"/><process ref="4"/><event-type ref="7"/><string ref="8"/><os-signpost-identifier ref="9"/><signpost-name ref="10"/><format-string ref="11"/><sentinel/><subsystem ref="12"/><category ref="13"/><os-log-metadata id="20" fmt="bytes= 65.536"><narrative-text ref="15"/><uint64 id="21" fmt="65.536">65536</uint64></os-log-metadata><sentinel/></row>
+<row><event-time id="22" fmt="00:01.001.100">1001100000</event-time><thread ref="2"/><process ref="4"/><event-type ref="7"/><string ref="8"/><os-signpost-identifier ref="9"/><signpost-name ref="18"/><format-string ref="11"/><sentinel/><subsystem ref="12"/><category ref="13"/><os-log-metadata ref="20"/><sentinel/></row>
+<row><event-time id="23" fmt="00:01.002.000">1002000000</event-time><thread ref="2"/><process ref="4"/><event-type ref="7"/><string ref="8"/><os-signpost-identifier ref="9"/><signpost-name ref="10"/><format-string ref="11"/><sentinel/><subsystem ref="12"/><category ref="13"/><os-log-metadata id="24" fmt="bytes= 131.072"><narrative-text ref="15"/><uint64 id="25" fmt="131.072">131072</uint64></os-log-metadata><sentinel/></row>
+<row><event-time id="26" fmt="00:01.002.100">1002100000</event-time><thread ref="2"/><process ref="4"/><event-type ref="7"/><string ref="8"/><os-signpost-identifier ref="9"/><signpost-name ref="18"/><format-string ref="11"/><sentinel/><subsystem ref="12"/><category ref="13"/><os-log-metadata ref="24"/><sentinel/></row>
+<row><event-time id="27" fmt="00:01.003.000">1003000000</event-time><thread ref="2"/><process ref="4"/><event-type ref="7"/><string ref="8"/><os-signpost-identifier ref="9"/><signpost-name ref="10"/><format-string ref="11"/><sentinel/><subsystem ref="12"/><category ref="13"/><os-log-metadata id="28" fmt="bytes= 262.144"><narrative-text ref="15"/><uint64 id="29" fmt="262.144">262144</uint64></os-log-metadata><sentinel/></row>
+<row><event-time id="30" fmt="00:01.003.100">1003100000</event-time><thread ref="2"/><process ref="4"/><event-type ref="7"/><string ref="8"/><os-signpost-identifier ref="9"/><signpost-name ref="18"/><format-string ref="11"/><sentinel/><subsystem ref="12"/><category ref="13"/><os-log-metadata ref="28"/><sentinel/></row>
+</node>
+<node xpath='//trace-toc[1]/run[1]/data[1]/table[9]'>
+<row><event-time id="31" fmt="00:01.004.000">1004000000</event-time><thread ref="2"/><process ref="4"/><event-type ref="7"/><string ref="8"/><os-signpost-identifier ref="9"/><signpost-name ref="10"/><format-string ref="11"/><sentinel/><subsystem ref="12"/><category ref="13"/><os-log-metadata id="32" fmt="bytes= 393.216"><narrative-text ref="15"/><uint64 id="33" fmt="393.216">393216</uint64></os-log-metadata><sentinel/></row>
+<row><event-time id="34" fmt="00:01.004.100">1004100000</event-time><thread ref="2"/><process ref="4"/><event-type ref="7"/><string ref="8"/><os-signpost-identifier ref="9"/><signpost-name ref="18"/><format-string ref="11"/><sentinel/><subsystem ref="12"/><category ref="13"/><os-log-metadata ref="32"/><sentinel/></row>
+<row><event-time id="35" fmt="00:01.005.000">1005000000</event-time><thread ref="2"/><process ref="4"/><event-type ref="7"/><string ref="8"/><os-signpost-identifier ref="9"/><signpost-name ref="10"/><format-string ref="11"/><sentinel/><subsystem ref="12"/><category ref="13"/><os-log-metadata id="36" fmt="bytes= 524.288"><narrative-text ref="15"/><uint64 id="37" fmt="524.288">524288</uint64></os-log-metadata><sentinel/></row>
+<row><event-time id="38" fmt="00:01.005.100">1005100000</event-time><thread ref="2"/><process ref="4"/><event-type ref="7"/><string ref="8"/><os-signpost-identifier ref="9"/><signpost-name ref="18"/><format-string ref="11"/><sentinel/><subsystem ref="12"/><category ref="13"/><os-log-metadata ref="36"/><sentinel/></row>
+<row><event-time id="39" fmt="00:01.006.000">1006000000</event-time><thread ref="2"/><process ref="4"/><event-type ref="7"/><string ref="8"/><os-signpost-identifier ref="9"/><signpost-name ref="10"/><format-string ref="11"/><sentinel/><subsystem ref="12"/><category ref="13"/><os-log-metadata ref="36"/><sentinel/></row>
+<row><event-time id="40" fmt="00:01.006.100">1006100000</event-time><thread ref="2"/><process ref="4"/><event-type ref="7"/><string ref="8"/><os-signpost-identifier ref="9"/><signpost-name ref="18"/><format-string ref="11"/><sentinel/><subsystem ref="12"/><category ref="13"/><os-log-metadata ref="36"/><sentinel/></row>
+</node>
+</trace-query-result>

@@ -16,16 +16,27 @@
 #
 # Output (plain text, deterministic): total samples and a per-thread table, then per signpost
 # name under subsystem ro.SimpleKube.AMSMB2 the count, byte totals and size percentiles
-# (TransportRead, InboundChunk, RecvDrain), duration percentiles (ServiceDispatch, ServicePass;
-# terminal passes listed separately and excluded), the coalescing ratio, the pairing mode,
-# pump-hop latency, bytes still buffered, and derived throughput. See docs/PROFILING.md for the
-# metric definitions.
+# (TransportRead, InboundChunk, RecvDrain), the InboundChunk ceiling line, duration percentiles
+# (ServiceDispatch, ServicePass; terminal passes listed separately and excluded), the coalescing
+# ratio, the pairing mode, pump-hop latency, bytes still buffered, and derived throughput. See
+# docs/PROFILING.md for the metric definitions.
 #
 # Conventions:
 #   - Percentiles use nearest-rank: over the N sorted values, pN is the value at 1-based index
 #     ceil(N * p / 100); median is p50. Sizes are bytes; durations are milliseconds (3 decimals).
 #   - A thread is labelled "<name> (0x<tid>)", i.e. xctrace's thread label with the trailing
 #     "(<process>, pid: N)" removed; unnamed threads therefore appear under the process name.
+#   - InboundChunk ceiling: printed after the InboundChunk size line — the number of chunks
+#     whose size equals the maximum observed size, their share of the chunk count (3 decimals)
+#     and of the byte total (2 decimals), then the share of chunks and of bytes at or above
+#     65536, 131072, 262144, 524288 and 1048576 bytes. The thresholds are fixed so the line is
+#     comparable across captures; the shares are finer than the per-thread table's 1 decimal
+#     because an at-cap chunk share is a fraction of a percent while its byte share is whole
+#     percents. With no InboundChunk events the line reads "ceiling: n/a". Caveat: it measures
+#     the transport's receive length only where the coalescing ratio is 1.00 (a TCP capture of
+#     6.0.0-rc5 or later, where each read is forwarded as exactly one chunk); on a coalesced
+#     capture, or one whose chunks came from a transport that emits no TransportRead, the
+#     maximum is a coalesced maximum. See "Receive length (#46)" in docs/PROFILING.md.
 #   - RecvDrain: size stats cover drains that copied bytes; 0 (EOF) and -1 (would-block) are
 #     counted separately. -1 arrives from xctrace as uint64 18446744073709551615 and is folded
 #     back to a signed value.
@@ -135,6 +146,7 @@ NS = 1_000_000_000
 IDLE_GAP_NS = NS  # gaps longer than this between signposts do not count as active time
 BYTE_EVENTS = ("TransportRead", "InboundChunk", "RecvDrain")
 INTERVALS = ("ServiceDispatch", "ServicePass")
+CEILING_THRESHOLDS = (65536, 131072, 262144, 524288, 1048576)  # the #46 sweep bounds, fixed
 
 
 class Fail(Exception):
@@ -236,6 +248,32 @@ def stats(values, fmt):
 
 def ms(ns):
     return f"{ns / 1_000_000:.3f}"
+
+
+def ceiling(values):
+    """Saturation of a chunk-size distribution: the at-max count with its chunk and byte shares,
+    then the shares at or above each fixed threshold. See the header's Conventions for the
+    rounding and for what the line does and does not measure.
+    """
+    if not values:
+        return "n/a"
+    count, total = len(values), sum(values)
+
+    def shares(subset):
+        """(share of the chunk count, share of the byte total) of a subset, as percents."""
+        byte_share = 100.0 * sum(subset) / total if total else 0.0
+        return f"{100.0 * len(subset) / count:.3f}%", f"{byte_share:.2f}%"
+
+    largest = max(values)
+    at_max = [v for v in values if v == largest]
+    at_max_chunks, at_max_bytes = shares(at_max)
+    above = []
+    for threshold in CEILING_THRESHOLDS:
+        chunk_share, byte_share = shares([v for v in values if v >= threshold])
+        above.append(f"{threshold}: {chunk_share} / {byte_share}")
+    return (f"{len(at_max)} chunks at the max size {largest} "
+            f"({at_max_chunks} of chunks, {at_max_bytes} of bytes); "
+            f"at or above {', '.join(above)}")
 
 
 # --- pump-hop pairing ------------------------------------------------------------------------
@@ -383,6 +421,7 @@ def main():
     for name in ("TransportRead", "InboundChunk"):
         vals = sizes[name]
         print(f"  {name:<16} count {len(vals)}, bytes {sum(vals)}, size {stats(vals, str)}")
+    print(f"  {'InboundChunk':<16} ceiling: {ceiling(sizes['InboundChunk'])}")
 
     drains = sizes["RecvDrain"]
     copied = [v for v in drains if v > 0]
