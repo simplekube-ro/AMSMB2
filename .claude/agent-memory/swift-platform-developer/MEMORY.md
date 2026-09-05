@@ -35,3 +35,13 @@
   close returns — that is when the started driver is guaranteed cancelled and its handlers cleared.
 - Linux `ENOTSUP` spelling (`.ENOTSUP` is not a `POSIXErrorCode` case there):
   `throw POSIXError(.init(ENOTSUP), description: ...)` with `#if canImport(Glibc) import Glibc #endif`.
+
+## Profiling tooling (scripts/profile-summary.sh, test-fixtures/profiling)
+- Fixture `os-signpost.xml` files are hand-written xctrace exports with *interned* values: the
+  first row defines `id="N"` for thread/subsystem/event-type/metadata and later rows carry
+  `ref="N"`. Deleting rows from a fixture (e.g. to test an empty-signpost branch) orphans the ids
+  the deleted rows defined — expand the interning first, then delete.
+- All fixtures share one identical `time-profile.xml`; a new fixture can just copy it.
+- `scripts/profile-summary.sh ../RandomPlayer/profiling/rc5-runN.trace` takes ~1 min per bundle;
+  a raw `xctrace export` of one bundle's os-signpost table is 50–80 MB and parses fine with
+  ElementTree if you need the per-event values the script does not print.
