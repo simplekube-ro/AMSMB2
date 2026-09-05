@@ -91,3 +91,6 @@ Reproduced locally with a throwaway Swift emitter + `xcrun xctrace record --temp
   `17216892719917625070` (`fmt="OS_SIGNPOST_ID_EXCLUSIVE"`).
 - `xctrace export --toc | grep` works fine (no `--output` needed) despite the "always pass --output"
   advice, which applies to `--xpath` exports into a closing pipe.
+
+## Topic files
+- [Profiling tooling review](profiling-tooling.md) — how to verify `scripts/profile-summary.sh` and its fixtures, incl. the real-bundle shortcut
